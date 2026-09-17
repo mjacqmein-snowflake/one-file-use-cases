@@ -878,7 +878,18 @@ body.introon{overflow:hidden}
 /* BELOW THAT, IT IS REMOVED RATHER THAN SHRUNK. The gutter is 163px, which is a
    tenth of a projector and a third of a phone, and a code on a screen somebody else
    is holding is not one anybody scans. Narrow gets the page back instead. */
-@media (max-width:1099px){ .qr{display:none} }
+/* A 1024x768 projector is exactly the case that needs the code on screen, and
+   viewport width cannot tell a projector from a phone. So keep it down to 900px,
+   shrunk and unlabelled, and only give the page back below that. */
+@media (max-width:1099px) and (min-width:900px){
+  /* Two things measured the hard way. Keep 123px: the source PNG is 246px, so a
+     non-integer downscale blurs the module edges and 96px would not scan. And do
+     NOT reduce the card padding -- it is the quiet zone, and at 7px the code
+     stopped decoding even though it looked fine. Only the caption comes off. */
+  .qr{right:10px;bottom:10px}
+  .qr__cap{display:none}
+}
+@media (max-width:899px){ .qr{display:none} }
 /* Printing is not what this is for, but it must not make a mess of it. Fixed
    elements repeat on every sheet in several engines; this one becomes an ordinary
    block at the end of the document instead. */
