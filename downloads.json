@@ -144,6 +144,11 @@
     "bytes": 918610,
     "sha256": "d44f8456351fa3d7f593d5560465fdf72a2bce1cd1d20e46fdbd36914835b33b"
   },
+  "35_ai_value_readiness": {
+    "path": "installers/35_ai_value_readiness/AI_Value_Readiness_Setup.sql",
+    "bytes": 5092679,
+    "sha256": "0777a7241aa2916ffb3d755139ad2a6d32be88b80e15a1517385c77e53fa8f18"
+  },
   "d1_search_quality": {
     "path": "installers/d1_search_quality/Site_Search_Quality_Monitor_Setup.sql",
     "bytes": 794929,
