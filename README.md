@@ -7,4 +7,9 @@ Every one ships a `TEARDOWN()`.
 
 **Open the catalog:** https://mjacqmein-snowflake.github.io/one-file-use-cases/
 
-This repository contains only the rendered catalog page. The solutions themselves live elsewhere.
+This repository contains the client-facing catalog, its images, the offline HTML,
+and generated SQL installer downloads. Readable development source lives elsewhere.
+
+Streamlit installers use one expand-icon menu for App only and Show Snowsight.
+Each choice opens a new tab and leaves the original session intact. The catalogue
+does not claim that fixture UI checks establish backend or production readiness.
