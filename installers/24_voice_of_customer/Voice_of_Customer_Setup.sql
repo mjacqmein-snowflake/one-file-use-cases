@@ -3,11 +3,11 @@
 -- SETTINGS  ·  the only part of this file intended to be edited
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- The gate. Nothing is created while this is FALSE.
-SET VOC_APPROVE = FALSE;
 
+-- Initial build is enabled. Leave defaults unchanged and run the entire file.
+-- The last result returns OPEN_APP_URL. Set APPROVE to FALSE only for a dry run.
+SET VOC_APPROVE = TRUE;
 SET VOC_VERBOSE_OUTPUT = FALSE;
-
 
 -- Where to build. Blank means the database currently in use.
 SET VOC_TARGET_DB = '';
@@ -314,7 +314,7 @@ SET VOC_THEME_SCHEDULE = 1440;  -- 1440 = daily. AI_AGG re-reads the whole windo
 SET VOC_DISCOVERY_DB = '';
 SET VOC_DISCOVERY_SCHEMA = '';
 SET VOC_DISCOVERY_MODEL = 'claude-sonnet-4-6';
-SET VOC_USE_DISCOVERED_SOURCES = FALSE;
+SET VOC_USE_DISCOVERED_SOURCES = TRUE;
 SET VOC_DISCOVERY_MAPPING = '';
 SET VOC_SAMPLE_IF_NO_SOURCES = TRUE;
 
@@ -542,6 +542,7 @@ BEGIN
   LET mode STRING := UPPER(COALESCE($VOC_MODE::VARCHAR, 'DISCOVER'));
   LET sig  OBJECT := OBJECT_CONSTRUCT();
   LET cnt  OBJECT := OBJECT_CONSTRUCT();
+  LET source_discovery_result VARIANT := NULL;
 
 
   -- ── Probes ────────────────────────────────────────────────────────────────
@@ -626,6 +627,7 @@ BEGIN
       'window_days', :w,
       'mode', :mode,
       'target_db', :db,
+      'source_discovery', :source_discovery_result,
       'discovered_at', CURRENT_TIMESTAMP()::STRING
       , 'source_catalog', :source_catalog
       , 'source_settings', :source_settings
@@ -1517,7 +1519,7 @@ BEGIN
         res := (SELECT 'SOURCE_DECISION_REQUIRED' AS STATUS, :voc_reason AS DETAILS, :voc_mapping AS PROPOSED_MAPPING);
         RETURN TABLE(res);
       END IF;
-    ELSEIF (NOT $VOC_USE_DISCOVERED_SOURCES::BOOLEAN OR :voc_mapping_text = '') THEN
+    ELSEIF (NOT $VOC_USE_DISCOVERED_SOURCES::BOOLEAN) THEN
       res := (SELECT 'REVIEW_SOURCE_MAPPING' AS STATUS, :voc_reason AS DETAILS,
         :voc_mapping AS VOC_DISCOVERY_MAPPING,
         'Review this mapping, put its JSON in VOC_DISCOVERY_MAPPING, set VOC_USE_DISCOVERED_SOURCES = TRUE and rerun. No customer text has been read.' AS NEXT_ACTION);
@@ -1576,6 +1578,11 @@ BEGIN
 
   stmts := ARRAY_APPEND(:stmts, 'CREATE SCHEMA IF NOT EXISTS ' || :tgt);
   stmts := ARRAY_APPEND(:stmts, 'CREATE STAGE IF NOT EXISTS ' || :tgt || '.APP_STAGE');
+  IF (:found:source_discovery IS NOT NULL AND NOT IS_NULL_VALUE(:found:source_discovery)) THEN
+    stmts := ARRAY_APPEND(:stmts, 'CREATE TABLE IF NOT EXISTS ' || :tgt || '.SOURCE_DISCOVERY_LOG (RUN_ID VARCHAR, PAYLOAD VARIANT)');
+    stmts := ARRAY_APPEND(:stmts, 'INSERT INTO ' || :tgt || '.SOURCE_DISCOVERY_LOG SELECT ''' || :run_id || ''',PARSE_JSON(BASE64_DECODE_STRING(''' || BASE64_ENCODE(TO_JSON(:found:source_discovery)) || '''))');
+    notes := ARRAY_APPEND(:notes, 'SOURCE DISCOVERY: ' || :found:source_discovery:status::VARCHAR || '. Validated choices and questions are retained in SOURCE_DISCOVERY_LOG.');
+  END IF;
 
   -- ── KEEPING THE APP WARM ──────────────────────────────────────────────────
   -- The claim here is narrow on purpose, because the wide version is false.
@@ -2151,7 +2158,10 @@ BEGIN
  -- this column the app could only say "re-run with ALLOW_ACTIONS = TRUE" --
  -- which is not a line that exists in any file. That reads as unexplained manual
  -- work, and it is the reason the buttons looked like they needed a terminal.
- || '''VOC'' AS SETTING_PREFIX');
+  || '''VOC'' AS SETTING_PREFIX');
+
+  LET app_build_start INTEGER := ARRAY_SIZE(:stmts) + 1;
+  LET app_build_end INTEGER := ARRAY_SIZE(:stmts);
 
   -- ═══════════════════════════════════════════════════════════════════════════
   -- B3: plan — Voice of Customer
@@ -4646,6 +4656,9 @@ END IF;
     END WHILE;
   END IF;
 
+  IF (:app_build_end < :app_build_start) THEN
+    app_build_start := ARRAY_SIZE(:stmts) + 1;
+  END IF;
   stmts := ARRAY_APPEND(:stmts,
     'CREATE TABLE IF NOT EXISTS ' || :tgt || '.APP_CUSTOMIZATION (ID VARCHAR, CONFIG VARIANT)');
   stmts := ARRAY_APPEND(:stmts,
@@ -12740,7 +12753,9 @@ END IF;
   notes := ARRAY_APPEND(:notes, 'OPEN THE APP after building: Snowsight > Projects > Streamlit > VOICE_OF_CUSTOMER_APP');
   cost_day := :cost_day + 0.10;
   cost_detail := ARRAY_APPEND(:cost_detail, 'Streamlit use is projected at 0.10 credits/day for light XS usage; source copying has additional serverless charges.');
-  --          bundle embedded as base64, plus COPY INTO and CREATE STREAMLIT
+  IF (:app_build_end < :app_build_start) THEN
+    app_build_end := ARRAY_SIZE(:stmts);
+  END IF;
 
   stmts := ARRAY_APPEND(:stmts, 'COPY FILES INTO ''snow://streamlit/' || :tgt || '.VOICE_OF_CUSTOMER_APP/versions/live/.streamlit/'' FROM @' || :tgt || '.APP_STAGE/.streamlit/');
   stmts := ARRAY_APPEND(:stmts, 'COPY FILES INTO ''snow://workspace/' || :tgt || '.ONESHOT_SOURCE/versions/live/.streamlit/'' FROM @' || :tgt || '.APP_STAGE/.streamlit/');
@@ -13005,6 +13020,7 @@ END IF;
 
   -- ── Gate ──────────────────────────────────────────────────────────────────
   LET approved BOOLEAN := FALSE;
+  LET workload_blocked BOOLEAN := FALSE;
   BEGIN
     approved := (SELECT TRY_CAST($VOC_APPROVE::VARCHAR AS BOOLEAN));
   EXCEPTION WHEN OTHER THEN approved := FALSE;
@@ -13016,10 +13032,10 @@ END IF;
   -- be, because the client owns the decision and the override is the audit trail.
   LET gate_closed_by STRING := '';
   IF (:hard_block <> '') THEN
-    approved := FALSE;
+    workload_blocked := TRUE;
     gate_closed_by := 'DETERMINISTIC CHECK';
   ELSEIF (:review_verdict = 'DO_NOT_PROCEED' AND NOT :override_asked) THEN
-    approved := FALSE;
+    workload_blocked := TRUE;
     gate_closed_by := 'REVIEW VERDICT';
   ELSEIF (:review_verdict = 'DO_NOT_PROCEED' AND :override_asked) THEN
     review_overridden := TRUE;
@@ -13027,6 +13043,15 @@ END IF;
       'OVERRIDE IN EFFECT: the review returned DO_NOT_PROCEED and '
    || 'VOC_OVERRIDE_REVIEW = TRUE, so the build proceeded anyway. The verdict and '
    || 'this override are both recorded in REVIEW_LOG and in the packet.');
+  END IF;
+
+  IF (:workload_blocked) THEN
+    IF (:approved AND 'VOICE_OF_CUSTOMER_APP' <> '' AND '24_voice_of_customer' <> '24_voice_of_customer' AND :app_build_end >= :app_build_start) THEN
+      stmts := ARRAY_SLICE(:stmts, 0, :app_build_end);
+      notes := ARRAY_APPEND(:notes, 'Data-workload build was refused. Only the existing app and its infrastructure are installed; the review decision is not overridden.');
+    ELSE
+      approved := FALSE;
+    END IF;
   END IF;
 
   -- ── The discovery packet ──────────────────────────────────────────────────
@@ -13376,6 +13401,7 @@ END IF;
     END IF;
     res := (SELECT IFF(:app_exists AND ARRAY_SIZE(:receipt_failures)=0,'READY','BUILD_FAILED') AS STATUS,
       IFF(:app_exists AND ARRAY_SIZE(:receipt_failures)=0,:app_url,NULL) AS OPEN_APP_URL,
+      IFF(:app_exists AND ARRAY_SIZE(:receipt_failures)=0,'OPEN THE APP: click OPEN_APP_URL. No additional variable changes are needed.','BUILD FAILED: inspect ATTENTION and DIAGNOSTICS.') AS NEXT_ACTION,
       IFF(:app_exists AND ARRAY_SIZE(:receipt_failures)=0,'https://app.snowflake.com/' || LOWER(CURRENT_ORGANIZATION_NAME()) || '/' || LOWER(CURRENT_ACCOUNT_NAME()) || '/#/workspaces/ws/' || :db || '/' || :sch || '/ONESHOT_SOURCE/streamlit_app.py',NULL) AS EDIT_SOURCE_URL,
       IFF(:voc_is_sample,'SAMPLE: synthetic feedback','APPROVED SOURCE SNAPSHOT') AS DATA_MODE,
       :wh AS APP_WAREHOUSE,

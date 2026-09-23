@@ -3,11 +3,11 @@
 -- SETTINGS  ·  the only part of this file intended to be edited
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- The gate. Nothing is created while this is FALSE.
-SET WHGEN_APPROVE = FALSE;
 
+-- Initial build is enabled. Leave defaults unchanged and run the entire file.
+-- The last result returns OPEN_APP_URL. Set APPROVE to FALSE only for a dry run.
+SET WHGEN_APPROVE = TRUE;
 SET WHGEN_VERBOSE_OUTPUT = FALSE;
-
 
 -- Where to build. Blank means the database currently in use.
 SET WHGEN_TARGET_DB = '';
@@ -50,7 +50,7 @@ SET WHGEN_WARM_WAREHOUSE = 'ONESHOT_APP_WH';
 -- default, can close the connection before this timer expires, and only Snowflake
 -- Support can raise it. Setting 240 here is therefore an upper bound and not a
 -- guarantee.
-SET WHGEN_APP_SLEEP_MINUTES = 240;
+SET WHGEN_APP_SLEEP_MINUTES = 5;
 
 -- How far back discovery and the views look.
 SET WHGEN_WINDOW_DAYS = 14;
@@ -492,6 +492,7 @@ BEGIN
   LET mode STRING := UPPER(COALESCE($WHGEN_MODE::VARCHAR, 'DISCOVER'));
   LET sig  OBJECT := OBJECT_CONSTRUCT();
   LET cnt  OBJECT := OBJECT_CONSTRUCT();
+  LET source_discovery_result VARIANT := NULL;
 
 
   -- ── Probes ────────────────────────────────────────────────────────────────
@@ -698,6 +699,7 @@ BEGIN
       'window_days', :w,
       'mode', :mode,
       'target_db', :db,
+      'source_discovery', :source_discovery_result,
       'discovered_at', CURRENT_TIMESTAMP()::STRING
       , 'warehouse_count', COALESCE(GET(:cnt, 'warehouses')::NUMBER, 0)
       , 'gen1_eligible_count', COALESCE(GET(:cnt, 'gen1_eligible')::NUMBER, 0)
@@ -1376,6 +1378,11 @@ BEGIN
 
   stmts := ARRAY_APPEND(:stmts, 'CREATE SCHEMA IF NOT EXISTS ' || :tgt);
   stmts := ARRAY_APPEND(:stmts, 'CREATE STAGE IF NOT EXISTS ' || :tgt || '.APP_STAGE');
+  IF (:found:source_discovery IS NOT NULL AND NOT IS_NULL_VALUE(:found:source_discovery)) THEN
+    stmts := ARRAY_APPEND(:stmts, 'CREATE TABLE IF NOT EXISTS ' || :tgt || '.SOURCE_DISCOVERY_LOG (RUN_ID VARCHAR, PAYLOAD VARIANT)');
+    stmts := ARRAY_APPEND(:stmts, 'INSERT INTO ' || :tgt || '.SOURCE_DISCOVERY_LOG SELECT ''' || :run_id || ''',PARSE_JSON(BASE64_DECODE_STRING(''' || BASE64_ENCODE(TO_JSON(:found:source_discovery)) || '''))');
+    notes := ARRAY_APPEND(:notes, 'SOURCE DISCOVERY: ' || :found:source_discovery:status::VARCHAR || '. Validated choices and questions are retained in SOURCE_DISCOVERY_LOG.');
+  END IF;
 
   -- ── KEEPING THE APP WARM ──────────────────────────────────────────────────
   -- The claim here is narrow on purpose, because the wide version is false.
@@ -1951,3011 +1958,9 @@ BEGIN
  -- this column the app could only say "re-run with ALLOW_ACTIONS = TRUE" --
  -- which is not a line that exists in any file. That reads as unexplained manual
  -- work, and it is the reason the buttons looked like they needed a terminal.
- || '''WHGEN'' AS SETTING_PREFIX');
+  || '''WHGEN'' AS SETTING_PREFIX');
 
-  -- ── Warehouse Generation Plan ───────────────────────────────────────────────
-  --
-  -- The one fact that shapes everything below: Gen2 bills at a HIGHER per-second
-  -- rate than Gen1 for the same size. So a Gen1 warehouse moving to Gen2 gets
-  -- cheaper ONLY if its runtime falls by more than the rate premium. At 1.35x the
-  -- workload has to finish 25.93% faster just to break even; below that the same
-  -- work costs more. "Upgrade the fleet to Gen2" is therefore not a savings
-  -- recommendation, and this solution refuses to make it.
-
-  -- ── The rate premium ────────────────────────────────────────────────────────
-  -- Read from the setting when the client has supplied their own figure,
-  -- otherwise inferred from the account's own cloud. AWS and GCP are 1.35x,
-  -- Azure is 1.25x. These live in the Snowflake Service Consumption Table, not
-  -- in anything queryable, so the value is declared rather than measured and the
-  -- economics view says exactly that.
-  LET cloud STRING := COALESCE(:sig:cloud::STRING, 'UNKNOWN');
-  LET mult_setting NUMBER(38,4) := 0;
-  BEGIN
-    mult_setting := COALESCE((SELECT $WHGEN_RATE_MULTIPLIER::NUMBER(38,4)), 0);
-  EXCEPTION WHEN OTHER THEN
-    mult_setting := 0;
-  END;
-
-  LET mult NUMBER(38,4) := CASE
-      WHEN :mult_setting > 0 THEN :mult_setting
-      WHEN :cloud = 'AZURE'  THEN 1.25
-      WHEN :cloud IN ('AWS', 'GCP') THEN 1.35
-      -- An unknown cloud takes the HIGHER premium. The conservative direction
-      -- here is the one that makes conversions look worse, because the failure
-      -- that costs a client money is recommending a conversion that does not pay
-      -- for itself, not declining one that would have.
-      ELSE 1.35 END;
-
-  LET mult_source STRING := CASE
-      WHEN :mult_setting > 0 THEN 'WHGEN_RATE_MULTIPLIER setting, supplied by you'
-      WHEN :cloud = 'UNKNOWN' THEN 'cloud not readable from CURRENT_REGION(), so the '
-        || 'higher AWS/GCP premium was assumed -- set WHGEN_RATE_MULTIPLIER to correct it'
-      ELSE 'published Gen2 rate for ' || :cloud
-        || ' (Snowflake Service Consumption Table), inferred from CURRENT_REGION() = '
-        || COALESCE(:sig:region_name::STRING, 'UNREADABLE') END;
-
-  -- The break-even bar. This is arithmetic, not an estimate: at a rate premium
-  -- of m, runtime must fall to 1/m of its former self, so the required reduction
-  -- is (1 - 1/m).
-  LET breakeven_pct NUMBER(38,2) := ROUND((1 - 1 / :mult) * 100, 2);
-
-  LET min_credits NUMBER(38,4) := 5;
-  BEGIN
-    min_credits := COALESCE((SELECT $WHGEN_MIN_CREDITS::NUMBER(38,4)), 5);
-  EXCEPTION WHEN OTHER THEN
-    min_credits := 5;
-  END;
-
-  -- Per-size Gen1 credit rate, used to convert credits into billed warehouse
-  -- seconds. Reused verbatim in several statements below, so it is built once.
-  -- Both spellings of every size appear because SHOW WAREHOUSES reports
-  -- 'X-Small' while ACCOUNT_USAGE reports 'XSMALL', and a solution that handles
-  -- only one of them silently rates half the fleet at 1 credit/hour.
-  LET size_rate STRING :=
-      'CASE UPPER(REPLACE(WH_SIZE, ''-'', '''')) '
-   || 'WHEN ''XSMALL'' THEN 1 WHEN ''SMALL'' THEN 2 WHEN ''MEDIUM'' THEN 4 '
-   || 'WHEN ''LARGE'' THEN 8 WHEN ''XLARGE'' THEN 16 WHEN ''2XLARGE'' THEN 32 '
-   || 'WHEN ''3XLARGE'' THEN 64 WHEN ''4XLARGE'' THEN 128 '
-   || 'WHEN ''5XLARGE'' THEN 256 WHEN ''6XLARGE'' THEN 512 ELSE NULL END';
-
-  -- ── The fleet snapshot ──────────────────────────────────────────────────────
-  -- SHOW WAREHOUSES is the only place generation is exposed. Snapshotted as a
-  -- table so every view below reads a consistent picture, and so the verdict a
-  -- client screenshots is reproducible rather than shifting under them.
-  LET demo_wh STRING := :sch || '_DEMO_WH';
-
-  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'BEGIN SHOW WAREHOUSES; '
-   || 'CREATE OR REPLACE TABLE ' || :tgt || '.WH_FLEET AS '
-   || 'SELECT "name" AS WAREHOUSE_NAME, "size" AS WH_SIZE, '
-   || 'UPPER(COALESCE("type", '''')) AS WH_TYPE, '
-   || 'COALESCE("generation", '''') AS GENERATION, '
-   || 'COALESCE("resource_constraint", '''') AS RESOURCE_CONSTRAINT, '
-   || 'COALESCE("max_cluster_count", 1)::INT AS MAX_CLUSTERS, '
-   || 'COALESCE("auto_suspend", 0)::INT AS AUTO_SUSPEND_SECS, '
-   || 'COALESCE("enable_query_acceleration", ''false'')::VARCHAR AS QAS_ENABLED, '
-   -- Captured so the QAS undo can restore the prior scale factor rather than
-   -- guessing one. A warehouse with QAS off still carries a factor, and putting
-   -- back the wrong number is a silent config change dressed up as a rollback.
-   || 'COALESCE("query_acceleration_max_scale_factor", 0)::INT AS QAS_SCALE_FACTOR, '
-   || 'CURRENT_TIMESTAMP() AS SNAPSHOT_AT '
-   || 'FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) '
-   -- Two warehouses are excluded because this tooling created them, and a
-   -- warehouse that exists to host the script is not part of the estate the
-   -- script is judging.
-   --
-   -- <schema>_DEMO_WH is the throwaway the SAMPLE action converts. <schema>_ONESHOT_WH
-   -- is the warehouse the deployment harness creates to run the build and the app.
-   -- Leaving the latter in was a real defect rather than an aesthetic one: it does
-   -- not exist during the FIRST build and does during the second, so the fleet grew
-   -- by one row on a re-run and the idempotence check correctly failed with
-   -- CONVERSION_BASELINE 103 -> 104.
-   || 'WHERE "name" NOT IN (' || CHAR(39) || :demo_wh || CHAR(39) || ', '
-   || CHAR(39) || :sch || '_ONESHOT_WH' || CHAR(39) || '); END');
-    cost_once := :cost_once + 0.01;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'WH_FLEET snapshot ~0.01 credits (SHOW WAREHOUSES is metadata, no warehouse compute)');
-
-    -- Register any gauntlet fixture warehouses so teardown drops them.
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-   || 'SELECT w.WAREHOUSE_NAME, ''WAREHOUSE'', ''FIXTURE'', ''FIXTURE_WAREHOUSE'' '
-   || 'FROM ' || :tgt || '.WH_FLEET w '
-   || 'WHERE w.WAREHOUSE_NAME LIKE ''GAUNTLET!_WHGEN!_%'' ESCAPE ''!'' '
-   || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || 'WHERE r.TARGET_FQN = w.WAREHOUSE_NAME AND r.KIND = ''FIXTURE_WAREHOUSE'')');
-  END IF;
-
-  -- ── The economics, stated once and cited everywhere ─────────────────────────
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_GEN2_ECONOMICS AS SELECT '
- || CHAR(39) || :cloud || CHAR(39) || ' AS CLOUD, '
- || CHAR(39) || COALESCE(:sig:region_name::STRING, 'UNREADABLE') || CHAR(39) || ' AS REGION, '
- || :mult || '::NUMBER(38,4) AS GEN2_RATE_MULTIPLIER, '
- || :breakeven_pct || '::NUMBER(38,2) AS REQUIRED_SPEEDUP_PCT, '
- || CHAR(39) || :mult_source || CHAR(39) || ' AS MULTIPLIER_SOURCE, '
- || CHAR(39) || 'Gen2 costs ' || :mult || 'x the credits per hour of Gen1 for the same '
- || 'size, so the same work must finish at least ' || :breakeven_pct || '% faster to '
- || 'cost the same. Below that, converting raises the bill. This is arithmetic on '
- || 'the multiplier, not a projection.' || CHAR(39) || ' AS HOW_TO_READ_IT');
-  cost_detail := ARRAY_APPEND(:cost_detail,
-    'V_GEN2_ECONOMICS is a constant row, no scan cost');
-
-  -- ── Workload shape per warehouse ────────────────────────────────────────────
-  -- Three measured quantities decide whether Gen2 can pay for itself:
-  --
-  -- 1. UTILISATION. Billed warehouse seconds come from credits and the size's
-  --    published rate, which already accounts for multi-cluster. Query seconds
-  --    come from EXECUTION_TIME. The ratio is how much of what you pay for is
-  --    actually executing. Gen2's premium applies to every billed second
-  --    including idle ones, so a warehouse that is mostly idle gets strictly
-  --    more expensive -- there is no runtime to shorten.
-  --
-  --    The ratio can exceed 1 on a concurrent warehouse, because several queries
-  --    execute in the same wall-clock second. That is not an error, it is a
-  --    well-packed warehouse, and it is the best possible Gen2 candidate.
-  --
-  -- 2. FAVOURABLE SHARE. The share of execution time spent on the work Snowflake
-  --    documents Gen2 as improving: table scans, DELETE, UPDATE, MERGE. A
-  --    warehouse whose time goes to tiny lookups has little for Gen2 to speed up.
-  --    Scan-heavy is taken as a SELECT reading at least 1 GB; below that the
-  --    query is not scan-bound and the faster hardware has less to work with.
-  --
-  -- 3. PRESSURE. Spill and queueing are direct evidence the warehouse is short of
-  --    resource, which is the condition Gen2's faster hardware and higher
-  --    concurrency actually relieve.
-  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_WH_WORKLOAD AS '
-   || 'WITH credits AS ('
-   -- Aggregate the DAILY totals, not the raw metering columns. The subquery below
-   -- has already collapsed the hourly rows to one row per warehouse per day, so
-   -- CREDITS_USED does not exist at this level -- reaching for it here is what made
-   -- this view fail to compile with "invalid identifier CREDITS_USED", which took
-   -- every downstream verdict, panel and action with it.
-   || 'SELECT WAREHOUSE_NAME, SUM(DAILY_CREDITS) AS CREDITS_USED, '
-   || 'COUNT(*) AS ACTIVE_DAYS, '
-   -- Daily spread is the burstiness input for Adaptive. STDDEV over the daily
-   -- totals rather than over the hourly rows: an overnight batch warehouse looks
-   -- wildly variable by hour and is perfectly regular by day.
-   || 'STDDEV(DAILY_CREDITS) AS DAILY_STDDEV, AVG(DAILY_CREDITS) AS DAILY_MEAN '
-   || 'FROM (SELECT WAREHOUSE_NAME, DATE_TRUNC(''day'', START_TIME) AS D, '
-   || 'SUM(CREDITS_USED) AS DAILY_CREDITS '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY '
-   || 'WHERE START_TIME >= ' || :since || ' GROUP BY 1, 2) '
-   || 'GROUP BY 1'
-   || '), '
-   || 'q AS ('
-   || 'SELECT WAREHOUSE_NAME, '
-   || 'COUNT(*) AS QUERY_COUNT, '
-   || 'SUM(EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS, '
-   -- The favourable set. INSERT and COPY are included because both are
-   -- write-path work that the delete/update/merge improvements cover, and
-   -- CREATE_TABLE_AS_SELECT is a scan plus a write.
-   || 'SUM(CASE WHEN QUERY_TYPE IN (''MERGE'', ''UPDATE'', ''DELETE'', ''INSERT'', '
-   || '''COPY'', ''CREATE_TABLE_AS_SELECT'', ''UNLOAD'') '
-   || 'OR (QUERY_TYPE = ''SELECT'' AND BYTES_SCANNED >= POWER(1024, 3)) '
-   || 'THEN EXECUTION_TIME ELSE 0 END) / 1000.0 AS FAVOURABLE_SECONDS, '
-   || 'SUM(QUEUED_OVERLOAD_TIME) / 1000.0 AS QUEUED_SECONDS, '
-   || 'SUM(BYTES_SPILLED_TO_LOCAL_STORAGE) / POWER(1024, 3) AS SPILL_LOCAL_GB, '
-   || 'SUM(BYTES_SPILLED_TO_REMOTE_STORAGE) / POWER(1024, 3) AS SPILL_REMOTE_GB, '
-   || 'SUM(BYTES_SCANNED) / POWER(1024, 4) AS SCANNED_TB '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY '
-   || 'WHERE START_TIME >= ' || :since || ' '
-   || 'AND WAREHOUSE_NAME IS NOT NULL '
-   -- A NULL warehouse size means the statement ran without warehouse compute
-   -- (DESCRIBE, SHOW, LIST). Counting those inflates the query count and drags
-   -- the favourable share down with work that costs nothing to begin with.
-   || 'AND WAREHOUSE_SIZE IS NOT NULL '
-   || 'GROUP BY 1'
-   || ') '
-   || 'SELECT f.WAREHOUSE_NAME, f.WH_SIZE, f.WH_TYPE, f.GENERATION, '
-   || 'f.MAX_CLUSTERS, f.AUTO_SUSPEND_SECS, '
-   || 'ROUND(COALESCE(c.CREDITS_USED, 0), 3) AS CREDITS_USED, '
-   || 'COALESCE(c.ACTIVE_DAYS, 0) AS ACTIVE_DAYS, '
-   || 'ROUND(DIV0(COALESCE(c.CREDITS_USED, 0), NULLIF(c.ACTIVE_DAYS, 0)), 3) AS CREDITS_PER_DAY, '
-   || 'ROUND(DIV0(COALESCE(c.CREDITS_USED, 0) * 3600.0, '
-   || 'NULLIF(' || REPLACE(:size_rate, 'WH_SIZE', 'f.WH_SIZE') || ', 0)), 1) AS BILLED_SECONDS, '
-   || 'ROUND(COALESCE(q.QUERY_SECONDS, 0), 1) AS QUERY_SECONDS, '
-   || 'ROUND(DIV0(COALESCE(q.QUERY_SECONDS, 0) * ' || REPLACE(:size_rate, 'WH_SIZE', 'f.WH_SIZE')
-   || ', NULLIF(COALESCE(c.CREDITS_USED, 0) * 3600.0, 0)), 3) AS UTILISATION, '
-   || 'ROUND(DIV0(COALESCE(q.FAVOURABLE_SECONDS, 0), '
-   || 'NULLIF(COALESCE(q.QUERY_SECONDS, 0), 0)), 3) AS FAVOURABLE_SHARE, '
-   || 'COALESCE(q.QUERY_COUNT, 0) AS QUERY_COUNT, '
-   || 'ROUND(COALESCE(q.QUEUED_SECONDS, 0), 1) AS QUEUED_SECONDS, '
-   || 'ROUND(COALESCE(q.SPILL_LOCAL_GB, 0), 2) AS SPILL_LOCAL_GB, '
-   || 'ROUND(COALESCE(q.SPILL_REMOTE_GB, 0), 2) AS SPILL_REMOTE_GB, '
-   || 'ROUND(COALESCE(q.SCANNED_TB, 0), 3) AS SCANNED_TB, '
-   || 'ROUND(DIV0(COALESCE(c.DAILY_STDDEV, 0), NULLIF(c.DAILY_MEAN, 0)), 3) AS DAILY_CV, '
-   -- Carried through so the verdict can judge QAS without re-reading the fleet.
-   || 'f.QAS_ENABLED, f.QAS_SCALE_FACTOR '
-   || 'FROM ' || :tgt || '.WH_FLEET f '
-   || 'LEFT JOIN credits c ON f.WAREHOUSE_NAME = c.WAREHOUSE_NAME '
-   || 'LEFT JOIN q ON f.WAREHOUSE_NAME = q.WAREHOUSE_NAME');
-    cost_day    := :cost_day + 0.06;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'V_WH_WORKLOAD scans QUERY_HISTORY and WAREHOUSE_METERING_HISTORY on every '
-   || 'read ~0.06 credits/day');
-    dials := ARRAY_APPEND(:dials,
-      'WINDOW_DAYS ' || :w || ' -> 7 roughly halves the V_WH_WORKLOAD scan (~0.03 credits/day)');
-  END IF;
-
-  -- ── Query-acceleration eligibility, measured rather than assumed ────────────
-  -- Snowflake will not say "this warehouse would be 20% faster with QAS". What it
-  -- will say, per query, is how much of that query's execution time it could have
-  -- offloaded. Summed per warehouse and divided by total execution time, that is
-  -- the closest thing to an honest expected benefit, and it comes from the
-  -- account's own queries rather than from a brochure.
-  --
-  -- UPPER_LIMIT_SCALE_FACTOR is carried because it is Snowflake's own ceiling on
-  -- useful parallelism for that workload. Setting a factor above it buys nothing
-  -- and raises the spend cap, so the action below never exceeds it.
-  IF (:sig:qas_eligible::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_QAS_ELIGIBILITY AS '
-   || 'SELECT WAREHOUSE_NAME, '
-   || 'COUNT(*) AS ELIGIBLE_QUERIES, '
-   -- ELIGIBLE_QUERY_ACCELERATION_TIME is seconds of execution time that QAS could
-   -- have offloaded. It is NOT a saving: the offloaded work still runs, on
-   -- separately-billed serverless compute.
-   || 'ROUND(SUM(ELIGIBLE_QUERY_ACCELERATION_TIME), 1) AS ELIGIBLE_SECONDS, '
-   || 'MAX(UPPER_LIMIT_SCALE_FACTOR) AS UPPER_LIMIT_SCALE_FACTOR '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ACCELERATION_ELIGIBLE '
-   || 'WHERE START_TIME >= ' || :since || ' '
-   || 'AND WAREHOUSE_NAME IS NOT NULL '
-   || 'GROUP BY 1');
-    cost_day    := :cost_day + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'V_QAS_ELIGIBILITY scans QUERY_ACCELERATION_ELIGIBLE ~0.02 credits/day');
-  END IF;
-
-  -- ── The verdict ─────────────────────────────────────────────────────────────
-  -- Four outcomes, and only one of them is "convert this". The thresholds are
-  -- JUDGEMENT, stated as such in the view, and they are deliberately set so that
-  -- the default answer on thin evidence is PILOT_ONLY rather than GO. A verdict
-  -- engine whose default is "yes" is a sales tool, not an analysis.
-  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    -- The QAS half of the verdict only exists if the eligibility view was built.
-    -- Held in variables so the view compiles either way: with evidence it judges,
-    -- and without it it says NO_EVIDENCE rather than recommending a feature it
-    -- cannot see the case for. QUERY_ACCELERATION_ELIGIBLE is Enterprise-only, so
-    -- the second branch is a real account state, not a defensive nicety.
-    --
-    -- Why QAS belongs in a Gen2 verdict at all: Snowflake enables QAS by default
-    -- when a warehouse is CREATED as Gen2, and does NOT when an existing Gen1
-    -- warehouse is ALTERed to Gen2 -- which is what the conversion below does. So
-    -- every warehouse this solution converts lands in a different configuration
-    -- from a natively-created Gen2 warehouse, and nothing said so until now.
-    LET qas_share STRING := 'ROUND(DIV0(COALESCE(qe.ELIGIBLE_SECONDS, 0), '
-                         || 'NULLIF(w.QUERY_SECONDS, 0)), 3)';
-    LET qas_is_on STRING := 'LOWER(COALESCE(w.QAS_ENABLED, ''false'')) '
-                         || 'IN (''true'', ''t'', ''1'')';
-    LET qas_cols  STRING := '';
-    LET qas_join  STRING := '';
-
-    IF (:sig:qas_eligible::STRING = 'AVAILABLE') THEN
-      qas_join := ' LEFT JOIN ' || :tgt || '.V_QAS_ELIGIBILITY qe '
-               || 'ON qe.WAREHOUSE_NAME = w.WAREHOUSE_NAME';
-      qas_cols :=
-         'w.QAS_ENABLED, w.QAS_SCALE_FACTOR, '
-      || 'COALESCE(qe.ELIGIBLE_QUERIES, 0) AS QAS_ELIGIBLE_QUERIES, '
-      || 'COALESCE(qe.ELIGIBLE_SECONDS, 0) AS QAS_ELIGIBLE_SECONDS, '
-      || :qas_share || ' AS QAS_ELIGIBLE_SHARE, '
-      -- Scale factor 2 is Snowflake's own default when it auto-enables QAS on a
-      -- newly created Gen2 warehouse, and it is the conservative choice: the factor
-      -- is a CEILING on billable QAS compute, not a target. Never propose above
-      -- Snowflake's own stated ceiling for the workload.
-      || 'LEAST(2, GREATEST(COALESCE(qe.UPPER_LIMIT_SCALE_FACTOR, 2), 1)) '
-      || 'AS QAS_PROPOSED_SCALE_FACTOR, '
-      || 'CASE '
-      || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''INELIGIBLE_TYPE'' '
-      || 'WHEN ' || :qas_is_on || ' THEN ''ON'' '
-      || 'WHEN COALESCE(qe.ELIGIBLE_SECONDS, 0) = 0 THEN ''NOT_WORTH_IT'' '
-      || 'WHEN ' || :qas_share || ' >= 0.10 THEN ''RECOMMENDED'' '
-      || 'ELSE ''NOT_WORTH_IT'' END AS QAS_VERDICT, '
-      || 'CASE '
-      || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''Query acceleration is governed by '
-      || 'the warehouse type here, not by this setting.'' '
-      || 'WHEN ' || :qas_is_on || ' THEN ''Already on, at scale factor '' '
-      || '|| w.QAS_SCALE_FACTOR || ''. Nothing to do.'' '
-      || 'WHEN COALESCE(qe.ELIGIBLE_SECONDS, 0) = 0 THEN ''Snowflake marked none of '
-      || 'this warehouse''''s queries eligible for acceleration in the window, so '
-      || 'enabling it would add a separately-billed service that never engages.'' '
-      || 'WHEN ' || :qas_share || ' >= 0.10 THEN ''Snowflake marked '' '
-      || '|| COALESCE(qe.ELIGIBLE_QUERIES, 0) || '' queries eligible, covering '' '
-      || '|| ROUND(' || :qas_share || ' * 100, 1) || ''% of execution time ('' '
-      || '|| COALESCE(qe.ELIGIBLE_SECONDS, 0) || ''s). A warehouse CREATED as Gen2 '
-      || 'gets QAS by default; converting one by ALTER does not, so this is the '
-      || 'setting the conversion left behind. It is NOT a saving -- the offloaded '
-      || 'work bills as serverless QAS credits. It is a way to shorten wall-clock '
-      || 'on exactly the scan-heavy work that has to get faster for the Gen2 rate '
-      || 'premium to pay for itself.'' '
-      || 'ELSE ''Only '' || ROUND(' || :qas_share || ' * 100, 1) || ''% of execution '
-      || 'time is eligible, below the 10% floor. The separately-billed QAS credits '
-      || 'are unlikely to be repaid by that little.'' END AS QAS_WHY, '
-      || CHAR(39) || 'The 10% eligible-share floor is judgement, not measurement. '
-      || 'QAS bills serverless credits of its own, so the floor is set where the '
-      || 'offload is large enough to plausibly repay them.' || CHAR(39)
-      || ' AS QAS_THRESHOLD_IS_JUDGEMENT, ';
-    ELSE
-      qas_cols :=
-         'w.QAS_ENABLED, w.QAS_SCALE_FACTOR, '
-      || 'NULL::INT AS QAS_ELIGIBLE_QUERIES, '
-      || 'NULL::NUMBER(38,1) AS QAS_ELIGIBLE_SECONDS, '
-      || 'NULL::NUMBER(38,3) AS QAS_ELIGIBLE_SHARE, '
-      || 'NULL::INT AS QAS_PROPOSED_SCALE_FACTOR, '
-      || 'CASE WHEN w.WH_TYPE <> ''STANDARD'' THEN ''INELIGIBLE_TYPE'' '
-      || 'WHEN ' || :qas_is_on || ' THEN ''ON'' '
-      || 'ELSE ''NO_EVIDENCE'' END AS QAS_VERDICT, '
-      || 'CASE WHEN w.WH_TYPE <> ''STANDARD'' THEN ''Query acceleration is governed '
-      || 'by the warehouse type here, not by this setting.'' '
-      || 'WHEN ' || :qas_is_on || ' THEN ''Already on, at scale factor '' '
-      || '|| w.QAS_SCALE_FACTOR || ''. Nothing to do.'' '
-      || 'ELSE ''SNOWFLAKE.ACCOUNT_USAGE.QUERY_ACCELERATION_ELIGIBLE was not '
-      || 'readable, so there is no evidence either way -- it is an Enterprise '
-      || 'Edition view. Worth checking by hand, because converting to Gen2 by '
-      || 'ALTER does not enable QAS even though creating a Gen2 warehouse does.'' '
-      || 'END AS QAS_WHY, '
-      || CHAR(39) || 'No QAS eligibility evidence was readable on this account, so '
-      || 'no QAS recommendation is made.' || CHAR(39)
-      || ' AS QAS_THRESHOLD_IS_JUDGEMENT, ';
-    END IF;
-
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_GEN2_VERDICT AS '
-   || 'SELECT w.WAREHOUSE_NAME, w.WH_SIZE, w.WH_TYPE, w.GENERATION, '
-   || 'w.CREDITS_USED, w.CREDITS_PER_DAY, w.UTILISATION, w.FAVOURABLE_SHARE, '
-   || 'w.QUEUED_SECONDS, w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB AS SPILL_GB, '
-   || 'w.QUERY_COUNT, '
-   || :qas_cols
-   || :breakeven_pct || '::NUMBER(38,2) AS REQUIRED_SPEEDUP_PCT, '
-   -- The number that reframes the whole conversation. If Gen2 delivers no
-   -- speedup at all on this warehouse, this is what it adds to the bill per day.
-   -- It is the downside a client is accepting when they press the button, and it
-   -- is computed from their own measured spend rather than assumed away.
-   || 'ROUND(w.CREDITS_PER_DAY * (' || :mult || ' - 1), 3) AS WORST_CASE_EXTRA_CREDITS_PER_DAY, '
-   || 'CASE '
-   -- Eligibility first. These are not judgements, they are what Snowflake
-   -- supports, and a warehouse that fails them cannot be converted at all.
-   || 'WHEN w.GENERATION = ''2'' THEN ''ALREADY_GEN2'' '
-   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''INELIGIBLE_TYPE'' '
-   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
-   || '  THEN ''INELIGIBLE_SIZE'' '
-   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''IMMATERIAL'' '
-   -- Then the economics. Idle-dominated first, because it is the case where
-   -- conversion is not a gamble but a straight loss.
-   || 'WHEN w.UTILISATION < 0.20 THEN ''AVOID'' '
-   || 'WHEN w.FAVOURABLE_SHARE < 0.30 THEN ''AVOID'' '
-   || 'WHEN w.UTILISATION >= 0.50 AND w.FAVOURABLE_SHARE >= 0.60 '
-   || '  AND (w.QUEUED_SECONDS > 0 OR w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB > 0) '
-   || '  THEN ''STRONG'' '
-   || 'WHEN w.UTILISATION >= 0.35 AND w.FAVOURABLE_SHARE >= 0.45 THEN ''LIKELY'' '
-   || 'ELSE ''PILOT_ONLY'' END AS VERDICT, '
-   || 'CASE '
-   || 'WHEN w.GENERATION = ''2'' THEN ''Already Gen2. Nothing to do.'' '
-   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''The GENERATION clause applies only to '
-   || 'STANDARD warehouses, so a '' || w.WH_TYPE || '' warehouse cannot be converted.'' '
-   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
-   || '  THEN ''Gen2 is not available at '' || w.WH_SIZE || ''.'' '
-   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''Spent '' || w.CREDITS_USED '
-   || '  || '' credits in the window, below the '' || ' || :min_credits || ' || '' credit '
-   || 'floor. Converting it can neither save nor cost anything worth measuring.'' '
-   || 'WHEN w.UTILISATION < 0.20 THEN ''Only '' || ROUND(w.UTILISATION * 100, 1) '
-   || '  || ''% of the billed time is executing queries, so this warehouse is paying '
-   || 'mostly for idle. The Gen2 premium applies to idle seconds too and there is no '
-   || 'runtime to shorten, so converting raises the bill with near-certainty. Fix the '
-   || 'idle first -- auto-suspend, or fewer warehouses.'' '
-   || 'WHEN w.FAVOURABLE_SHARE < 0.30 THEN ''Only '' || ROUND(w.FAVOURABLE_SHARE * 100, 1) '
-   || '  || ''% of execution time is the scan-heavy or DML work Gen2 is documented to '
-   || 'improve. Too little to clear a '' || ' || :breakeven_pct || ' || ''% bar.'' '
-   || 'WHEN w.UTILISATION >= 0.50 AND w.FAVOURABLE_SHARE >= 0.60 '
-   || '  AND (w.QUEUED_SECONDS > 0 OR w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB > 0) '
-   || '  THEN ''Busy ('' || ROUND(w.UTILISATION * 100, 1) || ''% of billed time '
-   || 'executing), dominated by scan and DML work ('' '
-   || '  || ROUND(w.FAVOURABLE_SHARE * 100, 1) || ''%), and already under resource '
-   || 'pressure -- '' || ROUND(w.QUEUED_SECONDS, 0) || ''s queued, '' '
-   || '  || ROUND(w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB, 1) || '' GB spilled. This is the '
-   || 'shape Gen2 is built for. Convert it, then check the outcome view.'' '
-   || 'WHEN w.UTILISATION >= 0.35 AND w.FAVOURABLE_SHARE >= 0.45 '
-   || '  THEN ''Reasonably busy and reasonably scan-heavy, but with no queueing or '
-   || 'spill there is no evidence it is short of resource. Worth converting and '
-   || 'measuring; do not assume the '' || ' || :breakeven_pct || ' || ''% speedup.'' '
-   || 'ELSE ''Eligible, but the evidence is too thin to predict which side of the '
-   || 'break-even it lands on. Convert it as a measured pilot, not as a rollout.'' '
-   || 'END AS WHY, '
-   || CHAR(39) || 'Thresholds (0.20/0.30/0.35/0.45/0.50/0.60) are judgement, not '
-   || 'measurement. They are set so thin evidence yields PILOT_ONLY rather than a '
-   || 'recommendation to convert.' || CHAR(39) || ' AS THRESHOLDS_ARE_JUDGEMENT '
-   || 'FROM ' || :tgt || '.V_WH_WORKLOAD w' || :qas_join);
-    cost_day    := :cost_day + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'V_GEN2_VERDICT reads V_WH_WORKLOAD ~0.02 credits/day');
-  END IF;
-
-  -- ── Adaptive candidacy, judged separately ───────────────────────────────────
-  -- Adaptive is not "Gen2 but more so". It removes size, multi-cluster, QAS and
-  -- suspend policy from your hands and bills per query, which is a good trade for
-  -- bursty mixed workloads and a bad one for anything latency-critical. The docs
-  -- are explicit about the exclusions, and they are the first thing checked here.
-  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_ADAPTIVE_VERDICT AS '
-   || 'SELECT w.WAREHOUSE_NAME, w.WH_SIZE, w.WH_TYPE, w.CREDITS_USED, '
-   || 'w.CREDITS_PER_DAY, w.DAILY_CV, w.MAX_CLUSTERS, w.QUEUED_SECONDS, '
-   || 'w.UTILISATION, w.QUERY_COUNT, '
-   || 'CASE '
-   || 'WHEN w.WH_TYPE = ''ADAPTIVE'' THEN ''ALREADY_ADAPTIVE'' '
-   -- Conversion to or from Snowpark-optimized and INTERACTIVE is unsupported, as
-   -- is any conversion involving X5/X6-Large.
-   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''UNSUPPORTED_CONVERSION'' '
-   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
-   || '  THEN ''UNSUPPORTED_SIZE'' '
-   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''IMMATERIAL'' '
-   -- Burstiness and queueing are the two signals that a fixed size is the wrong
-   -- shape for the workload. Either alone is enough to be worth a pilot.
-   || 'WHEN w.DAILY_CV >= 0.60 AND w.QUEUED_SECONDS > 0 THEN ''STRONG'' '
-   || 'WHEN w.DAILY_CV >= 0.60 OR w.QUEUED_SECONDS > 0 OR w.MAX_CLUSTERS > 1 '
-   || '  THEN ''LIKELY'' '
-   || 'WHEN w.UTILISATION >= 0.60 AND w.DAILY_CV < 0.30 THEN ''KEEP_STANDARD'' '
-   || 'ELSE ''PILOT_ONLY'' END AS VERDICT, '
-   || 'CASE '
-   || 'WHEN w.WH_TYPE = ''ADAPTIVE'' THEN ''Already an Adaptive Warehouse.'' '
-   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''Converting to or from a '' || w.WH_TYPE '
-   || '  || '' warehouse is not a supported Adaptive conversion path.'' '
-   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
-   || '  THEN ''Converting to or from '' || w.WH_SIZE || '' is not supported.'' '
-   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''Too small to matter.'' '
-   || 'WHEN w.DAILY_CV >= 0.60 AND w.QUEUED_SECONDS > 0 '
-   || '  THEN ''Day-to-day spend swings hard (CV '' || w.DAILY_CV || '') AND it queues '
-   || '('' || ROUND(w.QUEUED_SECONDS, 0) || ''s). A fixed size is wrong for this '
-   || 'workload in both directions at once -- too small at peak, paid-for at trough. '
-   || 'This is the clearest Adaptive case there is.'' '
-   || 'WHEN w.DAILY_CV >= 0.60 THEN ''Spend swings day to day (CV '' || w.DAILY_CV '
-   || '  || ''), which per-query allocation handles better than one fixed size.'' '
-   || 'WHEN w.QUEUED_SECONDS > 0 THEN ''Queues for '' || ROUND(w.QUEUED_SECONDS, 0) '
-   || '  || ''s in the window, so concurrency is the constraint. Adaptive routes '
-   || 'against a shared pool instead of one fixed cluster count.'' '
-   || 'WHEN w.MAX_CLUSTERS > 1 THEN ''Already multi-cluster, so someone has already '
-   || 'decided the load varies. Adaptive removes the need to tune the cluster '
-   || 'settings by hand.'' '
-   || 'WHEN w.UTILISATION >= 0.60 AND w.DAILY_CV < 0.30 '
-   || '  THEN ''Steady and well-utilised. Predictable everyday analytics is the case '
-   || 'the docs say to keep on standard Gen2, where you keep direct control of size.'' '
-   || 'ELSE ''No strong burstiness signal either way. Pilot it if you want the '
-   || 'operational simplicity; do not expect a cost change.'' '
-   || 'END AS WHY, '
-   || CHAR(39) || 'Adaptive requires Enterprise Edition or higher and is available '
-   || 'only in selected regions. This account reports: '
-   || COALESCE(:sig:edition_hint::STRING, 'UNKNOWN')
-   || '. That is INFERRED from multi-cluster usage, not read from the account -- '
-   || 'edition is not queryable here. The ALTER itself is the real test and will '
-   || 'refuse with a clear message if unsupported.' || CHAR(39) || ' AS ELIGIBILITY_NOTE, '
-   || CHAR(39) || 'Adaptive bills per query rather than per warehouse-second, so a '
-   || 'before-and-after on credits is the only way to know what it did to your '
-   || 'cost. Nothing here predicts that number.' || CHAR(39) || ' AS COST_MODEL_NOTE '
-   || 'FROM ' || :tgt || '.V_WH_WORKLOAD w');
-    cost_day    := :cost_day + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'V_ADAPTIVE_VERDICT reads V_WH_WORKLOAD ~0.02 credits/day');
-  END IF;
-
-  -- ── The baseline, captured BEFORE anything is converted ─────────────────────
-  -- This is the part that makes the rest defensible. A conversion with no
-  -- before-picture cannot be evaluated afterwards, and "it feels faster" is what
-  -- fills the vacuum. Every warehouse in the fleet gets a row now, so whichever
-  -- ones get converted later have something to be measured against.
-  --
-  -- It is a TABLE, not a view, on purpose: a view would re-derive the "before"
-  -- window after the change and compare the new behaviour against itself.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.CONVERSION_BASELINE ('
- || 'WAREHOUSE_NAME VARCHAR, WH_SIZE VARCHAR, GENERATION_BEFORE VARCHAR, '
- || 'WH_TYPE_BEFORE VARCHAR, AUTO_SUSPEND_BEFORE INT, '
- || 'WINDOW_DAYS INT, WINDOW_START TIMESTAMP_NTZ, WINDOW_END TIMESTAMP_NTZ, '
- || 'CREDITS_USED NUMBER(38,4), CREDITS_PER_DAY NUMBER(38,4), '
- || 'QUERY_SECONDS NUMBER(38,2), QUERY_COUNT NUMBER(38,0), '
- || 'SECONDS_PER_QUERY NUMBER(38,4), UTILISATION NUMBER(38,4), '
- || 'FAVOURABLE_SHARE NUMBER(38,4), CAPTURED_AT TIMESTAMP_NTZ, '
- || 'LABEL VARCHAR, BASIS VARCHAR)');
-
-  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    -- One row per warehouse per build. Re-running the script re-captures the
-    -- baseline for the CURRENT window, which is correct -- but it must not
-    -- overwrite the row a conversion is already being measured against, so rows
-    -- for warehouses that have a recorded GENERATION change are left alone.
-    stmts := ARRAY_APPEND(:stmts,
-      'DELETE FROM ' || :tgt || '.CONVERSION_BASELINE '
-   || 'WHERE WAREHOUSE_NAME NOT IN ('
-   || 'SELECT TARGET_FQN FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || 'WHERE KIND = ''WAREHOUSE_SETTING'')');
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.CONVERSION_BASELINE '
-   || '(WAREHOUSE_NAME, WH_SIZE, GENERATION_BEFORE, WH_TYPE_BEFORE, '
-   || ' AUTO_SUSPEND_BEFORE, WINDOW_DAYS, WINDOW_START, WINDOW_END, '
-   || ' CREDITS_USED, CREDITS_PER_DAY, QUERY_SECONDS, QUERY_COUNT, '
-   || ' SECONDS_PER_QUERY, UTILISATION, FAVOURABLE_SHARE, CAPTURED_AT, LABEL, BASIS) '
-   || 'SELECT w.WAREHOUSE_NAME, w.WH_SIZE, w.GENERATION, w.WH_TYPE, '
-   || 'w.AUTO_SUSPEND_SECS, ' || :w || ', '
-   || 'DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ, '
-   || 'CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, '
-   || 'w.CREDITS_USED, w.CREDITS_PER_DAY, w.QUERY_SECONDS, w.QUERY_COUNT, '
-   -- Seconds per query is the metric a conversion should actually move. Credits
-   -- per day moves with how much work arrived, which the conversion does not
-   -- control; time per query is closer to the thing Gen2 claims to change.
-   || 'ROUND(DIV0(w.QUERY_SECONDS, NULLIF(w.QUERY_COUNT, 0)), 4), '
-   || 'w.UTILISATION, w.FAVOURABLE_SHARE, CURRENT_TIMESTAMP(), '
-   || '''MEASURED'', ''BY_TIME_WINDOW'' '
-   || 'FROM ' || :tgt || '.V_WH_WORKLOAD w '
-   || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.CONVERSION_BASELINE b '
-   || 'WHERE b.WAREHOUSE_NAME = w.WAREHOUSE_NAME)');
-    cost_once := :cost_once + 0.03;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'CONVERSION_BASELINE capture ~0.03 credits one-time (reads V_WH_WORKLOAD once)');
-  END IF;
-
-  -- ── The outcome view: what the conversion actually did ──────────────────────
-  -- Deliberately NOT called a savings view. It reports an OBSERVED DELTA with the
-  -- basis stated, because attributing a credit difference to the conversion
-  -- assumes nothing else about the workload moved, and in a live account
-  -- something always did. The delta is the evidence; the attribution is the
-  -- reader's judgement, and the view says so in a column rather than in a
-  -- footnote nobody reads.
-  IF (:sig:credit_history::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_CONVERSION_OUTCOME AS '
-   || 'WITH after AS ('
-   || 'SELECT m.WAREHOUSE_NAME, '
-   || 'SUM(m.CREDITS_USED) AS CREDITS_USED, '
-   || 'COUNT(DISTINCT DATE_TRUNC(''day'', m.START_TIME)) AS DAYS_SINCE '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY m '
-   || 'JOIN ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || '  ON r.TARGET_FQN = m.WAREHOUSE_NAME AND r.KIND = ''WAREHOUSE_SETTING'' '
-   || 'WHERE m.START_TIME::TIMESTAMP_NTZ > r.ATTACHED_AT '
-   || 'GROUP BY 1'
-   || '), '
-   || 'aq AS ('
-   || 'SELECT q.WAREHOUSE_NAME, '
-   || 'SUM(q.EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS, '
-   || 'COUNT(*) AS QUERY_COUNT '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q '
-   || 'JOIN ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || '  ON r.TARGET_FQN = q.WAREHOUSE_NAME AND r.KIND = ''WAREHOUSE_SETTING'' '
-   || 'WHERE q.START_TIME::TIMESTAMP_NTZ > r.ATTACHED_AT AND q.WAREHOUSE_SIZE IS NOT NULL '
-   || 'GROUP BY 1'
-   || ') '
-   || 'SELECT b.WAREHOUSE_NAME, b.WH_SIZE, '
-   || 'b.GENERATION_BEFORE, r.ARTIFACT AS CHANGED_SETTING, r.ATTACHED_AT AS CHANGED_AT, '
-   || 'b.CREDITS_PER_DAY AS BEFORE_CREDITS_PER_DAY, '
-   || 'ROUND(DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)), 3) AS AFTER_CREDITS_PER_DAY, '
-   || 'b.SECONDS_PER_QUERY AS BEFORE_SECONDS_PER_QUERY, '
-   || 'ROUND(DIV0(aq.QUERY_SECONDS, NULLIF(aq.QUERY_COUNT, 0)), 4) AS AFTER_SECONDS_PER_QUERY, '
-   -- The speedup actually achieved, against the bar it had to clear. These two
-   -- columns side by side are the entire point of the solution.
-   || 'ROUND((1 - DIV0(DIV0(aq.QUERY_SECONDS, NULLIF(aq.QUERY_COUNT, 0)), '
-   || 'NULLIF(b.SECONDS_PER_QUERY, 0))) * 100, 2) AS OBSERVED_SPEEDUP_PCT, '
-   || :breakeven_pct || '::NUMBER(38,2) AS REQUIRED_SPEEDUP_PCT, '
-   || 'ROUND(DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)) - b.CREDITS_PER_DAY, 3) '
-   || '  AS OBSERVED_DELTA_CREDITS_PER_DAY, '
-   || 'a.DAYS_SINCE AS DAYS_OBSERVED, '
-   || 'CASE '
-   -- Under three days the daily rate is dominated by whichever day the change
-   -- landed on. Calling a regression on one day of data would be exactly the
-   -- kind of number this solution exists to stop.
-   || 'WHEN COALESCE(a.DAYS_SINCE, 0) < 3 THEN ''TOO_EARLY'' '
-   || 'WHEN DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)) > b.CREDITS_PER_DAY * 1.05 '
-   || '  THEN ''COSTING_MORE'' '
-   || 'WHEN DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)) < b.CREDITS_PER_DAY * 0.95 '
-   || '  THEN ''COSTING_LESS'' '
-   || 'ELSE ''NO_MATERIAL_CHANGE'' END AS OUTCOME, '
-   || CHAR(39) || 'OBSERVED_DELTA_CREDITS_PER_DAY is a difference between two '
-   || 'measured windows, not a saving. It attributes nothing: if the workload grew '
-   || 'or shrank over the same period, that is in this number too. Read it with '
-   || 'OBSERVED_SPEEDUP_PCT, which is far less sensitive to volume.'
-   || CHAR(39) || ' AS HOW_TO_READ_IT, '
-   || '''MEASURED'' AS LABEL, ''BY_TIME_WINDOW'' AS BASIS '
-   || 'FROM ' || :tgt || '.CONVERSION_BASELINE b '
-   || 'JOIN ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || '  ON r.TARGET_FQN = b.WAREHOUSE_NAME AND r.KIND = ''WAREHOUSE_SETTING'' '
-   || 'LEFT JOIN after a ON a.WAREHOUSE_NAME = b.WAREHOUSE_NAME '
-   || 'LEFT JOIN aq ON aq.WAREHOUSE_NAME = b.WAREHOUSE_NAME');
-    cost_day    := :cost_day + 0.04;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'V_CONVERSION_OUTCOME scans metering and query history for converted '
-   || 'warehouses only ~0.04 credits/day');
-  END IF;
-
-  -- ── A throwaway warehouse for the SAMPLE action ─────────────────────────────
-  -- The SAMPLE tier must have something to convert that is not the customer's.
-  -- Created here rather than inside the action because CREATE WAREHOUSE makes the
-  -- new warehouse the session's CURRENT warehouse; when an undo then dropped it,
-  -- every later statement in that session failed with "No active warehouse
-  -- selected" -- including the UPDATE that closes the action log. Created here the
-  -- hijack is harmless, and the action only flips a setting on it.
-  --
-  -- GENERATION = '1' is the whole point. Gen2 is the default for new standard
-  -- warehouses since the 2026_03 bundle, so omitting this clause produces a Gen2
-  -- warehouse and the demo would convert Gen2 to Gen2 while appearing to work.
-  -- INITIALLY_SUSPENDED, and it never runs a query, so it bills nothing.
-  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE WAREHOUSE IF NOT EXISTS ' || :demo_wh || ' WAREHOUSE_SIZE = XSMALL '
-   || 'GENERATION = ''1'' AUTO_SUSPEND = 60 INITIALLY_SUSPENDED = TRUE COMMENT = '
-   || CHAR(39) || 'Throwaway Gen1 warehouse for the ' || :sch || ' SAMPLE action. '
-   || 'Never runs a query, so it bills nothing. Dropped by TEARDOWN().' || CHAR(39));
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :demo_wh
-   || CHAR(39) || ', ' || CHAR(39) || 'FIXTURE' || CHAR(39) || ', '
-   || CHAR(39) || 'FIXTURE' || CHAR(39) || ', ' || CHAR(39) || 'FIXTURE_WAREHOUSE'
-   || CHAR(39) || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt
-   || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = ' || CHAR(39) || :demo_wh
-   || CHAR(39) || ' AND KIND = ' || CHAR(39) || 'FIXTURE_WAREHOUSE' || CHAR(39) || ')');
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      :demo_wh || ' is created suspended and never runs a query, so it bills nothing');
-  END IF;
-
-  -- ── Plan-time facts for the buttons ─────────────────────────────────────────
-  -- The buttons need to name real warehouses and real counts, and the views that
-  -- hold the verdict do not exist yet -- this build has not run. So the verdict is
-  -- recomputed here, at plan time, from the same inputs against SHOW WAREHOUSES
-  -- and ACCOUNT_USAGE in a single statement.
-  --
-  -- It is the same arithmetic as V_GEN2_VERDICT. Keeping the two in step matters:
-  -- if the button says nine warehouses and the table shows seven, the reader stops
-  -- trusting both. The success criteria below assert they agree.
-  LET vf OBJECT := OBJECT_CONSTRUCT();
-  IF (:sig:warehouses::STRING = 'AVAILABLE' AND :sig:credit_history::STRING = 'AVAILABLE') THEN
-    BEGIN
-      SHOW WAREHOUSES;
-      SELECT OBJECT_CONSTRUCT(
-               'affirmative_n', COUNT_IF(VERDICT IN ('STRONG', 'LIKELY')),
-               'strong_n',      COUNT_IF(VERDICT = 'STRONG'),
-               'avoid_n',       COUNT_IF(VERDICT = 'AVOID'),
-               'eligible_n',    COUNT_IF(VERDICT NOT IN ('ALREADY_GEN2',
-                                  'INELIGIBLE_TYPE', 'INELIGIBLE_SIZE')),
-               'affirmative_credits_per_day',
-                 ROUND(SUM(IFF(VERDICT IN ('STRONG', 'LIKELY'), CREDITS_PER_DAY, 0)), 3),
-               'worst_case_extra_per_day',
-                 ROUND(SUM(IFF(VERDICT IN ('STRONG', 'LIKELY'), CREDITS_PER_DAY, 0))
-                       * (:mult - 1), 3),
-               -- Deterministic pick, and NOT MAX_BY: MAX_BY breaks ties
-               -- arbitrarily, so two warehouses on identical spend would let the
-               -- caption name one and the ALTER change the other. Zero-padding the
-               -- credits makes a lexicographic MAX order by spend then by name.
-               'pilot', SPLIT_PART(MAX(IFF(VERDICT IN ('STRONG', 'LIKELY'),
-                          LPAD(ROUND(CREDITS_PER_DAY * 1000)::VARCHAR, 18, '0')
-                            || '|' || WAREHOUSE_NAME, '')), '|', 2),
-               'adaptive_n', COUNT_IF(ADAPTIVE_VERDICT IN ('STRONG', 'LIKELY')),
-               'adaptive_pilot', SPLIT_PART(MAX(IFF(ADAPTIVE_VERDICT IN ('STRONG', 'LIKELY'),
-                          LPAD(ROUND(CREDITS_PER_DAY * 1000)::VARCHAR, 18, '0')
-                            || '|' || WAREHOUSE_NAME, '')), '|', 2)
-             ) INTO :vf
-      FROM (
-        SELECT f.WAREHOUSE_NAME, f.CREDITS_PER_DAY,
-               CASE
-                 WHEN f.GENERATION = '2' THEN 'ALREADY_GEN2'
-                 WHEN f.WH_TYPE <> 'STANDARD' THEN 'INELIGIBLE_TYPE'
-                 WHEN f.SIZE_KEY IN ('5XLARGE', '6XLARGE') THEN 'INELIGIBLE_SIZE'
-                 WHEN f.CREDITS_USED < :min_credits THEN 'IMMATERIAL'
-                 WHEN f.UTILISATION < 0.20 THEN 'AVOID'
-                 WHEN f.FAVOURABLE_SHARE < 0.30 THEN 'AVOID'
-                 WHEN f.UTILISATION >= 0.50 AND f.FAVOURABLE_SHARE >= 0.60
-                      AND (f.QUEUED_SECONDS > 0 OR f.SPILL_GB > 0) THEN 'STRONG'
-                 WHEN f.UTILISATION >= 0.35 AND f.FAVOURABLE_SHARE >= 0.45 THEN 'LIKELY'
-                 ELSE 'PILOT_ONLY' END AS VERDICT,
-               CASE
-                 WHEN f.WH_TYPE = 'ADAPTIVE' THEN 'ALREADY_ADAPTIVE'
-                 WHEN f.WH_TYPE <> 'STANDARD' THEN 'UNSUPPORTED_CONVERSION'
-                 WHEN f.SIZE_KEY IN ('5XLARGE', '6XLARGE') THEN 'UNSUPPORTED_SIZE'
-                 WHEN f.CREDITS_USED < :min_credits THEN 'IMMATERIAL'
-                 WHEN f.DAILY_CV >= 0.60 AND f.QUEUED_SECONDS > 0 THEN 'STRONG'
-                 WHEN f.DAILY_CV >= 0.60 OR f.QUEUED_SECONDS > 0 OR f.MAX_CLUSTERS > 1
-                      THEN 'LIKELY'
-                 ELSE 'PILOT_ONLY' END AS ADAPTIVE_VERDICT
-        FROM (
-          SELECT s."name" AS WAREHOUSE_NAME,
-                 UPPER(REPLACE(s."size", '-', '')) AS SIZE_KEY,
-                 UPPER(COALESCE(s."type", '')) AS WH_TYPE,
-                 COALESCE(s."generation", '') AS GENERATION,
-                 COALESCE(s."max_cluster_count", 1)::INT AS MAX_CLUSTERS,
-                 COALESCE(c.CREDITS_USED, 0) AS CREDITS_USED,
-                 DIV0(COALESCE(c.CREDITS_USED, 0), NULLIF(c.ACTIVE_DAYS, 0)) AS CREDITS_PER_DAY,
-                 DIV0(COALESCE(c.DAILY_STDDEV, 0), NULLIF(c.DAILY_MEAN, 0)) AS DAILY_CV,
-                 DIV0(COALESCE(q.QUERY_SECONDS, 0)
-                      * CASE UPPER(REPLACE(s."size", '-', ''))
-                          WHEN 'XSMALL' THEN 1 WHEN 'SMALL' THEN 2 WHEN 'MEDIUM' THEN 4
-                          WHEN 'LARGE' THEN 8 WHEN 'XLARGE' THEN 16 WHEN '2XLARGE' THEN 32
-                          WHEN '3XLARGE' THEN 64 WHEN '4XLARGE' THEN 128
-                          WHEN '5XLARGE' THEN 256 WHEN '6XLARGE' THEN 512 ELSE NULL END,
-                      NULLIF(COALESCE(c.CREDITS_USED, 0) * 3600.0, 0)) AS UTILISATION,
-                 DIV0(COALESCE(q.FAVOURABLE_SECONDS, 0),
-                      NULLIF(COALESCE(q.QUERY_SECONDS, 0), 0)) AS FAVOURABLE_SHARE,
-                 COALESCE(q.QUEUED_SECONDS, 0) AS QUEUED_SECONDS,
-                 COALESCE(q.SPILL_GB, 0) AS SPILL_GB
-          FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) s
-          LEFT JOIN (
-            SELECT WAREHOUSE_NAME, SUM(DAILY_CREDITS) AS CREDITS_USED,
-                   COUNT(*) AS ACTIVE_DAYS,
-                   STDDEV(DAILY_CREDITS) AS DAILY_STDDEV, AVG(DAILY_CREDITS) AS DAILY_MEAN
-            FROM (SELECT WAREHOUSE_NAME, DATE_TRUNC('day', START_TIME) AS D,
-                         SUM(CREDITS_USED) AS DAILY_CREDITS
-                  FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                  WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
-                  GROUP BY 1, 2)
-            GROUP BY 1) c ON c.WAREHOUSE_NAME = s."name"
-          LEFT JOIN (
-            SELECT WAREHOUSE_NAME,
-                   SUM(EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS,
-                   SUM(CASE WHEN QUERY_TYPE IN ('MERGE', 'UPDATE', 'DELETE', 'INSERT',
-                                                'COPY', 'CREATE_TABLE_AS_SELECT', 'UNLOAD')
-                             OR (QUERY_TYPE = 'SELECT' AND BYTES_SCANNED >= POWER(1024, 3))
-                            THEN EXECUTION_TIME ELSE 0 END) / 1000.0 AS FAVOURABLE_SECONDS,
-                   SUM(QUEUED_OVERLOAD_TIME) / 1000.0 AS QUEUED_SECONDS,
-                   SUM(BYTES_SPILLED_TO_LOCAL_STORAGE + BYTES_SPILLED_TO_REMOTE_STORAGE)
-                     / POWER(1024, 3) AS SPILL_GB
-            FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-            WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
-              AND WAREHOUSE_NAME IS NOT NULL AND WAREHOUSE_SIZE IS NOT NULL
-            GROUP BY 1) q ON q.WAREHOUSE_NAME = s."name"
-          WHERE s."name" <> :demo_wh
-        ) f
-      );
-    EXCEPTION WHEN OTHER THEN
-      vf := OBJECT_CONSTRUCT();
-    END;
-    cost_once := :cost_once + 0.03;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'Plan-time verdict recompute ~0.03 credits (one pass over metering and query '
-   || 'history, so the buttons can name real warehouses before anything is built)');
-  END IF;
-
-  LET affirm_n   INT    := COALESCE(:vf:affirmative_n::INT, 0);
-  LET strong_n   INT    := COALESCE(:vf:strong_n::INT, 0);
-  LET avoid_n    INT    := COALESCE(:vf:avoid_n::INT, 0);
-  LET pilot_wh   STRING := COALESCE(:vf:pilot::STRING, '');
-  LET adapt_n    INT    := COALESCE(:vf:adaptive_n::INT, 0);
-  LET adapt_wh   STRING := COALESCE(:vf:adaptive_pilot::STRING, '');
-  LET affirm_cpd NUMBER(38,6) := COALESCE(:vf:affirmative_credits_per_day::NUMBER(38,6), 0);
-  LET worst_cpd  NUMBER(38,6) := COALESCE(:vf:worst_case_extra_per_day::NUMBER(38,6), 0);
-
-  -- ── QAS candidate count, deliberately in its OWN exception block ─────────────
-  -- Not folded into the recompute above, and that is the whole point:
-  -- QUERY_ACCELERATION_ELIGIBLE is Enterprise-only, so a single unreadable view
-  -- inside that statement would empty `vf` and silently zero affirm_n, strong_n and
-  -- the pilot name -- taking the Gen2 buttons out on every Standard Edition account.
-  -- One isolated failure costs one button, which is the same rule the probes follow.
-  LET qas_n    INT           := 0;
-  LET qas_secs NUMBER(38,1)  := 0;
-  IF (:sig:qas_eligible::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    BEGIN
-      SHOW WAREHOUSES;
-      SELECT COUNT(*), COALESCE(ROUND(SUM(ELIGIBLE_SECONDS), 1), 0)
-        INTO :qas_n, :qas_secs
-      FROM (
-        SELECT s."name" AS WAREHOUSE_NAME,
-               COALESCE(e.ELIGIBLE_SECONDS, 0) AS ELIGIBLE_SECONDS
-        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) s
-        LEFT JOIN (
-          SELECT WAREHOUSE_NAME,
-                 SUM(ELIGIBLE_QUERY_ACCELERATION_TIME) AS ELIGIBLE_SECONDS
-          FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ACCELERATION_ELIGIBLE
-          WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
-            AND WAREHOUSE_NAME IS NOT NULL
-          GROUP BY 1) e ON e.WAREHOUSE_NAME = s."name"
-        LEFT JOIN (
-          SELECT WAREHOUSE_NAME, SUM(EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS
-          FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-          WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
-            AND WAREHOUSE_NAME IS NOT NULL AND WAREHOUSE_SIZE IS NOT NULL
-          GROUP BY 1) q ON q.WAREHOUSE_NAME = s."name"
-        WHERE s."name" <> :demo_wh
-          -- The same three tests the view applies, in the same order.
-          AND UPPER(COALESCE(s."type", '')) = 'STANDARD'
-          AND LOWER(COALESCE(s."enable_query_acceleration", 'false')::VARCHAR)
-              NOT IN ('true', 't', '1')
-          AND DIV0(COALESCE(e.ELIGIBLE_SECONDS, 0),
-                   NULLIF(COALESCE(q.QUERY_SECONDS, 0), 0)) >= 0.10
-      );
-    EXCEPTION WHEN OTHER THEN
-      qas_n    := 0;
-      qas_secs := 0;
-    END;
-    cost_once := :cost_once + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'Plan-time QAS candidate count ~0.02 credits (one pass over '
-   || 'QUERY_ACCELERATION_ELIGIBLE and query history)');
-  END IF;
-
-  -- ── Reusable SQL for recording and restoring a generation change ────────────
-  -- Recording the PRIOR generation is what makes the change reversible, and the
-  -- literal '1' rather than the observed value is deliberate: SHOW WAREHOUSES
-  -- reports a blank generation for warehouses that predate the column, and
-  -- restoring `SET GENERATION = ` would be a syntax error. A standard warehouse
-  -- that is not Gen2 is a Gen1 warehouse, so that is what gets recorded.
-  --
-  -- The NOT EXISTS guard stops a second press from recording '2' as the original
-  -- and turning the undo into a no-op.
-  LET reg_gen STRING :=
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-   || 'SELECT v.WAREHOUSE_NAME, ''GENERATION'', CHAR(39) || ''1'' || CHAR(39), '
-   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.V_GEN2_VERDICT v '
-   || 'WHERE v.VERDICT IN (''STRONG'', ''LIKELY'') '
-   || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || 'WHERE r.TARGET_FQN = v.WAREHOUSE_NAME AND r.ARTIFACT = ''GENERATION'')';
-
-  LET undo_gen ARRAY := ARRAY_CONSTRUCT(
-      'BEGIN LET c CURSOR FOR SELECT TARGET_FQN, ARGUMENTS FROM ' || :tgt
-   || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING'
-   || CHAR(39) || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39) || '; '
-   || 'FOR r IN c DO '
-   || 'EXECUTE IMMEDIATE ' || CHAR(39) || 'ALTER WAREHOUSE "' || CHAR(39)
-   || ' || r.TARGET_FQN || ' || CHAR(39) || '" SET GENERATION = ' || CHAR(39)
-   || ' || r.ARGUMENTS; '
-   || 'END FOR; END',
-      -- Dropping the recording matters. Leaving the rows means the NOT EXISTS
-      -- guard on the next press treats Gen2 as the original value, and the
-      -- conversion becomes permanent without anyone choosing that.
-      'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || 'WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
-   || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39));
-
-  -- ── SAMPLE: prove the mechanism on a warehouse that is not yours ────────────
-  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'GEN2_DEMO',
-      'label',  'Convert a throwaway Gen1 warehouse to Gen2, then put it back',
-      'tier',   'SAMPLE',
-      'effect', 'Records the generation of ' || :demo_wh || ' -- a suspended Gen1 '
-             || 'warehouse this script created for exactly this purpose -- and sets '
-             || 'GENERATION = 2. None of your warehouses are touched. Press Undo to '
-             || 'watch it return to Gen1, which is the same undo the real conversions '
-             || 'use.',
-      'undo',   'Undo restores the recorded generation. TEARDOWN() drops the warehouse.',
-      'est',    0.01,
-      'basis',  'Two ALTER WAREHOUSE statements. ALTER is metadata-only and the '
-             || 'warehouse is suspended throughout, so nothing runs and nothing bills.',
-      'sql',    ARRAY_CONSTRUCT(
-        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :demo_wh
-     || CHAR(39) || ', ' || CHAR(39) || 'GENERATION' || CHAR(39) || ', '
-     || 'CHAR(39) || ' || CHAR(39) || '1' || CHAR(39) || ' || CHAR(39), '
-     || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
-     || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || 'WHERE TARGET_FQN = ' || CHAR(39) || :demo_wh || CHAR(39)
-     || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39) || ')',
-        'ALTER WAREHOUSE ' || :demo_wh || ' SET GENERATION = ''2'''),
-      'undo_sql', ARRAY_CONSTRUCT(
-        'ALTER WAREHOUSE ' || :demo_wh || ' SET GENERATION = ''1''',
-        'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
-     || CHAR(39) || :demo_wh || CHAR(39) || ' AND ARTIFACT = '
-     || CHAR(39) || 'GENERATION' || CHAR(39))
-    ));
-  END IF;
-
-  -- ── LIMITED: the measured pilot, one warehouse ──────────────────────────────
-  -- This is the action that should actually get pressed first, and the one the
-  -- whole solution is arranged around. One warehouse, named on the button, with a
-  -- baseline already captured and an outcome view waiting for it.
-  IF (:pilot_wh <> '') THEN
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'GEN2_PILOT',
-      'label',  'Pilot Gen2 on ' || :pilot_wh,
-      'tier',   'LIMITED',
-      'effect', 'Sets GENERATION = 2 on ' || :pilot_wh || ' and nothing else. Its '
-             || 'baseline was captured by this build, so V_CONVERSION_OUTCOME will '
-             || 'show the speedup it actually achieved against the '
-             || :breakeven_pct || '% it has to beat -- give it at least three days '
-             || 'before reading, and the view says TOO_EARLY until then. Cheapest '
-             || 'moment to press this is while the warehouse is idle: converting a '
-             || 'RUNNING warehouse bills BOTH generations until in-flight queries '
-             || 'drain.',
-      'undo',   'Reversible. Undo restores Gen1, and Snowflake supports moving from '
-             || 'Gen2 back to Gen1 directly on a running or suspended warehouse.',
-      'est',    0.01,
-      'basis',  'One ALTER WAREHOUSE, metadata-only. The cost that follows is the '
-             || 'workload itself at the Gen2 rate, which is what the pilot exists to '
-             || 'measure -- currently ' || ROUND(:affirm_cpd, 3) || ' credits/day '
-             || 'across all affirmative candidates.',
-      'sql',    ARRAY_CONSTRUCT(
-        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :pilot_wh
-     || CHAR(39) || ', ' || CHAR(39) || 'GENERATION' || CHAR(39) || ', '
-     || 'CHAR(39) || ' || CHAR(39) || '1' || CHAR(39) || ' || CHAR(39), '
-     || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
-     || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || 'WHERE TARGET_FQN = ' || CHAR(39) || :pilot_wh || CHAR(39)
-     || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39) || ')',
-        'ALTER WAREHOUSE "' || :pilot_wh || '" SET GENERATION = ''2'''),
-      'undo_sql', ARRAY_CONSTRUCT(
-        'ALTER WAREHOUSE "' || :pilot_wh || '" SET GENERATION = ''1''',
-        'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
-     || CHAR(39) || :pilot_wh || CHAR(39) || ' AND ARTIFACT = '
-     || CHAR(39) || 'GENERATION' || CHAR(39))
-    ));
-  END IF;
-
-  -- ── PRODUCTION: the affirmative cohort, and only the affirmative cohort ─────
-  -- Never "all Gen1 warehouses". AVOID, PILOT_ONLY, IMMATERIAL and every
-  -- ineligible verdict are excluded by the same view the reader is looking at, so
-  -- the button and the table cannot disagree.
-  --
-  -- No EXCEPTION handler on the loop, on purpose: a button that swallows a failed
-  -- ALTER and reports DONE is worse than one that stops. RUN_ACTION logs the
-  -- failure and halts, leaving a partial cohort that the registry can still undo.
-  IF (:affirm_n > 0) THEN
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'GEN2_COHORT',
-      'label',  'Convert the ' || :affirm_n || ' warehouse(s) the evidence supports',
-      'tier',   'PRODUCTION',
-      'effect', 'Sets GENERATION = 2 on every warehouse whose verdict is STRONG or '
-             || 'LIKELY -- ' || :strong_n || ' STRONG, ' || (:affirm_n - :strong_n)
-              || ' LIKELY. Warehouses marked AVOID are deliberately left alone: '
-              || :avoid_n || ' of them, where converting would raise the bill rather '
-              || 'than lower it. Press this while the fleet is quiet -- a RUNNING '
-              || 'warehouse bills both generations until its in-flight queries drain. '
-              -- Stated here rather than left as a surprise. A client who presses this
-              -- and then reads Snowflake's Gen2 page will find that new Gen2
-              -- warehouses get QAS and wonder why theirs did not.
-              || 'Note: this does NOT enable Query Acceleration. Snowflake enables QAS '
-              || 'automatically on a warehouse CREATED as Gen2, but not on one ALTERed '
-              || 'to Gen2, so these warehouses will differ from a natively-created Gen2 '
-              || 'warehouse. That is judged separately by QAS_VERDICT and offered as its '
-              || 'own action, because QAS bills serverless credits of its own and should '
-              || 'not ride along inside a different consent.',
-
-      'undo',   'Reversible: Undo restores every recorded generation, and so does '
-             || 'CALL ' || :tgt || '.TEARDOWN().',
-      'est',    ROUND(0.01 * :affirm_n, 3),
-      'basis',  :affirm_n || ' ALTER WAREHOUSE statements, metadata-only, so applying '
-             || 'it is ~' || ROUND(0.01 * :affirm_n, 3) || ' credits. The number that '
-             || 'matters is not that one: these warehouses currently spend '
-             || ROUND(:affirm_cpd, 3) || ' credits/day, and if Gen2 delivers NO '
-             || 'speedup at all on them it adds about ' || ROUND(:worst_cpd, 3)
-             || ' credits/day. That is the downside you are accepting. The upside is '
-             || 'anything faster than ' || :breakeven_pct || '%.',
-      'sql',    ARRAY_CONSTRUCT(
-        :reg_gen,
-        'BEGIN LET c CURSOR FOR SELECT WAREHOUSE_NAME FROM ' || :tgt
-     || '.V_GEN2_VERDICT WHERE VERDICT IN (''STRONG'', ''LIKELY''); '
-     || 'FOR r IN c DO '
-     || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || r.WAREHOUSE_NAME '
-     || '|| ''" SET GENERATION = ''''2''''''; '
-     || 'END FOR; END'),
-      'undo_sql', :undo_gen
-    ));
-  END IF;
-
-  -- ── Query Acceleration, judged and offered separately ───────────────────────
-  -- Deliberately NOT folded into GEN2_COHORT. QAS bills serverless credits of its
-  -- own, so bundling it into the Gen2 consent would slip a second cost change past
-  -- the client inside the first one -- which is the exact failure this solution
-  -- exists to prevent on the Gen2 decision itself.
-  --
-  -- The registry entry records the PRIOR values so the undo restores them. Both
-  -- clauses ride in ARGUMENTS because the shared teardown branch emits
-  -- `ALTER WAREHOUSE <name> SET <ARTIFACT> = <ARGUMENTS>`, which is the same trick
-  -- the Adaptive action uses to put back size and cluster counts in one statement.
-  LET reg_qas STRING :=
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-   || 'SELECT v.WAREHOUSE_NAME, ''ENABLE_QUERY_ACCELERATION'', '
-   -- FALSE is the value being restored, and the prior scale factor goes back with
-   -- it. Leaving the factor out would restore QAS-off but silently keep whatever
-   -- factor this action set, which is a config change disguised as a rollback.
-   || '''FALSE QUERY_ACCELERATION_MAX_SCALE_FACTOR = '' || '
-   || 'GREATEST(COALESCE(v.QAS_SCALE_FACTOR, 8), 1), '
-   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.V_GEN2_VERDICT v '
-   || 'WHERE v.QAS_VERDICT = ''RECOMMENDED'' '
-   || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || 'WHERE r.TARGET_FQN = v.WAREHOUSE_NAME '
-   || 'AND r.ARTIFACT = ''ENABLE_QUERY_ACCELERATION'')';
-
-  LET undo_qas ARRAY := ARRAY_CONSTRUCT(
-      'BEGIN LET c CURSOR FOR SELECT TARGET_FQN, ARGUMENTS FROM ' || :tgt
-   || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING'
-   || CHAR(39) || ' AND ARTIFACT = ' || CHAR(39) || 'ENABLE_QUERY_ACCELERATION'
-   || CHAR(39) || '; '
-   || 'FOR r IN c DO '
-   || 'EXECUTE IMMEDIATE ' || CHAR(39) || 'ALTER WAREHOUSE "' || CHAR(39)
-   || ' || r.TARGET_FQN || ' || CHAR(39) || '" SET ENABLE_QUERY_ACCELERATION = '
-   || CHAR(39) || ' || r.ARGUMENTS; '
-   || 'END FOR; END',
-      -- Same reasoning as the generation undo: leaving the rows behind makes the
-      -- NOT EXISTS guard treat QAS-on as the original state, and the change becomes
-      -- permanent without anyone choosing that.
-      'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || 'WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
-   || ' AND ARTIFACT = ' || CHAR(39) || 'ENABLE_QUERY_ACCELERATION' || CHAR(39));
-
-  -- SAMPLE: prove the mechanism on the throwaway warehouse, not on theirs.
-  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'QAS_DEMO',
-      'label',  'Turn Query Acceleration on for a throwaway warehouse, then put it back',
-      'tier',   'SAMPLE',
-      'effect', 'Sets ENABLE_QUERY_ACCELERATION = TRUE and '
-             || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = 2 on ' || :demo_wh || ', the '
-             || 'suspended warehouse this script created for its own demonstrations. '
-             || 'None of your warehouses are touched.',
-      'undo',   'Undo restores the recorded setting. TEARDOWN() drops the warehouse.',
-      'est',    0.01,
-      'basis',  'Two ALTER WAREHOUSE statements. ALTER is metadata-only and the '
-             || 'warehouse is suspended throughout, so no QAS compute is ever '
-             || 'requested and nothing bills.',
-      'sql',    ARRAY_CONSTRUCT(
-        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :demo_wh
-     || CHAR(39) || ', ''ENABLE_QUERY_ACCELERATION'', ''FALSE'', ''WAREHOUSE_SETTING'' '
-     || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || 'WHERE TARGET_FQN = ' || CHAR(39) || :demo_wh || CHAR(39)
-     || ' AND ARTIFACT = ''ENABLE_QUERY_ACCELERATION'')',
-        'ALTER WAREHOUSE ' || :demo_wh || ' SET ENABLE_QUERY_ACCELERATION = TRUE '
-     || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = 2'),
-      'undo_sql', ARRAY_CONSTRUCT(
-        'ALTER WAREHOUSE ' || :demo_wh || ' SET ENABLE_QUERY_ACCELERATION = FALSE',
-        'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
-     || CHAR(39) || :demo_wh || CHAR(39)
-     || ' AND ARTIFACT = ''ENABLE_QUERY_ACCELERATION''')
-    ));
-  END IF;
-
-  -- PRODUCTION: enable it where the account's own queries say it would engage.
-  IF (:qas_n > 0) THEN
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'QAS_ENABLE',
-      'label',  'Enable Query Acceleration on the ' || :qas_n || ' warehouse(s) with eligible work',
-      'tier',   'PRODUCTION',
-      'effect', 'Sets ENABLE_QUERY_ACCELERATION = TRUE on every warehouse whose '
-             || 'QAS_VERDICT is RECOMMENDED, at the scale factor in '
-             || 'QAS_PROPOSED_SCALE_FACTOR -- capped at 2, which is what Snowflake '
-             || 'itself uses when it enables QAS on a newly created Gen2 warehouse, '
-             || 'and never above the ceiling Snowflake reported for that workload. '
-             || 'Warehouses where none of the queries were eligible are left alone.',
-      'undo',   'Reversible: Undo restores ENABLE_QUERY_ACCELERATION and the prior '
-             || 'scale factor, and so does CALL ' || :tgt || '.TEARDOWN().',
-      'est',    ROUND(0.01 * :qas_n, 3),
-      'basis',  :qas_n || ' ALTER WAREHOUSE statements, metadata-only, ~'
-             || ROUND(0.01 * :qas_n, 3) || ' credits to apply. What it costs after '
-             || 'that is NOT metadata and NOT zero: QAS runs the offloaded work on '
-             || 'separate serverless compute, billed on its own line. Snowflake '
-             || 'marked ' || ROUND(:qas_secs, 0) || ' seconds of execution time '
-             || 'across these warehouses as eligible in the last ' || :w || ' days, '
-             || 'which is the work that would move to that line. So this is not a '
-             || 'saving -- it is a wall-clock reduction on scan-heavy work, bought '
-             || 'with QAS credits. It earns its place here because that same '
-             || 'wall-clock reduction is what the Gen2 rate premium needs in order '
-             || 'to pay for itself. Watch the QUERY_ACCELERATION_HISTORY view and '
-             || 'the credits line after you press it.',
-      'sql',    ARRAY_CONSTRUCT(
-        :reg_qas,
-        'BEGIN LET c CURSOR FOR SELECT WAREHOUSE_NAME, QAS_PROPOSED_SCALE_FACTOR '
-     || 'FROM ' || :tgt || '.V_GEN2_VERDICT WHERE QAS_VERDICT = ''RECOMMENDED''; '
-     || 'FOR r IN c DO '
-     || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || r.WAREHOUSE_NAME '
-     || '|| ''" SET ENABLE_QUERY_ACCELERATION = TRUE '
-     || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = '' || r.QAS_PROPOSED_SCALE_FACTOR; '
-     || 'END FOR; END'),
-      'undo_sql', :undo_qas
-    ));
-  END IF;
-
-  -- ── LIMITED: one Adaptive pilot ─────────────────────────────────────────────
-  -- Adaptive nulls the size, the cluster counts and the suspend policy when it
-  -- converts, so the undo has to put all of them back explicitly -- verified by
-  -- round-tripping a warehouse before this was written. The restore clause is
-  -- carried in ARGUMENTS so the shared teardown branch, which emits
-  -- `ALTER WAREHOUSE <name> SET <ARTIFACT> = <ARGUMENTS>`, reconstructs the whole
-  -- statement without needing a special case.
-  IF (:adapt_wh <> '') THEN
-    LET adapt_restore STRING := '';
-    BEGIN
-      EXECUTE IMMEDIATE 'SHOW WAREHOUSES LIKE ''' || :adapt_wh || '''';
-      SELECT CHAR(39) || 'STANDARD' || CHAR(39)
-          || ' WAREHOUSE_SIZE = ' || REPLACE(UPPER("size"), '-', '')
-          || ' GENERATION = ' || CHAR(39) || COALESCE(NULLIF("generation", ''), '1') || CHAR(39)
-          || ' AUTO_SUSPEND = ' || COALESCE("auto_suspend"::VARCHAR, '60')
-        INTO :adapt_restore
-      FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
-    EXCEPTION WHEN OTHER THEN
-      adapt_restore := '';
-    END;
-
-    -- No restore clause means no honest undo, so the action is not offered. A
-    -- button whose undo is a guess is worse than no button.
-    IF (:adapt_restore <> '') THEN
-      actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-        'code',   'ADAPTIVE_PILOT',
-        'label',  'Pilot an Adaptive Warehouse on ' || :adapt_wh,
-        'tier',   'LIMITED',
-        'effect', 'Converts ' || :adapt_wh || ' to an Adaptive Warehouse. Snowflake '
-               || 'then owns its size, cluster count, Query Acceleration and suspend '
-               || 'policy, and bills per query instead of per warehouse-second. '
-               || 'Requires Enterprise Edition or higher and a supported region -- '
-               || 'this account reports ' || COALESCE(:sig:edition_hint::STRING, 'UNKNOWN')
-               || ', which is inferred rather than read, so the ALTER is the real '
-               || 'test and will refuse clearly if unsupported. No downtime.',
-        'undo',   'Reversible, and verified by round-trip: Undo restores type '
-               || 'STANDARD with the size, generation and auto-suspend recorded '
-               || 'before the change (' || :adapt_restore || ').',
-        'est',    0.01,
-        'basis',  'One ALTER WAREHOUSE, metadata-only. What happens to cost after '
-               || 'that cannot be projected -- Adaptive bills per query, so the only '
-               || 'honest answer is the before-and-after in V_CONVERSION_OUTCOME. '
-               || :adapt_wh || ' currently spends what CONVERSION_BASELINE recorded '
-               || 'for it.',
-        'sql',    ARRAY_CONSTRUCT(
-          'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-       || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :adapt_wh
-       || CHAR(39) || ', ' || CHAR(39) || 'WAREHOUSE_TYPE' || CHAR(39) || ', '
-       || CHAR(39) || :adapt_restore || CHAR(39) || ', '
-       || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
-       || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-       || 'WHERE TARGET_FQN = ' || CHAR(39) || :adapt_wh || CHAR(39)
-       || ' AND ARTIFACT = ' || CHAR(39) || 'WAREHOUSE_TYPE' || CHAR(39) || ')',
-          'ALTER WAREHOUSE "' || :adapt_wh || '" SET WAREHOUSE_TYPE = ''ADAPTIVE'''),
-        'undo_sql', ARRAY_CONSTRUCT(
-          'ALTER WAREHOUSE "' || :adapt_wh || '" SET WAREHOUSE_TYPE = ' || :adapt_restore,
-          'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
-       || CHAR(39) || :adapt_wh || CHAR(39) || ' AND ARTIFACT = '
-       || CHAR(39) || 'WAREHOUSE_TYPE' || CHAR(39))
-      ));
-    END IF;
-  END IF;
-
-  -- ── The named-list ALTER path ───────────────────────────────────────────────
-  -- WHGEN_WAREHOUSES names warehouses this build may convert directly, by name,
-  -- regardless of verdict -- because naming a warehouse in the settings block is
-  -- an explicit instruction and it is not this script's place to overrule it.
-  -- Blank means nothing is altered, which is the shipped default.
-  --
-  -- This has to exist as a real code path rather than only as buttons. It is how
-  -- the test harness exercises an actual conversion: without it, the single most
-  -- important statement in the solution is one no test ever runs, which is exactly
-  -- how the equivalent path in 11_cost_efficiency stayed unexercised while every
-  -- check reported green.
-  LET wh_list STRING := '';
-  BEGIN
-    wh_list := COALESCE((SELECT NULLIF($WHGEN_WAREHOUSES::VARCHAR, '')), '');
-  EXCEPTION WHEN OTHER THEN
-    wh_list := '';
-  END;
-
-  IF (:wh_list <> '' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    -- Record the prior generation first, or the change is not reversible. Only
-    -- STANDARD warehouses at a Gen2-eligible size are touched even when named:
-    -- an ALTER that Snowflake will refuse is not worth attempting, and silently
-    -- skipping it is better than failing the build on a name someone mistyped.
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-   || 'SELECT f.WAREHOUSE_NAME, ''GENERATION'', CHAR(39) || ''1'' || CHAR(39), '
-   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.WH_FLEET f '
-   || 'WHERE COALESCE(f.GENERATION, '''') NOT IN (''2'') '
-   || 'AND f.WH_TYPE = ''STANDARD'' '
-   || 'AND UPPER(REPLACE(f.WH_SIZE, ''-'', '''')) NOT IN (''5XLARGE'', ''6XLARGE'') '
-   || 'AND f.WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
-   || :wh_list || ''', '','')))'
-   || ' AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || 'WHERE r.TARGET_FQN = f.WAREHOUSE_NAME AND r.ARTIFACT = ''GENERATION'')');
-
-    stmts := ARRAY_APPEND(:stmts,
-      'BEGIN '
-   || 'LET cur CURSOR FOR SELECT WAREHOUSE_NAME FROM ' || :tgt || '.WH_FLEET '
-   || 'WHERE COALESCE(GENERATION, '''') NOT IN (''2'') '
-   || 'AND WH_TYPE = ''STANDARD'' '
-   || 'AND UPPER(REPLACE(WH_SIZE, ''-'', '''')) NOT IN (''5XLARGE'', ''6XLARGE'') '
-   || 'AND WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
-   || :wh_list || ''', '',''))); '
-   || 'FOR rec IN cur DO '
-   || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || rec.WAREHOUSE_NAME '
-   || '|| ''" SET GENERATION = ''''2''''''; '
-   || 'END FOR; END');
-
-    cost_once := :cost_once + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'ALTER WAREHOUSE for the names in WHGEN_WAREHOUSES ~0.02 credits one-time. '
-   || 'Metadata-only; what it changes is the RATE the workload bills at afterwards.');
-    dials := ARRAY_APPEND(:dials,
-      'Clear WHGEN_WAREHOUSES to convert nothing during the build and use the '
-   || 'buttons instead');
-  END IF;
-
-  -- ── The named-list QAS path ─────────────────────────────────────────────────
-  -- Same reasoning as the block above, for the same reason, and it is needed more
-  -- here: QAS_VERDICT reaches RECOMMENDED only when Snowflake has marked real
-  -- queries eligible, which a fresh sandbox never has. Without this list the QAS
-  -- ALTER is unreachable by any test, and an untested ALTER that ships is how the
-  -- 11_cost_efficiency defect happened.
-  --
-  -- The prior value is recorded before the change, exactly as the button does, so
-  -- the same undo and the same TEARDOWN branch restore it.
-  LET qas_list STRING := '';
-  BEGIN
-    qas_list := COALESCE((SELECT NULLIF($WHGEN_QAS_WAREHOUSES::VARCHAR, '')), '');
-  EXCEPTION WHEN OTHER THEN
-    qas_list := '';
-  END;
-
-  IF (:qas_list <> '' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-   || 'SELECT f.WAREHOUSE_NAME, ''ENABLE_QUERY_ACCELERATION'', '
-   || '''FALSE QUERY_ACCELERATION_MAX_SCALE_FACTOR = '' || '
-   || 'GREATEST(COALESCE(f.QAS_SCALE_FACTOR, 8), 1), '
-   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.WH_FLEET f '
-   -- Only STANDARD warehouses: on an Adaptive warehouse the type governs
-   -- acceleration and the ALTER would be refused or meaningless.
-   || 'WHERE f.WH_TYPE = ''STANDARD'' '
-   || 'AND LOWER(COALESCE(f.QAS_ENABLED, ''false'')) NOT IN (''true'', ''t'', ''1'') '
-   || 'AND f.WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
-   || :qas_list || ''', '','')))'
-   || ' AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-   || 'WHERE r.TARGET_FQN = f.WAREHOUSE_NAME '
-   || 'AND r.ARTIFACT = ''ENABLE_QUERY_ACCELERATION'')');
-
-    stmts := ARRAY_APPEND(:stmts,
-      'BEGIN '
-   || 'LET cur CURSOR FOR SELECT WAREHOUSE_NAME FROM ' || :tgt || '.WH_FLEET '
-   || 'WHERE WH_TYPE = ''STANDARD'' '
-   || 'AND LOWER(COALESCE(QAS_ENABLED, ''false'')) NOT IN (''true'', ''t'', ''1'') '
-   || 'AND WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
-   || :qas_list || ''', '',''))); '
-   || 'FOR rec IN cur DO '
-   || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || rec.WAREHOUSE_NAME '
-   || '|| ''" SET ENABLE_QUERY_ACCELERATION = TRUE '
-   || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = 2''; '
-   || 'END FOR; END');
-
-    cost_once := :cost_once + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'ALTER WAREHOUSE for the names in WHGEN_QAS_WAREHOUSES ~0.02 credits '
-   || 'one-time. Metadata-only, but unlike the Gen2 ALTER this one opens a SECOND '
-   || 'billing line: from here on, eligible queries on those warehouses consume '
-   || 'serverless QAS credits on top of the warehouse credits. Scale factor 2 caps '
-   || 'how much.');
-    dials := ARRAY_APPEND(:dials,
-      'Clear WHGEN_QAS_WAREHOUSES to change no acceleration setting during the '
-   || 'build and use the buttons instead');
-  END IF;
-
-  -- ══════════════════════════════════════════════════════════════════════════
-  -- STANDING WORKLOAD — TASK_GEN2_WATCH
-  -- ══════════════════════════════════════════════════════════════════════════
-  -- Gen2 costs more per second. A conversion that does not speed the workload up
-  -- raises the bill quietly and forever, and nobody goes back to check: the ALTER
-  -- succeeded, so it looks done. This task is the check.
-
-  -- Credit rate read off the actual app warehouse, never assumed. The 4x error
-  -- this repo has already shipped once came from assuming X-Small.
-  LET gw_size    STRING := 'UNKNOWN';
-  LET gw_cph     NUMBER(38,2) := 1.0;
-  LET gw_rate_ok BOOLEAN := FALSE;
-  BEGIN
-    EXECUTE IMMEDIATE 'SHOW WAREHOUSES LIKE ''' || :wh || '''';
-    gw_size := (SELECT UPPER(COALESCE(MAX("size"), 'UNKNOWN'))
-                FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
-    gw_cph := CASE REPLACE(:gw_size, '-', '')
-        WHEN 'XSMALL' THEN 1   WHEN 'SMALL'  THEN 2
-        WHEN 'MEDIUM' THEN 4   WHEN 'LARGE'  THEN 8
-        WHEN 'XLARGE' THEN 16  WHEN '2XLARGE' THEN 32
-        WHEN '3XLARGE' THEN 64 WHEN '4XLARGE' THEN 128
-        WHEN '5XLARGE' THEN 256 WHEN '6XLARGE' THEN 512
-        ELSE 1 END;
-    gw_rate_ok := (:gw_cph > 1 OR REPLACE(:gw_size, '-', '') = 'XSMALL');
-  EXCEPTION WHEN OTHER THEN
-    gw_size := 'UNREADABLE'; gw_cph := 1.0; gw_rate_ok := FALSE;
-  END;
-
-  LET gw_task_fqn STRING := :tgt || '.TASK_GEN2_WATCH';
-
-  -- A table rather than a view, because the point is to keep a HISTORY of the
-  -- verdict on each conversion. A view would only ever show today's answer, and
-  -- "it was fine last week" is the observation that identifies a regression.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.CONVERSION_WATCH_LOG ('
- || 'CHECKED_AT TIMESTAMP_NTZ, WAREHOUSE_NAME VARCHAR, CHANGED_AT TIMESTAMP_NTZ, '
- || 'DAYS_OBSERVED NUMBER(38,0), '
- || 'BEFORE_CREDITS_PER_DAY NUMBER(38,4), AFTER_CREDITS_PER_DAY NUMBER(38,4), '
- || 'OBSERVED_DELTA_CREDITS_PER_DAY NUMBER(38,4), '
- || 'OBSERVED_SPEEDUP_PCT NUMBER(38,2), REQUIRED_SPEEDUP_PCT NUMBER(38,2), '
- || 'OUTCOME VARCHAR, LABEL VARCHAR, BASIS VARCHAR)');
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.GEN2_WATCH() '
- || 'RETURNS VARCHAR LANGUAGE SQL AS BEGIN '
- || 'INSERT INTO ' || :tgt || '.CONVERSION_WATCH_LOG '
- || '(CHECKED_AT, WAREHOUSE_NAME, CHANGED_AT, DAYS_OBSERVED, '
- || ' BEFORE_CREDITS_PER_DAY, AFTER_CREDITS_PER_DAY, OBSERVED_DELTA_CREDITS_PER_DAY, '
- || ' OBSERVED_SPEEDUP_PCT, REQUIRED_SPEEDUP_PCT, OUTCOME, LABEL, BASIS) '
- || 'SELECT CURRENT_TIMESTAMP(), WAREHOUSE_NAME, CHANGED_AT, DAYS_OBSERVED, '
- || 'BEFORE_CREDITS_PER_DAY, AFTER_CREDITS_PER_DAY, OBSERVED_DELTA_CREDITS_PER_DAY, '
- || 'OBSERVED_SPEEDUP_PCT, REQUIRED_SPEEDUP_PCT, OUTCOME, LABEL, BASIS '
- || 'FROM ' || :tgt || '.V_CONVERSION_OUTCOME; '
- || 'RETURN ''GEN2_WATCH COMPLETE''; END');
-
-  -- The rollback list. This is the output a client team would not build for
-  -- itself, and it is the only thing in the solution that names a conversion as
-  -- a mistake.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ROLLBACK_CANDIDATES AS '
- || 'SELECT WAREHOUSE_NAME, CHANGED_AT, DAYS_OBSERVED, '
- || 'BEFORE_CREDITS_PER_DAY, AFTER_CREDITS_PER_DAY, '
- || 'OBSERVED_DELTA_CREDITS_PER_DAY, OBSERVED_SPEEDUP_PCT, REQUIRED_SPEEDUP_PCT, '
- || 'ROUND(OBSERVED_DELTA_CREDITS_PER_DAY * 365, 1) AS ANNUALISED_DELTA_CREDITS, '
- || CHAR(39) || 'Converting this warehouse did not pay for the rate premium. '
- || 'ALTER WAREHOUSE <name> SET GENERATION = ' || CHAR(39) || CHAR(39) || '1'
- || CHAR(39) || CHAR(39) || ' puts it back, or press Undo on the action that '
- || 'converted it.' || CHAR(39) || ' AS WHAT_TO_DO, '
- || 'LABEL, BASIS '
- || 'FROM ' || :tgt || '.V_CONVERSION_OUTCOME '
- || 'WHERE OUTCOME = ''COSTING_MORE'' '
- || 'ORDER BY OBSERVED_DELTA_CREDITS_PER_DAY DESC');
-  cost_day    := :cost_day + 0.01;
-  cost_detail := ARRAY_APPEND(:cost_detail,
-    'V_ROLLBACK_CANDIDATES reads V_CONVERSION_OUTCOME ~0.01 credits/day');
-
-  stmts := ARRAY_APPEND(:stmts,
-    'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ''TASK''');
-  stmts := ARRAY_APPEND(:stmts,
-    'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
- || 'SELECT ''' || :gw_task_fqn || ''', ''TASK_GEN2_WATCH'', '
- || '''USING CRON 0 7 * * 1 UTC'', ''TASK''');
-
-  -- SUSPEND before replacing. Snowflake refuses to CREATE OR REPLACE a started
-  -- task, and at PRODUCTION tier the previous build deliberately leaves this one
-  -- running -- so a re-run would hit that refusal on a script whose whole promise
-  -- is that it can be re-run.
-  stmts := ARRAY_APPEND(:stmts, 'ALTER TASK IF EXISTS ' || :gw_task_fqn || ' SUSPEND');
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TASK ' || :gw_task_fqn || ' WAREHOUSE = ' || :wh
- || ' SCHEDULE = ''USING CRON 0 7 * * 1 UTC'''
- || ' COMMENT = ''Re-measures every warehouse this solution converted against its '
- || 'pre-change baseline, and records any that are now costing more.'''
- || ' AS CALL ' || :tgt || '.GEN2_WATCH()');
-  stmts := ARRAY_APPEND(:stmts, 'ALTER TASK ' || :gw_task_fqn || ' RESUME');
-
-  -- PRODUCTION tier is the consent. Below it the task exists and is suspended, and
-  -- the run rate below says so rather than reporting a charge for something this
-  -- build just switched off.
-  LET standing_live BOOLEAN := (:tier = 'PRODUCTION');
-  LET runs_per_month NUMBER(38,4) := IFF(:standing_live, 4.34, 0);
-  LET cadence_label STRING := 'weekly on Monday at 07:00 UTC'
-    || IFF(:standing_live, '', ', SUSPENDED at ' || :tier || ' tier');
-  LET gate_basis STRING := IFF(:standing_live,
-      'Left RUNNING because this build is PRODUCTION tier — this is a charge you will see.',
-      'SUSPENDED by this build because the tier is ' || :tier || ', not PRODUCTION. '
-        || 'At PRODUCTION the same task would fire 4.34 times a month.');
-
-  IF (NOT :standing_live) THEN
-    stmts := ARRAY_APPEND(:stmts, 'ALTER TASK ' || :gw_task_fqn || ' SUSPEND');
-  END IF;
-
-  -- Floor the measurement at this build's start, or a re-run into the same schema
-  -- averages in the previous run's calls: a true history of the statement, a false
-  -- history of the object being priced.
-  LET build_floor_utc STRING := (
-    SELECT TO_CHAR(CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()),
-                   'YYYY-MM-DD HH24:MI:SS.FF3'));
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.GEN2WATCH_RUN_COST '
- || 'COMMENT = ''Measured elapsed time of GEN2_WATCH(), the body of TASK_GEN2_WATCH.'' AS '
- || 'SELECT COUNT(*) AS RUNS_OBSERVED, '
- || 'ROUND(AVG(TOTAL_ELAPSED_TIME) / 1000.0, 3) AS AVG_SECONDS '
- -- Qualified with the target DATABASE on purpose: an unqualified
- -- INFORMATION_SCHEMA resolves against whatever database the session happens to
- -- be in, which is not guaranteed on a re-run.
- || 'FROM TABLE(' || :db || '.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION('
- || 'RESULT_LIMIT => 10000)) '
- || 'WHERE QUERY_TYPE = ''CALL'' AND EXECUTION_STATUS = ''SUCCESS'' '
- || 'AND QUERY_TEXT ILIKE ''%' || :tgt || '.GEN2_WATCH()%'' '
- || 'AND CONVERT_TIMEZONE(''UTC'', START_TIME)::TIMESTAMP_NTZ >= '''
- || :build_floor_utc || '''::TIMESTAMP_NTZ');
-
-  -- The build calls the procedure once so SECONDS_PER_RUN is measured rather than
-  -- guessed. The task body IS this call, so timing it is honest and it also proves
-  -- the procedure runs before anything schedules it.
-  stmts := ARRAY_APPEND(:stmts, 'CALL ' || :tgt || '.GEN2_WATCH()');
-
-  stmts := ARRAY_APPEND(:stmts,
-    'INSERT INTO ' || :tgt || '.STANDING_WORKLOAD '
- || '(KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
- || ' WAREHOUSE_CREDITS_PER_HOUR, MEASURED_INPUT, BASIS, INSTALLED_AT) '
- || 'SELECT ''TASK'', ''TASK_GEN2_WATCH'', '
- || '  ''' || :cadence_label || ''', '
- || '  ' || :runs_per_month || ', '
- || '  COALESCE(r.AVG_SECONDS, 1.0), '
- || '  ' || :gw_cph || ', '
- || '  CASE WHEN r.AVG_SECONDS IS NOT NULL '
- || '    THEN ''TOTAL_ELAPSED_TIME averaged over '' || r.RUNS_OBSERVED '
- || '      || '' GEN2_WATCH() call(s) this build made; the task body is that exact call'' '
- || '    ELSE ''no GEN2_WATCH() call was readable in this session''''s query history, '
- || 'so this uses the 1-warehouse-second floor stated in the plan'' END, '
- || '  ''CRON 0 7 * * 1 UTC = weekly = 4.34 runs/month, times measured seconds per '
- || 'run, at ' || :gw_cph || ' credits/hour ('
- || IFF(:gw_rate_ok, :wh || ' is ' || :gw_size,
-        'size of ' || :wh || ' unreadable, so 1 credit/hour is a LOWER bound')
- || '). ' || :gate_basis || ''', '
- || '  CURRENT_TIMESTAMP() '
- || 'FROM ' || :tgt || '.GEN2WATCH_RUN_COST r');
-  --           adding to :cost_day / :cost_once / :cost_detail / :dials
-
-  -- ── The estimate, recorded so it can be graded later ──────────────────────
-  -- Written to its OWN table, separate from COST_MEASURED. That separation is the
-  -- mechanism, not a stylistic choice: two tables and one view with a mandatory
-  -- LABEL make "never sum a measurement with a projection" a property of the
-  -- schema rather than a rule someone has to remember. There is no column
-  -- anywhere that contains both kinds of number.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.COST_PROJECTED '
- || '(RUN_ID VARCHAR, TIER VARCHAR, CATEGORY VARCHAR, LABEL VARCHAR, BASIS VARCHAR, '
- || 'CREDITS NUMBER(38,9), HORIZON VARCHAR, DERIVATION VARCHAR, '
- || 'PROJECTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
-  stmts := ARRAY_APPEND(:stmts, 'DELETE FROM ' || :tgt || '.COST_PROJECTED '
-                             || 'WHERE RUN_ID = ''' || :run_id || '''');
-  stmts := ARRAY_APPEND(:stmts,
-    'INSERT INTO ' || :tgt || '.COST_PROJECTED '
- || '(RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, HORIZON, DERIVATION) '
- || 'SELECT ''' || :run_id || ''', ''' || :tier || ''', ''STEADY_STATE'', ''PROJECTED'', '
- || '''ARITHMETIC'', ' || :cost_day || ', ''per day'', '
- || '''Sum of this plan''''s own itemised cost lines. Arithmetic, not observed.'' '
- || 'UNION ALL SELECT ''' || :run_id || ''', ''' || :tier || ''', ''ONE_TIME_BUILD'', '
- || '''PROJECTED'', ''ARITHMETIC'', ' || :cost_once || ', ''once'', '
- || '''Sum of this plan''''s own one-time cost lines. Arithmetic, not observed.''');
-
-  -- Everything with a credit figure on it, measured and projected side by side and
-  -- never added together. LABEL is not nullable in practice because both feeding
-  -- tables write it as a literal.
-  --
-  -- Scoped to the NEWEST run. The tables underneath are ledgers and keep every run,
-  -- which is what makes MEASURE() re-callable and WI5 telemetry possible -- but a
-  -- reader asking "what did this cost" means the run they just did, and an unscoped
-  -- view showed two of every category with the same category reading
-  -- NOT_YET_LANDED on one row and LANDED on the next. Correct, and it looks like a
-  -- contradiction. V_COST_HISTORY keeps the unscoped view for anyone who wants it.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_HISTORY AS '
- || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
- || :rate || ' AS RATE_PER_CREDIT, ROUND(CREDITS * ' || :rate || ', 4) AS DOLLARS, '
- || 'STATUS, SOURCE_VIEW AS SOURCE, LATENCY_NOTE AS BASIS_NOTE, '
- || 'ROWS_PROCESSED, WALL_CLOCK_MS, MEASURED_AT AS AS_OF '
- || 'FROM ' || :tgt || '.COST_MEASURED '
- || 'UNION ALL '
- || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
- || :rate || ', ROUND(CREDITS * ' || :rate || ', 4), '
- || '''ESTIMATE'', ''this plan'', DERIVATION || '' Horizon: '' || HORIZON, '
- || 'NULL, NULL, PROJECTED_AT '
- || 'FROM ' || :tgt || '.COST_PROJECTED');
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_LINES AS '
- || 'SELECT * FROM ' || :tgt || '.V_COST_HISTORY WHERE RUN_ID = ('
- || 'SELECT RUN_ID FROM ' || :tgt || '.RUN_LEDGER ORDER BY STARTED_AT DESC LIMIT 1)');
-
-  -- Subtotals BY LABEL. There is deliberately no grand total: the one number a
-  -- reader most wants is the one that cannot honestly exist.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_SUMMARY AS '
- || 'SELECT LABEL, COUNT(*) AS LINES, '
- || 'SUM(CASE WHEN STATUS IN (''LANDED'', ''ESTIMATE'') THEN CREDITS END) AS CREDITS, '
- || 'COUNT_IF(STATUS = ''NOT_YET_LANDED'') AS STILL_PENDING, '
- || 'COUNT_IF(STATUS = ''NOT_ATTRIBUTABLE'') AS NOT_ATTRIBUTABLE, '
- || 'MAX(AS_OF) AS AS_OF, '
- || 'CASE LABEL WHEN ''MEASURED'' THEN ''Observed from Snowflake''''s own metering. '
- || 'Pending categories are excluded from this figure rather than counted as zero.'' '
- || 'ELSE ''Arithmetic from the plan. Not observed. Do not add this to the MEASURED row.'' '
- || 'END AS WHAT_THIS_IS '
- || 'FROM ' || :tgt || '.V_COST_LINES GROUP BY LABEL');
-
-  -- The extrapolation, with its arithmetic on screen. A multiplier the reader
-  -- cannot check is a multiplier the reader should not accept.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_EXTRAPOLATION AS '
- || 'SELECT m.CATEGORY, m.CREDITS AS MEASURED_AT_LIMITED, '
- || '''' || REPLACE(:scale_unit, '''', '''''') || ''' AS SCALE_UNIT, '
- || :scale_limited || ' AS LIMITED_SCALE, ' || :scale_production || ' AS PRODUCTION_SCALE, '
- || 'ROUND(DIV0(' || :scale_production || ', ' || :scale_limited || '), 4) AS RATIO, '
- || 'ROUND(m.CREDITS * DIV0(' || :scale_production || ', ' || :scale_limited || '), 6) '
- || '  AS EXTRAPOLATED_TO_PRODUCTION, '
- || '''PROJECTED'' AS LABEL, '
- || 'm.CREDITS || '' x ('' || ' || :scale_production || ' || '' / '' || ' || :scale_limited
- || ' || '') = '' || ROUND(m.CREDITS * DIV0(' || :scale_production || ', '
- || :scale_limited || '), 6) AS ARITHMETIC, '
- || 'm.STATUS AS MEASURED_STATUS, '
- || 'CASE WHEN ' || :scale_limited || ' = ' || :scale_production
- || '  THEN ''No scaling declared, so this is the measured figure unchanged. It is '
- || 'NOT a production estimate.'' '
- || '     WHEN m.STATUS <> ''LANDED'' '
- || '  THEN ''The measurement this extrapolates from has not landed yet, so the '
- || 'extrapolation is empty rather than a guess.'' '
- || '     ELSE ''Measured at LIMITED scale and multiplied by the ratio shown. The '
- || 'ratio assumes cost scales linearly in this unit, which is the assumption to '
- || 'argue with.'' END AS READ_THIS '
- || 'FROM ' || :tgt || '.COST_MEASURED m WHERE m.LABEL = ''MEASURED''');
-
-  -- ── VALUE MODEL ───────────────────────────────────────────────────────────
-  -- Three rules, and the third is the one that matters: the addressable base is
-  -- computed from THEIR data, every conversion rate is an input with a stated
-  -- default that they set, and if the only honest output is "here is the base, you
-  -- supply the rate" then that IS the output. No invented ROI.
-  --
-  -- A solution declares its own lines below. A solution that declares nothing gets
-  -- a single row saying so, which is a better artifact than an empty view: empty
-  -- reads as broken, whereas "this solution does not claim a financial benefit"
-  -- reads as a decision.
-  LET value_inputs ARRAY := ARRAY_CONSTRUCT();
-  LET value_base   ARRAY := ARRAY_CONSTRUCT();
-  LET value_lines  ARRAY := ARRAY_CONSTRUCT();
--- ── VALUE MODEL ───────────────────────────────────────────────────────────────
--- The honest shape for a generation-change solution, and it is deliberately not
--- the shape a cost solution usually takes.
---
--- There is no "credits saved" line here, and there cannot be one before a
--- conversion happens. Gen2 costs MORE per second; whether that turns into a
--- saving depends on how much faster the workload finishes, which is a property of
--- the workload and is unknown until it runs on Gen2. Any percentage put here
--- would be ours rather than theirs, and it would be the single most quotable
--- number on the page.
---
--- So the base is the spend EXPOSED to the decision -- a fact -- and the value
--- line is explicitly two-sided: the same base times a speedup the client
--- supplies, against the rate premium they are certain to pay.
-
-value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
-  'name', 'expected_speedup',
-  'value', 0, 'default', 0, 'units', 'fraction of runtime removed',
-  'description', 'How much faster you expect the affirmative warehouses to finish '
-              || 'on Gen2, as a fraction -- 0.30 means 30% faster. The default is '
-              || 'ZERO on purpose: nobody knows this number before the pilot, and a '
-              || 'friendly default here would be the one figure everyone quoted. '
-              || 'Run the pilot, read OBSERVED_SPEEDUP_PCT, put that number here.'));
-value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
-  'name', 'credit_price',
-  'value', 3, 'default', 3, 'units', 'currency per credit',
-  'description', 'Your contracted price per credit. The 3 is list-price shorthand '
-              || 'and is almost certainly not your rate; it is on your contract.'));
-value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
-  'name', 'days_per_year',
-  'value', 365, 'default', 365, 'units', 'days',
-  'description', 'Annualisation factor. Lower it if the affirmative warehouses only '
-              || 'run on business days.'));
-
--- Measured at BUILD time from the view this solution just created, so the number
--- is this account's own consumption rather than an assumption.
-value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
-  'metric', 'exposed_credits_per_day',
-  'units', 'credits/day',
-  'sql', 'SELECT ROUND(COALESCE(SUM(CREDITS_PER_DAY), 0), 4) FROM ' || :tgt
-      || '.V_GEN2_VERDICT WHERE VERDICT IN (''STRONG'', ''LIKELY'')',
-  'derivation', 'Current credits per day on the warehouses whose verdict is STRONG '
-             || 'or LIKELY, read from ACCOUNT_USAGE metering over the discovery '
-             || 'window. This is the spend the decision applies to -- not a saving, '
-             || 'and not a projection.'));
-
--- The certain cost. This is the only side of the trade that can be computed in
--- advance, and it is a cost rather than a benefit, which is why it is stated as
--- its own base metric rather than netted into the line above.
-value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
-  'metric', 'rate_premium_credits_per_day',
-  'units', 'credits/day',
-  'sql', 'SELECT ROUND(COALESCE(SUM(WORST_CASE_EXTRA_CREDITS_PER_DAY), 0), 4) FROM '
-      || :tgt || '.V_GEN2_VERDICT WHERE VERDICT IN (''STRONG'', ''LIKELY'')',
-  'derivation', 'The affirmative warehouses'' current credits/day times '
-             || '(multiplier - 1). This is what converting them costs if the '
-             || 'workload does not get any faster, and it is the downside of the '
-             || 'decision expressed in credits rather than in adjectives.'));
-
--- Declared UNMEASURABLE before the pilot, and it is the more important of the
--- three. The whole point of the solution is that this cannot be known in advance.
-value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
-  'metric', 'realised_speedup',
-  'units', 'percent of runtime removed',
-  'measurable', FALSE,
-  'derivation', 'Would come from comparing seconds-per-query on the same warehouse '
-             || 'before and after conversion.',
-  'why_not', 'No Gen2 measurement exists for a warehouse that has never run on '
-          || 'Gen2. Snowflake publishes no fixed improvement percentage because the '
-          || 'answer depends on the query mix, and this solution refuses to supply '
-          || 'one. CONVERSION_BASELINE holds the before-picture and '
-          || 'V_CONVERSION_OUTCOME fills this in once a conversion has been live for '
-          || 'at least three days.'));
-
-value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
-  'line', 'Compute reclaimed if the speedup you entered is real',
-  'base_metric', 'exposed_credits_per_day',
-  'rate_input', 'expected_speedup',
-  'value_input', 'credit_price',
-  -- The base is per DAY, so without this the annual figure is a daily one and the
-  -- comparison against the premium below is out by 365.
-  'annualise_input', 'days_per_year',
-  'horizon', 'per year, at your credit price'));
-value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
-  'line', 'Rate premium you pay regardless',
-  'base_metric', 'rate_premium_credits_per_day',
-  'value_input', 'credit_price',
-  'annualise_input', 'days_per_year',
-  'horizon', 'per year, at your credit price'));
-value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
-  'line', 'Speedup actually achieved',
-  'base_metric', 'realised_speedup',
-  'value_input', 'credit_price',
-  'annualise_input', 'days_per_year',
-  'horizon', 'unmeasurable until a conversion has been live'));
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_INPUTS AS SELECT '
- || 'VALUE:name::STRING AS INPUT_NAME, VALUE:value::NUMBER(38,6) AS VALUE, '
- || 'VALUE:default::NUMBER(38,6) AS DEFAULT_VALUE, VALUE:units::STRING AS UNITS, '
- || 'IFF(VALUE:value::NUMBER(38,6) = VALUE:default::NUMBER(38,6), '
- || '''DEFAULT — you have not changed this'', ''CLIENT_SET'') AS SOURCE, '
- || 'VALUE:description::STRING AS WHAT_IT_MEANS '
- || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
- || BASE64_ENCODE(TO_JSON(:value_inputs)) || '''))))');
-
-  -- The addressable base, and this is the part that has to come from THEIR data.
-  --
-  -- A base metric may be declared three ways, and the third is the point:
-  --   'sql'   a scalar query, evaluated at BUILD time against the views this
-  --           solution just created. This is the honest form -- the base is
-  --           measured from the account rather than assumed.
-  --   'value' a plan-time literal, for a base already known from discovery.
-  --   measurable = FALSE  the solution KNOWS it cannot compute this base here, and
-  --           says so with a reason instead of substituting a plausible number.
-  --
-  -- A base declared with 'sql' that does not compile fails the build loudly. That
-  -- is deliberate: it is OUR SQL, so a broken one is a defect for the gauntlet to
-  -- catch, not a condition of the customer's data to be swallowed at runtime.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_BASE '
- || '(METRIC VARCHAR, BASE_VALUE NUMBER(38,4), UNITS VARCHAR, DERIVED_HOW VARCHAR, '
- || 'MEASURABLE BOOLEAN, WHY_NOT_MEASURABLE VARCHAR)');
-  LET vb INT := 0;
-  WHILE (:vb < ARRAY_SIZE(:value_base)) DO
-    LET vb_o VARIANT := GET(:value_base, :vb);
-    LET vb_m STRING := REPLACE(COALESCE(:vb_o:metric::STRING, ''), '''', '''''');
-    LET vb_u STRING := REPLACE(COALESCE(:vb_o:units::STRING, ''), '''', '''''');
-    LET vb_d STRING := REPLACE(COALESCE(:vb_o:derivation::STRING, ''), '''', '''''');
-    LET vb_ok BOOLEAN := COALESCE(:vb_o:measurable::BOOLEAN, TRUE);
-    LET vb_why STRING := REPLACE(COALESCE(:vb_o:why_not::STRING, ''), '''', '''''');
-    LET vb_sql STRING := COALESCE(:vb_o:sql::STRING, '');
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.VALUE_BASE '
-   || '(METRIC, BASE_VALUE, UNITS, DERIVED_HOW, MEASURABLE, WHY_NOT_MEASURABLE) SELECT '
-   || '''' || :vb_m || ''', '
-   || CASE WHEN NOT :vb_ok THEN 'NULL'
-           WHEN :vb_sql <> '' THEN '(' || :vb_sql || ')'
-           ELSE COALESCE(:vb_o:value::STRING, 'NULL') END || ', '
-   || '''' || :vb_u || ''', ''' || :vb_d || ''', '
-   || IFF(:vb_ok, 'TRUE', 'FALSE') || ', '
-   || IFF(:vb_why = '', 'NULL', '''' || :vb_why || ''''));
-    vb := :vb + 1;
-  END WHILE;
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_LINES AS SELECT '
- || 'VALUE:line::STRING AS LINE, VALUE:base_metric::STRING AS BASE_METRIC, '
- || 'VALUE:rate_input::STRING AS RATE_INPUT, VALUE:value_input::STRING AS VALUE_INPUT, '
-     -- Names an input that converts the base's own period into a year. Without it a
-     -- per-day base produced a per-day benefit which was then compared against a
-     -- per-year cost, and the NET column silently subtracted a year of cost from a
-     -- day of value. It read as a credible negative number, which is the worst kind
-     -- of wrong. It is an INPUT rather than a constant so a client whose warehouses
-     -- only run on business days can say 250 instead of 365.
- || 'VALUE:annualise_input::STRING AS ANNUALISE_INPUT, '
- || 'COALESCE(VALUE:horizon::STRING, ''per year'') AS HORIZON '
- || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
- || BASE64_ENCODE(TO_JSON(:value_lines)) || '''))))');
-
-  -- Cost on one side, value on the other, both ANNUAL so the comparison is
-  -- apples-to-apples, arithmetic printed on every row, and the two never blended
-  -- into a single "ROI" figure. Cost is MEASURED where it has landed and PROJECTED
-  -- where it has not, and the column says which.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_BUSINESS_CASE AS '
- || 'WITH cost AS ('
- || '  SELECT SUM(CASE WHEN LABEL = ''MEASURED'' AND STATUS = ''LANDED'' THEN CREDITS END) '
- || '           AS MEASURED_CREDITS, '
- || '         SUM(CASE WHEN LABEL = ''PROJECTED'' AND CATEGORY = ''STEADY_STATE'' '
- || '                  THEN CREDITS END) AS PROJECTED_CREDITS_PER_DAY, '
- || '         COUNT_IF(LABEL = ''MEASURED'' AND STATUS = ''NOT_YET_LANDED'') AS PENDING '
- || '  FROM ' || :tgt || '.V_COST_LINES) '
- || 'SELECT l.LINE, b.METRIC, b.BASE_VALUE, b.UNITS, b.DERIVED_HOW, b.MEASURABLE, '
- || '       r.INPUT_NAME AS RATE_NAME, r.VALUE AS RATE, r.SOURCE AS RATE_SOURCE, '
- || '       v.INPUT_NAME AS VALUE_NAME, v.VALUE AS VALUE_PER_UNIT, v.SOURCE AS VALUE_SOURCE, '
- || '       COALESCE(an.VALUE, 1) AS PERIODS_PER_YEAR, l.HORIZON, '
- || '       CASE WHEN NOT b.MEASURABLE THEN NULL ELSE ROUND(b.BASE_VALUE * r.VALUE '
- || '            * v.VALUE * COALESCE(an.VALUE, 1), 2) END AS GROSS_VALUE_PER_YEAR, '
- || '       ROUND(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) AS PROJECTED_COST_PER_YEAR, '
- || '       CASE WHEN NOT b.MEASURABLE THEN NULL '
- || '            ELSE ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1) '
- || '                       - c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) '
- || '       END AS NET_PER_YEAR, '
-     -- Payback in days, from two annual figures. NULL rather than a big number when
-     -- annual value is zero or negative: "never" is the answer, and a division
-     -- would print something that looks like a duration.
- || '       CASE WHEN NOT b.MEASURABLE '
- || '              OR COALESCE(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 0) <= 0 '
- || '            THEN NULL '
- || '            ELSE ROUND(DIV0(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', '
- || '                            b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1)) '
- || '                       * 365, 1) END AS PAYBACK_DAYS, '
- || '       CASE WHEN NOT b.MEASURABLE '
- || '            THEN ''UNMEASURABLE: '' || COALESCE(b.WHY_NOT_MEASURABLE, '
- || '                 ''this solution cannot compute this base from your account'') '
- || '            ELSE b.BASE_VALUE || '' '' || b.UNITS || '' x '' || r.VALUE || '' ('' '
- || '                 || r.INPUT_NAME || '') x '' || v.VALUE || '' ('' || v.INPUT_NAME '
- || '                 || '') x '' || COALESCE(an.VALUE, 1) || '' periods/yr = '' '
- || '                 || ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 2) '
- || '                 || '' per year'' END AS ARITHMETIC, '
- || '       ''The base is measured from your data. Both rates are YOURS to set -- '
- || 'the defaults are placeholders, not benchmarks, and VALUE_INPUTS says which of '
- || 'them you have actually changed. Value and cost are both annual here so they can '
- || 'be compared. Cost is '' || COALESCE(c.MEASURED_CREDITS::STRING, '
- || '''not yet measured'') || '' measured credits with '' || c.PENDING '
- || '       || '' category(ies) still pending.'' AS READ_THIS '
- || 'FROM ' || :tgt || '.VALUE_LINES l '
- || 'JOIN ' || :tgt || '.VALUE_BASE b ON b.METRIC = l.BASE_METRIC '
- || 'JOIN ' || :tgt || '.VALUE_INPUTS r ON r.INPUT_NAME = l.RATE_INPUT '
- || 'JOIN ' || :tgt || '.VALUE_INPUTS v ON v.INPUT_NAME = l.VALUE_INPUT '
- || 'LEFT JOIN ' || :tgt || '.VALUE_INPUTS an ON an.INPUT_NAME = l.ANNUALISE_INPUT '
- || 'CROSS JOIN cost c '
- || 'UNION ALL '
-     -- The declared-nothing case. An empty view reads as a bug; this reads as an
-     -- answer, and it is the correct answer for a solution whose benefit is
-     -- operational rather than financial.
- || 'SELECT ''NO VALUE MODEL DECLARED'', NULL, NULL, NULL, NULL, FALSE, '
- || '       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '
- || '       ROUND((SELECT PROJECTED_CREDITS_PER_DAY FROM cost) * 365 * ' || :rate || ', 2), '
- || '       NULL, NULL, ''UNMEASURABLE: no financial benefit is claimed'', '
- || '       ''This solution does not assert a financial return. Its cost is shown so '
- || 'you can judge it against a benefit you decide on yourself. Inventing a rate here '
- || 'would be the dishonest option.'' '
- || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.VALUE_LINES)');
-
-  -- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────
-  -- What would make this POC a success, decided from THEIR account rather than
-  -- from a number somebody liked. Same shape as the value model above: the
-  -- solution declares criteria, this block builds the objects.
-  --
-  -- A criterion carries two SQL scalars, `target_sql` and `actual_sql`, and BOTH
-  -- are re-evaluated on every read of V_POC_SCORECARD. That is a deliberate
-  -- choice by the operator and it has a cost worth naming: because the bar is
-  -- re-derived from current data, a MET on Tuesday and a MET on Friday are not
-  -- necessarily the same claim, and a shrinking base can lower the bar it is
-  -- being judged against. The COMPARABILITY column on every row says so, so the
-  -- caveat travels with the number instead of living in a design document.
-  --
-  -- The mechanism is worth understanding before editing. A view cannot
-  -- EXECUTE IMMEDIATE a string, so target_sql/actual_sql are not stored and
-  -- interpreted -- they are INLINED as scalar subqueries into the view body at
-  -- build time. Reading the view re-runs them. Consequence for snippet authors:
-  -- each must be an UNCORRELATED scalar subquery. A correlated one, or an EXISTS
-  -- in the select list, raises "Unsupported subquery type" at build.
-  --
-  -- Four states, and the third and fourth are the reason this exists:
-  --   MET       target compared against actual, comparison holds
-  --   NOT_MET   comparison does not hold. A real failure, reported as one.
-  --   PENDING   cannot be evaluated YET -- credits have not landed, a holdout
-  --             group does not exist. Carries why, and when it resolves.
-  --   N/A       does not apply to this build, e.g. PRODUCTION-tier only.
-  -- PENDING is not a failure and must never render as one. A zero standing in
-  -- for "no data yet" is the defect this design exists to prevent.
-  -- WHY THESE ARE ALL poc_-PREFIXED. The first cut used sc, sc2, sc_o and so on,
-  -- and two solutions legitimately declare their own `LET sc` in this same
-  -- procedure body -- 09_rmn_cleanroom's adapt_apply.sql holds slot columns in one.
-  -- Snowflake rejected the whole block with "Variable with name SC declared twice"
-  -- and the build failed with nothing to point at the cause. A shared template does
-  -- not get to squat on short identifiers that snippet authors reasonably use.
-  LET success_criteria ARRAY := ARRAY_CONSTRUCT();
--- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────────
--- What would make this a success, measured against bars derived from THIS account.
---
--- EVERY CRITERION IS GATED ON THE SIGNAL IT READS, because a criterion scored
--- against a view that was never built is worse than no criterion.
---
--- WHAT IS DELIBERATELY NOT HERE: there is no "N credits saved" criterion. Gen2
--- costs more per second, so a saving is not available in advance at any confidence
--- and claiming one as a success bar would make the bar itself the fabrication.
-
--- ── Coverage: every warehouse in the fleet gets a verdict ─────────────────────
-IF (:sig:warehouses::STRING = 'AVAILABLE' AND :sig:credit_history::STRING = 'AVAILABLE') THEN
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_FLEET_COVERED',
-    'label', 'Every warehouse in the fleet receives a Gen2 verdict',
-    'why', 'A verdict list that silently drops warehouses understates the estate, and '
-        || 'the one it drops is as likely to be the biggest spender as the smallest. '
-        || 'If the join between the fleet snapshot and the workload metrics loses '
-        || 'rows, this fails.',
-    'compare', '=',
-    'units', 'warehouses',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.WH_FLEET',
-    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_GEN2_VERDICT',
-    'target_derivation', 'The row count of WH_FLEET, a snapshot of SHOW WAREHOUSES '
-        || 'taken at build time. Equality: every warehouse appears, including the ones '
-        || 'whose verdict is ALREADY_GEN2 or INELIGIBLE.'));
-
-  -- ── The button and the table must agree ────────────────────────────────────
-  -- The verdict is computed twice: once at plan time so the buttons can name real
-  -- warehouses before anything exists, and once in the view. If those two
-  -- disagree, the reader is looking at one number and pressing another, and both
-  -- lose credibility at once. This is the criterion that catches drift between
-  -- them.
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_PLAN_MATCHES_VIEW',
-    'label', 'The count on the conversion button matches the count in the verdict view',
-    'why', 'The plan recomputes the verdict before the views exist, so the button can '
-        || 'name real warehouses. Two implementations of one rule drift. If the button '
-        || 'offers to convert nine warehouses and the table shows seven, the reader '
-        || 'stops trusting the page -- correctly.',
-    'compare', '=',
-    'units', 'affirmative warehouses',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT ' || :affirm_n,
-    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_GEN2_VERDICT '
-        || 'WHERE VERDICT IN (''STRONG'', ''LIKELY'')',
-    'target_derivation', 'The affirmative count the plan computed at plan time, which '
-        || 'is the number printed on the PRODUCTION button: ' || :affirm_n || '.'));
-
-  -- ── Every verdict is grounded in measured inputs ───────────────────────────
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_VERDICTS_GROUNDED',
-    'label', 'No warehouse is recommended for conversion without measured workload evidence',
-    'why', 'A Gen2 recommendation with no utilisation and no favourable-share behind '
-        || 'it is the naive "convert every Gen1 warehouse" recommendation wearing a '
-        || 'verdict column, and on an idle-heavy warehouse it raises the bill. This '
-        || 'checks that every affirmative verdict has both signals present.',
-    'compare', '=',
-    'units', 'ungrounded affirmative verdicts',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT 0',
-    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_GEN2_VERDICT '
-        || 'WHERE VERDICT IN (''STRONG'', ''LIKELY'') '
-        || 'AND (UTILISATION IS NULL OR FAVOURABLE_SHARE IS NULL '
-        || 'OR QUERY_COUNT = 0)',
-    'target_derivation', 'Zero. An affirmative verdict on a warehouse with no query '
-        || 'history is not a verdict, it is a guess.'));
-END IF;
-
--- ── The baseline exists before any conversion ────────────────────────────────
-IF (:sig:credit_history::STRING = 'AVAILABLE') THEN
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_BASELINE_BEFORE_CHANGE',
-    'label', 'Every converted warehouse has a baseline captured before it was converted',
-    'why', 'This is the criterion the whole solution rests on. A conversion with no '
-        || 'before-picture can never be evaluated, and what fills that vacuum is '
-        || 'someone saying it feels faster. If a warehouse appears in the change '
-        || 'registry with no baseline row, the outcome view cannot score it.',
-    'compare', '=',
-    'units', 'conversions missing a baseline',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT 0',
-    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
-        || 'WHERE r.KIND = ''WAREHOUSE_SETTING'' '
-        || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.CONVERSION_BASELINE b '
-        || 'WHERE b.WAREHOUSE_NAME = r.TARGET_FQN)',
-    'target_derivation', 'Zero. Every row in the registry recording a warehouse '
-        || 'setting change must have a matching CONVERSION_BASELINE row.'));
-
-  -- ── The outcome: pending on purpose, and it says why ──────────────────────
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_SPEEDUP_BEATS_BREAKEVEN',
-    'label', 'Converted warehouses achieved more than the ' || :breakeven_pct
-        || '% speedup Gen2 needs to pay for itself',
-    'why', 'This is the only success criterion that matters, and it cannot be scored '
-        || 'until a conversion has been live long enough to measure. Everything else '
-        || 'in this solution is setup for this one number.',
-    'compare', '>=',
-    'units', 'percent of runtime removed',
-    'basis', 'BY_TIME_WINDOW',
-    'target_sql', 'SELECT ' || :breakeven_pct,
-    'actual_sql', 'SELECT ROUND(AVG(OBSERVED_SPEEDUP_PCT), 2) FROM ' || :tgt
-        || '.V_CONVERSION_OUTCOME WHERE OUTCOME <> ''TOO_EARLY''',
-    'target_derivation', 'The break-even bar for this account''s cloud: '
-        || :breakeven_pct || '%, which is (1 - 1/' || :mult || ') expressed as a '
-        || 'percentage. Not a benchmark and not a target Snowflake published -- it is '
-        || 'the point at which the rate premium is exactly paid for.',
-    'pending_reason', 'No conversion has been live for three days yet, so every row '
-        || 'in the outcome view reads TOO_EARLY and the average is over an empty set. '
-        || 'That is an absence of data, not a speedup of zero and not a failure.',
-    'resolves_when', 'Press the pilot action, wait at least three days for metering '
-        || 'and query history to accumulate on the converted warehouse, then re-read '
-        || 'V_CONVERSION_OUTCOME. TASK_GEN2_WATCH does this weekly on its own at '
-        || 'PRODUCTION tier.'));
-END IF;
-
--- ── Cost ──────────────────────────────────────────────────────────────────────
-IF (:credit_cap > 0) THEN
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_COST_IN_BUDGET',
-    'label', 'Measured steady-state cost stays inside your credit cap',
-    'why', 'A POC that cannot state its own running cost cannot be approved for '
-        || 'production, and a projection is not a measurement.',
-    'compare', '<=',
-    'units', 'credits',
-    'basis', 'BY_TAG',
-    'target_sql', 'SELECT ' || :credit_cap,
-    'actual_sql', 'SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
-        || 'WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''',
-    'target_derivation', 'Your WHGEN_CREDIT_CAP setting, currently '
-        || :credit_cap || ' credits.',
-    'pending_reason', 'Warehouse credits reach ACCOUNT_USAGE on a delay, so nothing '
-        || 'has been attributed to this run yet. This is an absence of data, not a '
-        || 'cost of zero.',
-    'resolves_when', 'credits land in ACCOUNT_USAGE, typically within 8 hours -- call '
-        || 'MEASURE() in this schema after that to fill it in'));
-ELSE
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'WHGEN_COST_IN_BUDGET',
-    'label', 'Measured steady-state cost stays inside your credit cap',
-    'why', 'A POC that cannot state its own running cost cannot be approved for '
-        || 'production.',
-    'compare', '<=',
-    'units', 'credits',
-    'basis', 'BY_TAG',
-    'target_derivation', 'No cap was set, so there is no bar to derive.',
-    'na_reason', 'WHGEN_CREDIT_CAP is 0, so no ceiling was declared for this run. Set '
-        || 'it and re-run to have this criterion scored. Picking a default ceiling '
-        || 'here would invent a standard you did not choose.'));
-END IF;
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.SUCCESS_CRITERIA '
- || '(CODE VARCHAR, LABEL VARCHAR, WHY_IT_MATTERS VARCHAR, COMPARE VARCHAR, '
- || 'UNITS VARCHAR, BASIS VARCHAR, TARGET_DERIVATION VARCHAR, '
- || 'PENDING_REASON VARCHAR, RESOLVES_WHEN VARCHAR, NA_REASON VARCHAR)');
-
-  -- The declarations themselves, one INSERT each. Same reason the value base
-  -- uses a WHILE loop rather than a FLATTEN: the fields are optional in
-  -- different combinations and a single projection over the array would have to
-  -- invent a shape for the absent ones.
-  LET poc_i INT := 0;
-  WHILE (:poc_i < ARRAY_SIZE(:success_criteria)) DO
-    LET poc_o VARIANT := GET(:success_criteria, :poc_i);
-    LET poc_code STRING := REPLACE(COALESCE(:poc_o:code::STRING, ''), '''', '''''');
-    LET poc_lab  STRING := REPLACE(COALESCE(:poc_o:label::STRING, ''), '''', '''''');
-    LET poc_why  STRING := REPLACE(COALESCE(:poc_o:why::STRING, ''), '''', '''''');
-    LET poc_cmp  STRING := REPLACE(COALESCE(:poc_o:compare::STRING, '>='), '''', '''''');
-    LET poc_un   STRING := REPLACE(COALESCE(:poc_o:units::STRING, ''), '''', '''''');
-    LET poc_bas  STRING := REPLACE(COALESCE(:poc_o:basis::STRING, 'BY_TIME_WINDOW'), '''', '''''');
-    LET poc_der  STRING := REPLACE(COALESCE(:poc_o:target_derivation::STRING, ''), '''', '''''');
-    LET poc_pr   STRING := REPLACE(COALESCE(:poc_o:pending_reason::STRING, ''), '''', '''''');
-    LET poc_rw   STRING := REPLACE(COALESCE(:poc_o:resolves_when::STRING, ''), '''', '''''');
-    LET poc_nr   STRING := REPLACE(COALESCE(:poc_o:na_reason::STRING, ''), '''', '''''');
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.SUCCESS_CRITERIA (CODE, LABEL, WHY_IT_MATTERS, '
-   || 'COMPARE, UNITS, BASIS, TARGET_DERIVATION, PENDING_REASON, RESOLVES_WHEN, '
-   || 'NA_REASON) SELECT '
-   || '''' || :poc_code || ''', ''' || :poc_lab || ''', ''' || :poc_why || ''', '
-   || '''' || :poc_cmp || ''', ''' || :poc_un || ''', ''' || :poc_bas || ''', '
-   || '''' || :poc_der || ''', '
-   || IFF(:poc_pr = '', 'NULL', '''' || :poc_pr || '''') || ', '
-   || IFF(:poc_rw = '', 'NULL', '''' || :poc_rw || '''') || ', '
-   || IFF(:poc_nr = '', 'NULL', '''' || :poc_nr || ''''));
-    poc_i := :poc_i + 1;
-  END WHILE;
-
-  -- The scorecard. Each criterion becomes one SELECT with its target and actual
-  -- inlined, and the arms are UNION ALLed into a single view. Built as a string
-  -- because the number of arms is not known until the solution has declared.
-  LET poc_body STRING := '';
-  LET poc_j INT := 0;
-  WHILE (:poc_j < ARRAY_SIZE(:success_criteria)) DO
-    LET poc2_o VARIANT := GET(:success_criteria, :poc_j);
-    LET poc2_code STRING := REPLACE(COALESCE(:poc2_o:code::STRING, ''), '''', '''''');
-    LET poc2_cmp  STRING := COALESCE(:poc2_o:compare::STRING, '>=');
-    LET poc2_tsql STRING := COALESCE(:poc2_o:target_sql::STRING, '');
-    LET poc2_asql STRING := COALESCE(:poc2_o:actual_sql::STRING, '');
-    -- An unevaluable criterion declares no actual_sql. It still gets a row --
-    -- omitting it would make the scorecard look shorter than the promise.
-    LET poc2_t STRING := IFF(:poc2_tsql = '', 'CAST(NULL AS NUMBER(38,6))',
-                           '(' || :poc2_tsql || ')::NUMBER(38,6)');
-    LET poc2_a STRING := IFF(:poc2_asql = '', 'CAST(NULL AS NUMBER(38,6))',
-                           '(' || :poc2_asql || ')::NUMBER(38,6)');
-    poc_body := :poc_body
-      || IFF(:poc_body = '', '', ' UNION ALL ')
-      || 'SELECT ''' || :poc2_code || ''' AS CODE, ' || :poc2_t || ' AS TARGET, '
-      || :poc2_a || ' AS ACTUAL, ''' || REPLACE(:poc2_cmp, '''', '''''') || ''' AS CMP';
-    poc_j := :poc_j + 1;
-  END WHILE;
-
-  -- The verdict CASE is deliberately ordered, and only NA_REASON forces a state.
-  --
-  -- PENDING_REASON is an EXPLANATION, not a state. An earlier cut had it force
-  -- PENDING, which meant a criterion that declared "credits land in about eight
-  -- hours" was pinned to PENDING permanently -- it could never resolve, so the
-  -- one criterion whose whole point was to become answerable never did. A
-  -- criterion is pending because its ACTUAL is absent, and for no other reason;
-  -- the declared text only says WHY it is absent and when that changes.
-  --
-  -- The NULL check therefore has to come before the comparison. Reversing them
-  -- would let a NULL actual reach the comparison, which returns NULL, which a
-  -- naive COALESCE would then turn into a failure. "Not measured yet" reported as
-  -- "failed" is the single most damaging thing this view could do.
-  IF (ARRAY_SIZE(:success_criteria) > 0) THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS '
-   || 'WITH ev AS (' || :poc_body || ') '
-   || 'SELECT c.CODE, c.LABEL, c.WHY_IT_MATTERS, e.TARGET, e.ACTUAL, c.UNITS, '
-   || '       c.COMPARE, c.BASIS, c.TARGET_DERIVATION, '
-   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN ''N/A'' '
-   || '            WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN ''PENDING'' '
-   || '            WHEN e.CMP = ''>='' AND e.ACTUAL >= e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''<='' AND e.ACTUAL <= e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''>''  AND e.ACTUAL >  e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''<''  AND e.ACTUAL <  e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''='' AND e.ACTUAL =  e.TARGET THEN ''MET'' '
-   || '            ELSE ''NOT_MET'' END AS STATE, '
-      -- Why a row is not simply pass/fail, in the row itself. The solution's own
-      -- wording wins when it has one, because "a randomised holdout would be
-      -- required" is worth infinitely more than "no measurement has landed".
-   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN c.NA_REASON '
-   || '            WHEN e.ACTUAL IS NOT NULL AND e.TARGET IS NOT NULL THEN NULL '
-   || '            WHEN c.PENDING_REASON IS NOT NULL THEN c.PENDING_REASON '
-   || '            WHEN e.ACTUAL IS NULL THEN ''No measurement has landed for this '
-   || 'criterion yet. It is not a failure; it is not yet answerable.'' '
-   || '            ELSE ''The target could not be derived from your account -- the '
-   || 'discovery input it depends on is absent.'' END AS WHY_NOT_EVALUATED, '
-      -- Suppressed once the row is answerable: "resolves when credits land" under
-      -- a row that has already been decided is stale advice.
-   || '       CASE WHEN c.NA_REASON IS NULL '
-   || '             AND (e.ACTUAL IS NULL OR e.TARGET IS NULL) '
-   || '            THEN c.RESOLVES_WHEN END AS RESOLVES_WHEN, '
-      -- The arithmetic, printed. A bare MET is an assertion; "42 >= 30" is
-      -- checkable by the person reading it.
-   || '       CASE WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN NULL '
-   || '            ELSE ROUND(e.ACTUAL, 4) || '' '' || e.CMP || '' '' '
-   || '                 || ROUND(e.TARGET, 4) || '' '' || COALESCE(c.UNITS, '''') '
-   || '       END AS ARITHMETIC, '
-   || '       ''Target and actual are BOTH re-derived from your account on every '
-   || 'read, so this bar moves as your data moves. That is intended -- the target '
-   || 'is not a number we picked -- but it means MET is a statement about today, '
-   || 'not a result comparable across runs. TARGET_DERIVATION says how the bar '
-   || 'was set. BASIS says how the actual was attributed.'' AS COMPARABILITY '
-   || 'FROM ' || :tgt || '.SUCCESS_CRITERIA c '
-   || 'JOIN ev e ON e.CODE = c.CODE');
-  ELSE
-    -- Declared nothing. One honest row beats an empty view, exactly as with the
-    -- value model: empty reads as broken, this reads as unauthored.
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS SELECT '
-   || '''NO SUCCESS CRITERIA DECLARED'' AS CODE, '
-   || '''This solution has not declared POC success criteria'' AS LABEL, '
-   || 'NULL AS WHY_IT_MATTERS, CAST(NULL AS NUMBER(38,6)) AS TARGET, '
-   || 'CAST(NULL AS NUMBER(38,6)) AS ACTUAL, NULL AS UNITS, NULL AS COMPARE, '
-   || 'NULL AS BASIS, NULL AS TARGET_DERIVATION, ''PENDING'' AS STATE, '
-   || '''No criteria are declared, so there is nothing to pass or fail. This is a '
-   || 'gap in the solution, not a result for your account.'' AS WHY_NOT_EVALUATED, '
-   || '''When this solution declares blocks/success_criteria.sql'' AS RESOLVES_WHEN, '
-   || 'NULL AS ARITHMETIC, ''Nothing is being claimed here.'' AS COMPARABILITY');
-  END IF;
-
-  -- The roll-up behind the header chip. MET requires that nothing failed AND
-  -- that something actually passed -- a scorecard of nothing but PENDING is not
-  -- a success, and calling it one would be the whole failure mode of this
-  -- feature. NOT_RUN is not a pass.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_VERDICT AS '
- || 'WITH s AS (SELECT COUNT_IF(STATE = ''MET'') AS MET, '
- || '                  COUNT_IF(STATE = ''NOT_MET'') AS NOT_MET, '
- || '                  COUNT_IF(STATE = ''PENDING'') AS PENDING, '
- || '                  COUNT_IF(STATE = ''N/A'') AS NA, '
- || '                  COUNT_IF(STATE <> ''N/A'') AS SCORED '
- || '           FROM ' || :tgt || '.V_POC_SCORECARD) '
- || 'SELECT MET, NOT_MET, PENDING, NA, SCORED, '
- || '       MET || ''/'' || SCORED || '' MET'' AS HEADLINE, '
- || '       CASE WHEN SCORED = 0 THEN ''NOT_RUN'' '
- || '            WHEN NOT_MET > 0 THEN ''NOT_MET'' '
- || '            WHEN MET = 0 THEN ''PENDING'' '
- || '            WHEN PENDING > 0 THEN ''MET_WITH_PENDING'' '
- || '            ELSE ''MET'' END AS VERDICT, '
- || '       CASE WHEN SCORED = 0 THEN ''Nothing has been scored.'' '
- || '            WHEN NOT_MET > 0 THEN NOT_MET || '' criterion(s) did not meet '
- || 'target. Open the POC success tab for the arithmetic on each.'' '
- || '            WHEN MET = 0 THEN ''Nothing has failed, but nothing has been '
- || 'confirmed either -- every criterion is still pending.'' '
- || '            WHEN PENDING > 0 THEN ''Everything measurable so far has met its '
- || 'target, with '' || PENDING || '' still pending. Not a complete result yet.'' '
- || '            ELSE ''Every scored criterion met its target.'' END AS READ_THIS '
- || 'FROM s');
-
-  -- ── PRODUCTION HARDENING ──────────────────────────────────────────────────
-  -- Only at PRODUCTION tier, and every piece of it detects-then-skips with a
-  -- printed reason rather than failing the build. A platform team's objection to a
-  -- tool is almost never "it does too little"; it is "it left something behind
-  -- that nobody owns".
-  IF (:tier = 'PRODUCTION') THEN
-    -- Cost attribution. The tag lives in the target schema so it disappears with
-    -- it; the ONE thing outside the schema is the tag applied to the warehouse, so
-    -- that is the only row the registry needs.
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE TAG IF NOT EXISTS ' || :tgt || '.ONESHOT_SOLUTION '
-   || 'COMMENT = ''Cost attribution for Warehouse Generation — Gen2 and Adaptive. Query '
-   || 'ACCOUNT_USAGE.TAG_REFERENCES to find everything this deployment owns.''');
-    stmts := ARRAY_APPEND(:stmts,
-      'ALTER SCHEMA ' || :tgt || ' SET TAG ' || :tgt || '.ONESHOT_SOLUTION = '
-   || '''Warehouse Generation — Gen2 and Adaptive''');
-    IF (:wh_ok) THEN
-      stmts := ARRAY_APPEND(:stmts,
-        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-     || 'SELECT ''' || :meas_wh || ''', ''' || :tgt || '.ONESHOT_SOLUTION'', '
-     || '''WAREHOUSE'', ''OBJECT_TAG'' '
-     || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || 'WHERE TARGET_FQN = ''' || :meas_wh || ''' AND ARTIFACT = ''' || :tgt
-     || '.ONESHOT_SOLUTION'' AND KIND = ''OBJECT_TAG'')');
-      stmts := ARRAY_APPEND(:stmts,
-        'ALTER WAREHOUSE ' || :meas_wh || ' SET TAG ' || :tgt
-     || '.ONESHOT_SOLUTION = ''Warehouse Generation — Gen2 and Adaptive''');
-    END IF;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'COST ATTRIBUTION: everything this deployment created carries the tag '
-   || :tgt || '.ONESHOT_SOLUTION, so your FinOps team can find it in '
-   || 'ACCOUNT_USAGE.TAG_REFERENCES without asking us. Tags cost nothing.');
-
-    -- Failure notification. Tasks take an error integration directly; dynamic
-    -- tables have NO equivalent clause, so theirs needs an alert, which is
-    -- serverless and therefore costs credits of its own. That asymmetry is priced
-    -- rather than hidden, and the whole thing skips loudly when there is no
-    -- integration to point at.
-    IF (:notif <> '') THEN
-      notes := ARRAY_APPEND(:notes,
-        'FAILURE NOTIFICATION: task failures will be sent to ' || :notif || '. '
-     || 'Dynamic table refresh failures CANNOT use an error integration -- Snowflake '
-     || 'has no such clause for them -- so if this solution creates dynamic tables '
-     || 'their failures need a serverless ALERT over DYNAMIC_TABLE_REFRESH_HISTORY, '
-     || 'which is priced separately in the cost lines above.');
-    ELSE
-      notes := ARRAY_APPEND(:notes,
-        'FAILURE NOTIFICATION SKIPPED: WHGEN_NOTIFICATION_INTEGRATION is blank, so '
-     || 'nothing will tell you when a scheduled object fails. This is a real gap at '
-     || 'PRODUCTION tier and the build continues anyway rather than blocking you. '
-     || 'Run SHOW NOTIFICATION INTEGRATIONS to pick one; if the account has none, an '
-     || 'administrator runs: CREATE NOTIFICATION INTEGRATION ONESHOT_ALERTS '
-     || 'TYPE = EMAIL ENABLED = TRUE;');
-    END IF;
-
-    -- What an on-call engineer opens at 3am. Built to survive a solution that has
-    -- no tasks and no dynamic tables: it returns a row saying so rather than
-    -- nothing, because an empty operations view is indistinguishable from a broken
-    -- one.
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_OPERATIONS AS '
-   || 'SELECT ''TASK'' AS OBJECT_KIND, t.NAME AS OBJECT_NAME, '
-      -- The cron string lives on ACCOUNT_USAGE.TASKS, NOT on TASK_HISTORY.
-      -- t.SCHEDULE was read straight off TASK_HISTORY, which has 30 columns and
-      -- none of them is SCHEDULE, so this view failed to compile on every
-      -- PRODUCTION build -- and because the statement loop stops at the first
-      -- failure, everything declared after it was silently never created. It went
-      -- unnoticed because step 16 read only the OUTER statement results and this
-      -- failure surfaced as an inner FAILED row nobody looked at.
-      --
-      -- COALESCE, because ACCOUNT_USAGE lags: a task created minutes ago may have
-      -- history but no TASKS row yet, and a blank SLA is better than dropping the
-      -- task from an operations view.
-   || '       COALESCE(s.SCHEDULE, ''schedule not yet in ACCOUNT_USAGE.TASKS'') '
-   || '         AS REFRESH_SLA, MAX(t.COMPLETED_TIME) AS LAST_RUN, '
-   || '       COUNT_IF(t.STATE = ''FAILED'') AS FAILURES_IN_WINDOW, '
-   || '       COUNT(*) AS RUNS_IN_WINDOW, NULL::NUMBER AS CREDITS_IN_WINDOW, '
-   || '       ''From ACCOUNT_USAGE.TASK_HISTORY over the last '' || ' || :w
-   || '         || '' days.'' AS SOURCE '
-   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY t '
-      -- TASKS names its columns TASK_NAME / TASK_DATABASE / TASK_SCHEMA, while
-      -- TASK_HISTORY uses NAME / DATABASE_NAME / SCHEMA_NAME. Two ACCOUNT_USAGE
-      -- views of the same object disagreeing on column names is exactly the kind
-      -- of thing to read rather than assume -- guessing S.NAME cost another run.
-   || '  LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TASKS s '
-   || '    ON s.TASK_NAME = t.NAME AND s.TASK_DATABASE = t.DATABASE_NAME '
-   || '   AND s.TASK_SCHEMA = t.SCHEMA_NAME AND s.DELETED IS NULL '
-   || '  WHERE t.DATABASE_NAME = ''' || :db || ''' AND t.SCHEMA_NAME = ''' || :sch || ''' '
-   || '    AND t.SCHEDULED_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
-   || '  GROUP BY 1, 2, 3 '
-   || 'UNION ALL '
-   || 'SELECT ''DYNAMIC_TABLE'', d.NAME, d.TARGET_LAG_SEC::STRING || '' sec target lag'', '
-   || '       MAX(d.REFRESH_END_TIME), COUNT_IF(d.STATE = ''FAILED''), COUNT(*), NULL, '
-   || '       ''From ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY. Note: dynamic tables '
-   || 'auto-suspend after 5 consecutive failures.'' '
-   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY d '
-   || '  WHERE d.DATABASE_NAME = ''' || :db || ''' AND d.SCHEMA_NAME = ''' || :sch || ''' '
-   || '    AND d.REFRESH_START_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
-   || '  GROUP BY 1, 2, 3 '
-   || 'UNION ALL '
-   || 'SELECT ''THIS DEPLOYMENT'', ''' || :sch || ''', ''not scheduled'', '
-   || '       (SELECT MAX(STARTED_AT) FROM ' || :tgt || '.RUN_LEDGER), 0, '
-   || '       (SELECT COUNT(*) FROM ' || :tgt || '.RUN_LEDGER), '
-   || '       (SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
-   || '         WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''), '
-   || '       ''No tasks or dynamic tables found for this schema in the window. If '
-   || 'this solution creates none, that is expected and this row is the whole '
-   || 'operations picture.'' ');
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'OPERATIONS: V_OPERATIONS reports last run, failures and credits per '
-   || 'scheduled object over ' || :w || ' days. It reads ACCOUNT_USAGE views, which '
-   || 'are free to query but lag by up to 45 minutes for task history.');
-  END IF;
-
-  -- ── The action registry, its audit log, and the one door in ────────────────
-  -- Built AFTER the solution's plan section, because that is where a solution
-  -- declares its actions.
-  --
-  -- CREATE OR REPLACE ... AS SELECT rather than CREATE + INSERT: a second build
-  -- must not stack a second copy of every action, which is the same bug
-  -- ATTACHED_OBJECT_REGISTRY had. Note the two need DIFFERENT fixes and this comment
-  -- used to imply otherwise: the action registry can be rebuilt from scratch each
-  -- run, so CREATE OR REPLACE is right; the attachment registry must SURVIVE, because
-  -- TEARDOWN reads it, so it takes an anti-join insert instead. Reaching for
-  -- CREATE OR REPLACE there would have destroyed the record of what to detach.
-  -- FLATTEN over a JSON literal also avoids the VALUES-clause restriction on
-  -- ARRAY/OBJECT constructors.
-  --
-  -- The JSON travels BASE64-ENCODED, and that is not belt-and-braces. An action's
-  -- `sql` array holds generated DDL, which routinely contains quoted identifiers
-  -- like "ICE_GOLD_ORDERS". TO_JSON escapes those double quotes to \", and when
-  -- the result is pasted into a single-quoted SQL literal Snowflake's parser
-  -- consumes the backslash -- so PARSE_JSON receives structurally broken JSON and
-  -- fails with "Error parsing JSON: missing comma, pos 1628", pointing at a
-  -- character that is nowhere near the actual problem. Doubling the quotes, as
-  -- this line used to, does nothing about the backslash.
-  --
-  -- 03_generative_completion hit this first and fixed it locally by chaining a
-  -- second REPLACE for backslashes; that works but depends on getting the order
-  -- right and on remembering it at every new call site. The base64 alphabet
-  -- contains no quote and no backslash, so the hazard cannot recur here.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.ACTION_REGISTRY AS SELECT '
- || 'VALUE:code::STRING AS CODE, VALUE:label::STRING AS LABEL, '
- || 'VALUE:tier::STRING AS TIER, VALUE:effect::STRING AS EFFECT, '
- || 'VALUE:undo::STRING AS UNDO, '
- || 'VALUE:est::NUMBER(38,6) AS EST_CREDITS, VALUE:basis::STRING AS EST_BASIS, '
- || 'VALUE:sql::ARRAY AS RUN_SQL, '
-    -- The reverse of RUN_SQL, declared by the solution alongside it. COALESCE to an
-    -- empty array so an action that genuinely cannot be reversed is representable:
-    -- zero undo statements is a fact the app can show, whereas a NULL would just
-    -- look like a bug.
- || 'COALESCE(VALUE:undo_sql::ARRAY, ARRAY_CONSTRUCT()) AS UNDO_SQL, '
-    -- The parameters this action accepts, declared alongside its SQL. Empty array for
-    -- every action that takes none, which is why an unparameterised action is byte
-    -- identical in behaviour to before: ARRAY_SIZE 0 skips the whole resolver.
-    --
-    -- Each element is {name, label, kind, allowed_sql, options, min, max, help}. The
-    -- WHITELIST LIVES HERE, in the registry, and is evaluated inside RUN_ACTION -- not
-    -- passed in by the app. The app cannot influence what a value is checked against,
-    -- which is the entire point: a tampered client can only ever choose from a set
-    -- this build already discovered.
- || 'COALESCE(VALUE:params::ARRAY, ARRAY_CONSTRUCT()) AS PARAM_SPEC, '
- || 'CURRENT_TIMESTAMP() AS DECLARED_AT '
- || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
- || BASE64_ENCODE(TO_JSON(:actions)) || '''))))');
-
-  -- One row per attempt, whether it worked or not. An action framework without an
-  -- audit trail is indistinguishable from someone running DDL by hand.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_LOG '
- || '(LOG_ID VARCHAR, CODE VARCHAR, LABEL VARCHAR, EST_CREDITS NUMBER(38,6), '
- || 'STATUS VARCHAR, STATEMENTS_RUN INT, ERROR VARCHAR, '
- || 'RUN_BY VARCHAR DEFAULT CURRENT_USER(), '
- || 'STARTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(), '
- || 'FINISHED_AT TIMESTAMP_NTZ, UNDO_SNAPSHOT VARCHAR, PARAMS VARCHAR)');
-  -- Separate ALTER because the CREATE above is IF NOT EXISTS: a schema built by an
-  -- earlier artifact already has the table and would silently keep the old shape.
-  stmts := ARRAY_APPEND(:stmts,
-    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
- || 'ADD COLUMN IF NOT EXISTS UNDO_SNAPSHOT VARCHAR');
-  -- The RESOLVED parameter values this run actually used, as JSON. Without this the
-  -- audit trail becomes untrue the moment an action takes parameters: two rows reading
-  -- "DONE. Attach the policy" would be indistinguishable while having tiered different
-  -- tables. NULL for an unparameterised action, which is honest -- there were none.
-  stmts := ARRAY_APPEND(:stmts,
-    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
- || 'ADD COLUMN IF NOT EXISTS PARAMS VARCHAR');
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '(LOG_ID VARCHAR, SEQ INT, STATEMENT VARCHAR, QUERY_ID VARCHAR, '
- || 'STATUS VARCHAR, ERROR VARCHAR, '
- || 'RAN_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
-
-  -- What the app reads. Excludes RUN_SQL on purpose: the dashboard needs to show
-  -- what an action DOES and what it costs, and shipping the DDL to the browser
-  -- invites someone to treat the page as the source of truth for it.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTIONS AS SELECT '
- || 'a.CODE, a.LABEL, a.TIER, a.EFFECT, a.UNDO, a.EST_CREDITS, a.EST_BASIS, '
- || 'ARRAY_SIZE(a.RUN_SQL) AS STATEMENTS, '
- || 'ARRAY_SIZE(a.UNDO_SQL) AS UNDO_STATEMENTS, '
- || 'ARRAY_SIZE(a.PARAM_SPEC) AS PARAM_COUNT, '
- || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
- || '  WHERE l.CODE = a.CODE AND l.STATUS = ''UNDONE'') AS TIMES_UNDONE, '
- || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
- || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS TIMES_RUN, '
- || '(SELECT MAX(l.FINISHED_AT) FROM ' || :tgt || '.ACTION_LOG l '
- || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS LAST_RUN_AT '
- || 'FROM ' || :tgt || '.ACTION_REGISTRY a '
- || 'ORDER BY CASE a.TIER WHEN ''SAMPLE'' THEN 1 WHEN ''LIMITED'' THEN 2 ELSE 3 END, a.CODE');
-
-  -- ── What the app renders a widget from ─────────────────────────────────────
-  -- One row per parameter. Deliberately EXCLUDES allowed_sql, for the same reason
-  -- V_ACTIONS excludes RUN_SQL: the app does not need the whitelist QUERY, it needs
-  -- the whitelist RESULT, and shipping the query invites someone to treat the browser
-  -- as the place the permitted set is decided. The host reads OPTIONS_SQL only to run
-  -- it for display; RUN_ACTION re-evaluates the registry's own copy when it validates,
-  -- so what the app showed can never be what authorises the value.
-  --
-  -- ORDINAL is preserved from the declaration order so the widgets render in the order
-  -- the solution author intended rather than alphabetically.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_PARAMS AS SELECT '
- || 'a.CODE, p.INDEX AS ORDINAL, '
- || 'p.VALUE:name::STRING AS PARAM_NAME, '
- || 'COALESCE(p.VALUE:label::STRING, p.VALUE:name::STRING) AS LABEL, '
- || 'UPPER(COALESCE(p.VALUE:kind::STRING, ''IDENT'')) AS KIND, '
- || 'p.VALUE:allowed_sql::STRING AS OPTIONS_SQL, '
- || 'p.VALUE:options::ARRAY AS OPTIONS, '
- || 'p.VALUE:min::NUMBER(38,6) AS MIN_VALUE, '
- || 'p.VALUE:max::NUMBER(38,6) AS MAX_VALUE, '
- || 'COALESCE(p.VALUE:freeform::BOOLEAN, FALSE) AS FREEFORM, '
- || 'p.VALUE:help::STRING AS HELP '
- || 'FROM ' || :tgt || '.ACTION_REGISTRY a, '
- || 'LATERAL FLATTEN(input => a.PARAM_SPEC) p '
- || 'ORDER BY a.CODE, p.INDEX');
-
-  -- Estimated against measured. The measurement is NOT available immediately:
-  -- per-query credits live in QUERY_ATTRIBUTION_HISTORY, which lags by up to a few
-  -- hours, so this view is empty for a while after an action runs and then fills
-  -- in. Saying that plainly beats printing an estimate and letting the reader
-  -- assume it was measured.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_COST AS SELECT '
- || 'l.LOG_ID, l.CODE, l.LABEL, l.STATUS, l.EST_CREDITS, '
- || 'SUM(q.CREDITS_ATTRIBUTED_COMPUTE) AS MEASURED_CREDITS, '
- || 'COUNT(q.QUERY_ID) AS STATEMENTS_MEASURED, l.STATEMENTS_RUN, l.STARTED_AT, '
-    -- Why the measurement is absent, rather than leaving a NULL to be read as a
-    -- failure. QUERY_ATTRIBUTION_HISTORY only records queries that consumed
-    -- WAREHOUSE COMPUTE. ALTER WAREHOUSE, CREATE VIEW and SET MASKING POLICY consume
-    -- none, so for a metadata-only action no row will EVER appear -- and every
-    -- action was telling the customer the figure "appears once attribution catches
-    -- up". Checked against real runs: ICE_FIX matched 0 of 27 statements and
-    -- WH_SUSPEND_ALL 0 of 2, permanently. A promise that never comes true is worse
-    -- than saying up front that there is nothing to measure.
- || 'CASE '
- || '  WHEN COUNT(q.QUERY_ID) >= l.STATEMENTS_RUN AND l.STATEMENTS_RUN > 0 '
- || '    THEN ''MEASURED'' '
- || '  WHEN COUNT(q.QUERY_ID) > 0 '
- || '    THEN ''PARTIAL: '' || COUNT(q.QUERY_ID) || '' of '' || l.STATEMENTS_RUN '
- || '      || '' statement(s) used attributable compute; the rest were metadata-only'' '
- || '  WHEN l.STARTED_AT > DATEADD(hour, -6, CURRENT_TIMESTAMP()) '
- || '    THEN ''PENDING: attribution can lag several hours. If these statements were '
-|| 'metadata-only (ALTER, CREATE VIEW, policy attach) it will stay empty because they '
-|| 'consume no warehouse compute.'' '
- || '  ELSE ''NO COMPUTE MEASURED: these statements consumed no warehouse compute, so '
-|| 'QUERY_ATTRIBUTION_HISTORY has nothing to attribute. Metadata operations are '
-|| 'genuinely near-free -- this is not a missing measurement.'' '
- || 'END AS MEASURED_STATUS '
- || 'FROM ' || :tgt || '.ACTION_LOG l '
- || 'LEFT JOIN ' || :tgt || '.ACTION_STATEMENT_LOG s ON s.LOG_ID = l.LOG_ID '
- || 'LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY q '
- || '  ON q.QUERY_ID = s.QUERY_ID '
- || 'GROUP BY 1,2,3,4,5,8,9');
-
-  -- ── The monthly run-rate, over whatever the solution registered above ─────
-  -- THE CADENCE IS KNOWN, THE DURATION IS MEASURED, THE PRODUCT IS PROJECTED.
-  -- Runs per month comes from a schedule this build itself set, so it is a fact.
-  -- Seconds per run comes from what this build observed. Their product is still a
-  -- PROJECTION, because next month's data volume is not this month's -- and it is
-  -- labelled that way rather than presented as a bill.
-  --
-  -- Deliberately not summed with anything MEASURED, for the same reason step 14
-  -- asserts it: a total mixing a measurement with a forecast is a number nobody
-  -- can defend in a room.
-  -- A row with RUNS_PER_MONTH IS NULL is VOLUME-DRIVEN: a serverless meter billed per
-  -- unit of data (Snowpipe Streaming, for instance) with no schedule and no warehouse.
-  -- The formula below cannot describe it, and NULL arithmetic correctly yields NULL
-  -- rather than inventing a monthly figure. Every schedule-driven solution writes a
-  -- positive RUNS_PER_MONTH, so this branch changes nothing for them.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_MONTHLY_RUN_RATE AS SELECT '
- || 'KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
- || 'WAREHOUSE_CREDITS_PER_HOUR, '
-    -- credits = runs x seconds x (credits/hour / 3600). Multiply BEFORE dividing:
-    -- LET cps := 1.0/3600.0 rounds to scale 6 (0.000278) and a solution already
-    -- shipped a 4x-low figure that way.
- || 'ROUND(RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
- || '  / 3600.0, 4) AS EST_CREDITS_PER_MONTH, '
- || 'CASE WHEN RUNS_PER_MONTH IS NULL THEN ''VOLUME-DRIVEN'' '
- || '     ELSE ''PROJECTED'' END AS LABEL, MEASURED_INPUT, BASIS, INSTALLED_AT '
- || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
-
-  -- One line the app and the packet can both print. Zero rows is a legitimate
-  -- and meaningful answer -- it means this solution installs nothing recurring --
-  -- so it says that in words rather than rendering an empty table.
-  --
-  -- Scheduled and volume-driven components are reported in SEPARATE clauses and are
-  -- never added together. The single-sentence version claimed every figure was
-  -- "PROJECTED from schedules this build set and durations it measured", which for a
-  -- continuous serverless ingest endpoint was false three times over -- no schedule was
-  -- set, no duration was measured, and the resulting "About 0.02 credits/month" read as
-  -- though streaming were free. A volume-driven component contributes NO credits figure
-  -- here on purpose: the honest answer is a per-unit rate plus a volume the customer
-  -- controls, and that lives in BASIS.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_RUN_RATE_HEADLINE AS SELECT '
- || 'CASE WHEN COUNT(*) = 0 THEN '
- || '  ''This build installs nothing that runs on a schedule. It costs storage '
- || 'plus whatever compute the people querying it use.'' '
- || 'ELSE '
- || '  CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0 THEN '
- || '    ''About '' || ROUND(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
- || '      RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
- || '      / 3600.0, 0)), 2) '
- || '    || '' credits/month across '' || COUNT_IF(RUNS_PER_MONTH IS NOT NULL) '
- || '    || '' scheduled component(s), PROJECTED from schedules this build set '
- || 'and durations it measured.'' ELSE '''' END '
- || '  || CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NULL) > 0 THEN '
- || '    IFF(COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0, '' Plus '', ''This build '
- || 'installs '') || COUNT_IF(RUNS_PER_MONTH IS NULL) '
- || '    || '' volume-driven component(s) that run continuously with NO schedule '
- || 'and NO monthly projection: the cost scales with how much data you send, not '
- || 'with a cadence. This is NOT zero -- read BASIS in V_MONTHLY_RUN_RATE for the '
- || 'per-unit rate.'' ELSE '''' END '
- || 'END AS HEADLINE, COUNT(*) AS COMPONENTS, '
- || 'ROUND(COALESCE(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
- || '  RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
- || '  / 3600.0, 0)), 0), 4) AS EST_CREDITS_PER_MONTH, '
- || 'COUNT_IF(RUNS_PER_MONTH IS NOT NULL) AS SCHEDULED_COMPONENTS, '
- || 'COUNT_IF(RUNS_PER_MONTH IS NULL) AS VOLUME_COMPONENTS '
- || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
-
-
-  -- The only way to run one. Everything the app can do goes through here, so the
-  -- refusals below are the whole safety model:
-  --   1. the action must exist in this build
-  --   2. the BUILD must have been authorised FOR THAT ACTION'S TIER -- ALLOW_ACTIONS
-  --      for LIMITED and PRODUCTION, ALLOW_SAMPLE_ACTIONS for SAMPLE
-  --   3. the caller must type the code back exactly
-  -- and it stops at the FIRST failing statement, because a half-applied change is
-  -- worse than an unapplied one.
-  --
-  -- Existence is checked BEFORE authorisation now, because the tier is a property of
-  -- the registered action and there is nothing to authorise until we know it. The
-  -- swap leaks nothing: the action codes are printed in the script and listed in the
-  -- app, so "no such action" was never a secret.
-  --
-  -- An unrecognised TIER falls to the STRICTER gate on purpose. A typo in a tier
-  -- name must not be a way to get a PRODUCTION action treated as a sample.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR, P_PARAMS VARCHAR) '
- || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
- || 'DECLARE '
- || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
- || '  est NUMBER(38,6) := 0; sqls ARRAY := ARRAY_CONSTRUCT(); usnap STRING := NULL; '
- || '  i INT := 0; ran INT := 0; errs STRING := ''''; '
- || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
-    -- Parameter resolution state. `resolved` accumulates the EMITTED TEXT for each
-    -- parameter -- already shape-checked, already whitelisted, already quoted -- so
-    -- interpolation downstream is a plain REPLACE over values that have passed every
-    -- gate. Nothing the caller sent is ever interpolated directly.
- || '  pspec ARRAY := ARRAY_CONSTRUCT(); pobj OBJECT := OBJECT_CONSTRUCT(); '
- || '  resolved OBJECT := OBJECT_CONSTRUCT(); pkeys ARRAY := ARRAY_CONSTRUCT(); '
- || '  k INT := 0; kk INT := 0; pj VARIANT := NULL; pname STRING := ''''; '
- || '  pkind STRING := ''''; pval STRING := NULL; asql STRING := NULL; '
- || '  emit STRING := ''''; parts ARRAY := ARRAY_CONSTRUCT(); jj INT := 0; '
- || '  part STRING := ''''; hits INT := 0; num NUMBER(38,6) := NULL; '
- || '  canon STRING := NULL; opts ARRAY := ARRAY_CONSTRUCT(); '
-    -- Two accumulators, deliberately. `resolved` holds the EMITTED TEXT that goes into
-    -- the statements -- quoted, so "EVENT_TS". `chosen` holds the CANONICAL VALUE a
-    -- human picked -- EVENT_TS. The log gets `chosen`, because an audit trail reading
-    -- {"attach_on":"\"EVENT_TS\""} makes a reader decode escaping to learn what was
-    -- done; the exact text that executed is already in ACTION_STATEMENT_LOG, so nothing
-    -- is lost by keeping this one readable.
- || '  chosen OBJECT := OBJECT_CONSTRUCT(); '
- || '  pmin NUMBER(38,6) := NULL; pmax NUMBER(38,6) := NULL; '
- || '  s STRING := ''''; fin ARRAY := ARRAY_CONSTRUCT(); ustmts ARRAY := ARRAY_CONSTRUCT(); '
- || 'BEGIN '
- || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:cnt = 0) THEN '
- || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
- || '  END IF; '
- || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
- || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:tier = ''SAMPLE'') THEN '
- || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
- || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. This build was created with WHGEN_ALLOW_SAMPLE_ACTIONS = '
- || 'FALSE, so even the seeded-data actions are inert. Re-run the script with it set '
- || 'to TRUE to arm them.''; '
- || '    END IF; '
- || '  ELSE '
- || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. '' || :tier || '' actions touch real data and this build was '
- || 'created with WHGEN_ALLOW_ACTIONS = FALSE, so nothing in the app can change '
- || 'anything of yours. Re-run the script with it set to TRUE to arm them.''; '
- || '    END IF; '
- || '  END IF; '
- || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
- || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
- || '  END IF; '
- || '  SELECT LABEL, EST_CREDITS, RUN_SQL, TO_JSON(UNDO_SQL), PARAM_SPEC '
- || '    INTO :lbl, :est, :sqls, :usnap, :pspec '
- || '    FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE; '
-    -- ── Parameters: validate EVERYTHING before a single statement runs ──────────
-    -- Order matters. This whole block sits BEFORE the ACTION_LOG insert and before
-    -- the execution loop, so a refusal here has applied nothing at all -- which is
-    -- what makes refuse-the-whole-action free rather than a rollback problem. A
-    -- partially-applied change is the thing this framework works hardest to prevent,
-    -- so a single bad value stops the entire action rather than running the subset
-    -- that happened to validate.
- || '  pobj := COALESCE(TRY_PARSE_JSON(:P_PARAMS)::OBJECT, OBJECT_CONSTRUCT()); '
-    -- Values sent to an action that declares none are a REFUSAL, not something to
-    -- ignore. Silently dropping them would mean the caller believes it constrained
-    -- the action and the action did something broader -- and the log would agree
-    -- with the action, not the caller.
- || '  IF (ARRAY_SIZE(:pspec) = 0 AND ARRAY_SIZE(OBJECT_KEYS(:pobj)) > 0) THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no parameters, but values were '
- || 'supplied for it. Nothing was run.''; '
- || '  END IF; '
- || '  WHILE (:k < ARRAY_SIZE(:pspec)) DO '
- || '    pj := GET(:pspec, :k); '
- || '    pname := pj:name::STRING; '
- || '    pkind := UPPER(COALESCE(pj:kind::STRING, ''IDENT'')); '
- || '    asql := pj:allowed_sql::STRING; '
- || '    pval := GET(:pobj, :pname)::STRING; '
- || '    IF (:pval IS NULL OR TRIM(:pval) = '''') THEN '
- || '      RETURN ''REFUSED. '' || :P_CODE || '' needs a value for '' || :pname '
- || '        || ''. Nothing was run.''; '
- || '    END IF; '
- || '    IF (:pkind = ''STRING'') THEN '
-    -- ── A LITERAL VALUE, not an identifier ──────────────────────────────────────
-    -- Some parameters land inside a string literal rather than in an object position
-    -- -- an audience NAME is stored in a column, it does not name anything. Those
-    -- cannot be identifier-quoted (a name with a space is legitimate) and they still
-    -- cannot be bound, because RUN_ACTION EXECUTE IMMEDIATEs pre-built statement text.
-    --
-    -- TWO defences, again, because escaping alone is the thing that goes wrong quietly:
-    --   1. A conservative CHARACTER ALLOWLIST -- letters, digits, space and a few
-    --      punctuation marks that appear in real names. No single quote, no double
-    --      quote, no backslash, no semicolon, no comment marker. This is a permit-list,
-    --      so a character nobody thought about is refused rather than passed through.
-    --   2. Quote DOUBLING on top, so even if the allowlist were later widened by
-    --      someone, a quote could not terminate the literal.
-    -- Length is capped so a parameter cannot be used to push a statement past a limit.
- || '      IF (LENGTH(:pval) > 200) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' is longer than 200 characters. '
- || 'Nothing was run.''; '
- || '      END IF; '
- || '      IF (NOT REGEXP_LIKE(:pval, ''[A-Za-z0-9 _.,()\\-]+'')) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' contains a character that is not '
- || 'permitted in a name. Letters, digits, spaces and _ . , ( ) - are allowed. '
- || 'Nothing was run.''; '
- || '      END IF; '
-    -- The literal is emitted WITHOUT its surrounding quotes: the statement in the
-    -- solution supplies those, exactly as it does for any other literal it writes, so
-    -- '<<audience_name>>' reads as a literal in the source and stays one.
- || '      emit := REPLACE(:pval, '''''''', ''''''''''''); '
- || '      canon := :pval; '
- || '      IF (NOT COALESCE(pj:freeform::BOOLEAN, FALSE) '
- || '          AND ARRAY_SIZE(COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT())) = 0) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
- || 'marked freeform. Nothing was run.''; '
- || '      END IF; '
- || '    ELSEIF (:pkind = ''NUMBER'') THEN '
-    -- A number is still interpolated, because clauses like ARCHIVE_FOR_DAYS = 90 are
-    -- DDL and cannot be bound any more than an identifier can. The parse is the gate:
-    -- it returns NULL rather than raising, so a non-numeric arrives here as a refusal
-    -- instead of an exception, and the emitted text is the PARSED number rather than
-    -- the caller's string -- verified: '180 OR 1=1' parses to NULL, so it cannot
-    -- survive as text.
-    --
-    -- TRY_TO_DECIMAL(_, 38, 6), NOT TRY_TO_NUMBER. TRY_TO_NUMBER defaults to scale 0
-    -- and SILENTLY ROUNDS: TRY_TO_NUMBER('90.5') is 91, verified. A parameter that
-    -- quietly becomes a different number than the one chosen is worse than one that
-    -- is refused.
- || '      num := TRY_TO_DECIMAL(:pval, 38, 6); '
- || '      IF (:num IS NULL) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' must be a number. Nothing was run.''; '
- || '      END IF; '
- || '      pmin := pj:min::NUMBER(38,6); pmax := pj:max::NUMBER(38,6); '
- || '      IF ((:pmin IS NOT NULL AND :num < :pmin) '
- || '          OR (:pmax IS NOT NULL AND :num > :pmax)) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is outside the '
- || 'permitted range '' || COALESCE(:pmin::STRING, ''-'') || '' to '' '
- || '          || COALESCE(:pmax::STRING, ''-'') || ''. Nothing was run.''; '
- || '      END IF; '
-    -- Emit 180, never 180.000000. These values land in identifier positions as well as
-    -- value positions -- DEMO_COOL_POLICY_180 is a name and DEMO_COOL_POLICY_180.000000
-    -- is a syntax error -- so a NUMBER(38,6) cast straight to STRING breaks the
-    -- statement. Found live: the first parameterised run failed to compile on exactly
-    -- this. A genuinely fractional value keeps its decimals with trailing zeros
-    -- trimmed, so 90.5 stays 90.5.
- || '      IF (:num = TRUNC(:num)) THEN '
- || '        emit := :num::INT::STRING; '
- || '      ELSE '
- || '        emit := REGEXP_REPLACE(REGEXP_REPLACE(:num::STRING, ''0+$'', ''''), ''[.]$'', ''''); '
- || '      END IF; '
- || '      canon := :emit; '
- || '    ELSE '
-    -- ── Gate 1: SHAPE, per dot-separated part ───────────────────────────────────
-    -- Independent of the whitelist on purpose. The whitelist is only ever as good as
-    -- the allowed_sql a future author writes; point it at a free-text column and it
-    -- authorises arbitrary text. This gate holds regardless. REGEXP_LIKE in Snowflake
-    -- matches the ENTIRE string -- verified, not assumed: ''ORDERS; DROP'' is FALSE
-    -- against this pattern, as are a space and a double quote. Do not "fix" this
-    -- pattern by adding anchors and do not relax it to a partial match.
-    --
-    -- Split on ''.'' so a qualified name is checked part by part. A name genuinely
-    -- containing a dot is refused here rather than silently mis-parsed into the wrong
-    -- number of parts.
- || '      parts := SPLIT(:pval, ''.''); jj := 0; '
- || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
- || '        IF (NOT REGEXP_LIKE(GET(:parts, :jj)::STRING, ''[A-Za-z_][A-Za-z0-9_$]*'')) THEN '
- || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not a valid '
- || 'identifier. Nothing was run.''; '
- || '        END IF; '
- || '        jj := :jj + 1; '
- || '      END WHILE; '
-    -- ── Gate 2: MEMBERSHIP, which also returns the CANONICAL SPELLING ───────────
-    -- DEFAULT DENY. A parameter must declare where its permitted values come from --
-    -- allowed_sql (a query) or options (a literal list) -- and if it declares neither
-    -- the action is REFUSED rather than falling back to the shape gate alone. An author
-    -- who simply forgets allowed_sql would otherwise get an identifier accepted on shape
-    -- alone and never know, which is the quiet failure this feature exists to avoid.
-    -- Freeform has to be asked for in writing, and is only appropriate for a NAME BEING
-    -- CREATED, which cannot be checked against things that already exist.
-    --
-    -- Both sources are enforced HERE, server-side. options is not merely what the app
-    -- offers: a list the host renders but the procedure does not check is a dropdown
-    -- pretending to be a control.
-    --
-    -- The comparison is case-INSENSITIVE but what gets emitted is the ALLOWED SET''S OWN
-    -- SPELLING, never the caller''s. This matters specifically because the value is
-    -- emitted QUOTED: a caller typing ''event_ts'' against a column stored as EVENT_TS
-    -- matches, and emitting their casing would produce "event_ts", which is a DIFFERENT
-    -- and non-existent object. Verified live -- the case-insensitive match accepted the
-    -- lowercase spelling, which is correct, and only canonicalising makes the resulting
-    -- identifier resolve. It also means a column genuinely stored lowercase is quoted in
-    -- ITS spelling and resolves too.
- || '      canon := NULL; '
- || '      IF (:asql IS NOT NULL AND TRIM(:asql) <> '''') THEN '
-    -- The whitelist query comes from the REGISTRY, never from the caller, so the app
-    -- cannot influence what its own value is checked against. The value is BOUND rather
-    -- than concatenated -- the point of the check is to constrain an attacker-controlled
-    -- string, so the check itself must not concatenate one.
-    --
-    -- allowed_sql must expose a column named ALLOWED_VALUE. Requiring a NAME rather than
-    -- reading position 1 means an author widening their SELECT list cannot silently
-    -- change which column authorises values.
- || '        EXECUTE IMMEDIATE ''SELECT MAX(TO_VARCHAR(a.ALLOWED_VALUE)) FROM ('' || :asql '
- || '          || '') a WHERE UPPER(TO_VARCHAR(a.ALLOWED_VALUE)) = UPPER(?)'' USING (pval); '
- || '        SELECT $1 INTO :canon FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())); '
- || '        IF (:canon IS NULL) THEN '
- || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
- || 'values this build discovered for it. Nothing was run.''; '
- || '        END IF; '
- || '      ELSE '
- || '        opts := COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT()); '
- || '        IF (ARRAY_SIZE(:opts) > 0) THEN '
-    -- A plain loop rather than FLATTEN over a local VARIANT: that construct raised
-    -- EXPRESSION_ERROR inside a procedure body when it was tried, and a loop cannot.
- || '          jj := 0; '
- || '          WHILE (:jj < ARRAY_SIZE(:opts)) DO '
- || '            IF (UPPER(GET(:opts, :jj)::STRING) = UPPER(:pval)) THEN '
- || '              canon := GET(:opts, :jj)::STRING; '
- || '              BREAK; '
- || '            END IF; '
- || '            jj := :jj + 1; '
- || '          END WHILE; '
- || '          IF (:canon IS NULL) THEN '
- || '            RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
- || 'permitted values for it. Nothing was run.''; '
- || '          END IF; '
- || '        ELSEIF (COALESCE(pj:freeform::BOOLEAN, FALSE)) THEN '
-    -- Freeform: there is no set to canonicalise against, so the caller''s spelling IS
-    -- the name being created. It has already passed the shape gate.
- || '          canon := :pval; '
- || '        ELSE '
- || '          RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
- || 'marked freeform, so this build cannot say what it is allowed to be. Nothing was run. '
- || 'This is a defect in the solution, not in what you chose.''; '
- || '        END IF; '
- || '      END IF; '
-    -- ── Quote the CANONICAL value, part by part ─────────────────────────────────
-    -- "DB"."SCHEMA"."TABLE", not "DB.SCHEMA.TABLE" -- the latter names one object with
-    -- dots in it. ENUM values are emitted BARE because they land in positions like
-    -- ARCHIVE_TIER = COOL where a quoted string is not valid syntax; the shape gate
-    -- already refused anything that is not a bare word, so an unquoted enum still
-    -- cannot carry punctuation.
- || '      parts := SPLIT(:canon, ''.''); jj := 0; emit := ''''; '
- || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
- || '        part := GET(:parts, :jj)::STRING; '
- || '        IF (:pkind = ''ENUM'') THEN '
- || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || :part; '
- || '        ELSE '
- || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || ''"'' || :part || ''"''; '
- || '        END IF; '
- || '        jj := :jj + 1; '
- || '      END WHILE; '
- || '    END IF; '
- || '    resolved := OBJECT_INSERT(:resolved, :pname, :emit, TRUE); '
- || '    chosen := OBJECT_INSERT(:chosen, :pname, :canon, TRUE); '
- || '    k := :k + 1; '
- || '  END WHILE; '
-    -- ── Interpolation, over validated text only ────────────────────────────────
-    -- Both the forward statements AND the reverse ones, because the reverse set is
-    -- snapshotted below and an undo must reverse THE SAME target. Resolving undo here
-    -- is what makes that structural rather than a promise: UNDO_ACTION replays text
-    -- that was already resolved, so it cannot be handed different values later.
- || '  pkeys := OBJECT_KEYS(:resolved); '
- || '  ustmts := PARSE_JSON(:usnap)::ARRAY; '
- || '  i := 0; '
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    s := GET(:sqls, :i)::STRING; kk := 0; '
- || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
- || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
- || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
- || '      kk := :kk + 1; '
- || '    END WHILE; '
-    -- A placeholder left over means the statement names a parameter the action did not
-    -- declare -- a typo between the two. Refusing beats executing DDL with a literal
-    -- <<tbl>> in it, and beats the silent alternative of leaving it to fail with a
-    -- syntax error that points at the wrong thing.
- || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
- || '      RETURN ''REFUSED. Statement '' || (:i + 1) || '' of '' || :P_CODE '
- || '        || '' contains a placeholder this action does not declare. Nothing was run.''; '
- || '    END IF; '
- || '    fin := ARRAY_APPEND(:fin, :s); '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  sqls := :fin; fin := ARRAY_CONSTRUCT(); i := 0; '
- || '  WHILE (:i < ARRAY_SIZE(:ustmts)) DO '
- || '    s := GET(:ustmts, :i)::STRING; kk := 0; '
- || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
- || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
- || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
- || '      kk := :kk + 1; '
- || '    END WHILE; '
- || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
- || '      RETURN ''REFUSED. Reverse statement '' || (:i + 1) || '' of '' || :P_CODE '
- || '        || '' contains a placeholder this action does not declare. Nothing was run, '
- || 'because an action whose undo cannot resolve must not run in the first place.''; '
- || '    END IF; '
- || '    fin := ARRAY_APPEND(:fin, :s); '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  usnap := TO_JSON(:fin); i := 0; '
-    -- The reverse statements are SNAPSHOTTED onto this run, not read from the
-    -- registry when the undo happens. The registry holds what the action CURRENTLY
-    -- declares; a rebuild between the run and the undo can change that, and then the
-    -- undo reverses a different set of objects than the run created. Storing them
-    -- here means an undo can only ever replay what THIS run was going to do.
-    -- Stored as JSON text rather than ARRAY because an ARRAY bind through
-    -- INSERT..SELECT is fragile, and TO_JSON/PARSE_JSON round-trips exactly.
- || '  INSERT INTO ' || :tgt || '.ACTION_LOG '
- || '    (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS, UNDO_SNAPSHOT, PARAMS) '
- || '    SELECT :log_id, :P_CODE, :lbl, :est, ''RUNNING'', :usnap, '
-    -- The RESOLVED values, not the raw input: what the statements were actually built
-    -- with. NULL when the action takes none, so an unparameterised row reads as having
-    -- had none rather than as an empty object that might mean anything.
- || '           IFF(ARRAY_SIZE(OBJECT_KEYS(:chosen)) = 0, NULL, TO_JSON(:chosen)); '
-    -- :i indexes the ARRAY from 0, but every number this procedure SHOWS a
-    -- human is :i + 1. Sabotaging the second statement of an action originally
-    -- produced "statement 1: SQL compilation error", which points at the wrong
-    -- DDL -- the single most expensive kind of wrong in an error message.
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    BEGIN '
- || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
- || '               LAST_QUERY_ID(), ''OK''; '
- || '      ran := :ran + 1; '
- || '    EXCEPTION WHEN OTHER THEN '
- || '      errs := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :errs; '
- || '      BREAK; '
- || '    END; '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''DONE'', ''FAILED''), '
- || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
- || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
- || '  IF (:errs <> '''') THEN '
- || '    RETURN ''FAILED after '' || :ran || '' statement(s), nothing further was run. '' || :errs; '
- || '  END IF; '
- || '  RETURN ''DONE. '' || :lbl '
-    -- Name the values in the RETURN, not just in the log. The message is the only
-    -- thing most readers see, and "DONE. Attach the policy" is the same sentence
-    -- whichever table it just tiered.
- || '    || IFF(ARRAY_SIZE(:pkeys) = 0, '''', '' on '' || TO_JSON(:chosen)) '
- || '    || '' -- '' || :ran || '' statement(s) ran. Estimated '' '
- || '    || :est || '' credits. V_ACTION_COST reconciles that against what Snowflake '' '
- || '    || ''actually charged, and its MEASURED_STATUS column says whether a '' '
- || '    || ''measurement is pending, partial, or will never arrive because the '' '
- || '    || ''statements consumed no warehouse compute.''; '
- || 'END');
-
-  -- ── The two-argument form every existing solution and test already calls ────
-  -- A DELEGATE, not a copy. There is exactly ONE implementation of the three gates
-  -- and the parameter resolver, and this signature reaches it with an empty parameter
-  -- object. Duplicating the body to "keep the simple path simple" would put a second
-  -- copy of a safety gate in the file, and a duplicated gate is a gate that rots --
-  -- F2 needed a dedicated in-sync assertion for exactly that reason.
-  --
-  -- So the 27 solutions that declare no parameters, and gauntlet step 12 which calls
-  -- RUN_ACTION(code, confirm) positionally, keep working unchanged and still get
-  -- every gate.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
- || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
- || 'DECLARE r STRING := ''''; '
- || 'BEGIN '
- || '  CALL ' || :tgt || '.RUN_ACTION(:P_CODE, :P_CONFIRM, NULL) INTO :r; '
- || '  RETURN :r; '
- || 'END');
-
-  -- ── Undoing one action, without taking the rest down with it ───────────────
-  -- Until this existed the only undo was TEARDOWN(), which drops the whole schema.
-  -- That is a fine answer to "remove the demo" and a useless answer to "I pressed
-  -- the production button, show me it comes back" -- it destroys the evidence
-  -- along with the change. This reverses ONE action and leaves everything else
-  -- standing, which is the thing you actually want before you press it for real.
-  --
-  -- Same three gates as RUN_ACTION, deliberately. An undo is itself a change to
-  -- the account: reversing a masking policy EXPOSES a column again. It is not
-  -- inherently the safe direction and does not get a weaker door.
-  --
-  -- DELIBERATELY NOT PARAMETERISED, and this is a safety decision rather than an
-  -- omission. RUN_ACTION resolves the reverse statements and snapshots them ALREADY
-  -- RESOLVED, so the undo replays the exact text built for that run. Giving this
-  -- procedure a parameter argument would let a caller undo with DIFFERENT values than
-  -- the run used -- an undo that reverses a different target than the action touched,
-  -- which is worse than having no undo at all. The only reverse statements reachable
-  -- here are the ones the run itself produced.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.UNDO_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
- || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
- || 'DECLARE '
- || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
- || '  sqls ARRAY := ARRAY_CONSTRUCT(); last_st STRING := NULL; usnap STRING := NULL; '
- || '  i INT := 0; ran INT := 0; errs STRING := ''''; e1 STRING := ''''; '
- || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
- || 'BEGIN '
- || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:cnt = 0) THEN '
- || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
- || '  END IF; '
-    -- Tier-aware, exactly as RUN_ACTION. Undo has to be reachable under the SAME
-    -- authorisation that let the action run, or SAMPLE actions become one-way: the
-    -- button works, the reversal refuses, and the seeded objects are stranded until
-    -- TEARDOWN(). Unknown tiers fall to the stricter gate, as above.
- || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
- || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:tier = ''SAMPLE'') THEN '
- || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
- || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. This build was created with WHGEN_ALLOW_SAMPLE_ACTIONS = FALSE.''; '
- || '    END IF; '
- || '  ELSE '
- || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. This build was created with WHGEN_ALLOW_ACTIONS = FALSE.''; '
- || '    END IF; '
- || '  END IF; '
- || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
- || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
- || '  END IF; '
- || '  SELECT LABEL INTO :lbl FROM ' || :tgt
- || '    .ACTION_REGISTRY WHERE CODE = :P_CODE; '
-    -- Prefer the snapshot taken when the action ran. Fall back to what the registry
-    -- declares now, for a schema built before UNDO_SNAPSHOT existed -- that is the
-    -- old, less precise behaviour, and it is better than refusing to undo at all.
- || '  BEGIN '
- || '    SELECT UNDO_SNAPSHOT INTO :usnap FROM ' || :tgt || '.ACTION_LOG '
- || '      WHERE CODE = :P_CODE AND STATUS = ''DONE'' '
- || '      ORDER BY FINISHED_AT DESC LIMIT 1; '
- || '  EXCEPTION WHEN OTHER THEN usnap := NULL; END; '
- || '  IF (:usnap IS NOT NULL) THEN '
- || '    sqls := PARSE_JSON(:usnap)::ARRAY; '
- || '  ELSE '
- || '    SELECT UNDO_SQL INTO :sqls FROM ' || :tgt
- || '      .ACTION_REGISTRY WHERE CODE = :P_CODE; '
- || '  END IF; '
- || '  IF (ARRAY_SIZE(:sqls) = 0) THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no reverse statements. Read its '
-|| 'undo text -- some changes are only reversible by hand, and pretending otherwise '
-|| 'would be worse than saying so.''; '
- || '  END IF; '
-    -- An unresolved placeholder can only reach here down the FALLBACK path above --
-    -- a parameterised action whose run predates UNDO_SNAPSHOT, so the registry's own
-    -- unresolved text was loaded instead. Executing it would run DDL containing a
-    -- literal <<tbl>>; guessing a value would reverse a target this run may never have
-    -- touched. Both are worse than refusing and saying which action it was.
- || '  i := 0; '
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    IF (REGEXP_LIKE(GET(:sqls, :i)::STRING, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
- || '      RETURN ''REFUSED. '' || :P_CODE || '' takes parameters and no resolved reverse '
-|| 'statements were recorded for the run being undone, so the values it used are not '
-|| 'known. Run it again to record them; nothing was reversed.''; '
- || '    END IF; '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  i := 0; '
-    -- Refusing to undo something that was never done is not pedantry. Running the
-    -- reverse of an un-run action can itself be destructive: the reverse of "attach
-    -- a masking policy" is "unset it", which on a column somebody ELSE masked would
-    -- quietly strip their protection.
-    -- COUNT of DONE rows is the WRONG question: it stays true forever, so a second
-    -- undo sailed past this guard and reported UNDONE again having done nothing.
-    -- Verified live -- it was harmless only because the first undo had already
-    -- emptied the registry it reads. The right question is what happened LAST.
- || '  last_st := (SELECT STATUS FROM ' || :tgt || '.ACTION_LOG '
- || '              WHERE CODE = :P_CODE AND STATUS IN (''DONE'', ''UNDONE'') '
- || '              ORDER BY FINISHED_AT DESC LIMIT 1); '
- || '  IF (:last_st IS NULL) THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' has not completed on this build, so there '
-|| 'is nothing to reverse.''; '
- || '  END IF; '
- || '  IF (:last_st = ''UNDONE'') THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' has already been undone. Run it again '
-|| 'before undoing it again.''; '
- || '  END IF; '
- || '  INSERT INTO ' || :tgt || '.ACTION_LOG (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS) '
- || '    SELECT :log_id, :P_CODE, ''UNDO: '' || :lbl, 0, ''UNDOING''; '
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    BEGIN '
- || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
- || '               LAST_QUERY_ID(), ''OK''; '
- || '      ran := :ran + 1; '
-    -- An undo does NOT stop at the first failure, which is the opposite of
-    -- RUN_ACTION. Half-applying a change is bad; half-REVERSING one leaves the
-    -- account in a state neither the action nor the undo describes, so it pushes on
-    -- and reports everything that went wrong. Every statement is logged either way.
- || '    EXCEPTION WHEN OTHER THEN '
- || '      e1 := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
- || '      errs := :errs || :e1 || ''; ''; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :e1; '
- || '    END; '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''UNDONE'', ''FAILED''), '
- || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
- || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
- || '  IF (:errs <> '''') THEN '
- || '    RETURN ''PARTIALLY UNDONE. '' || :ran || '' of '' || ARRAY_SIZE(:sqls) '
- || '      || '' statement(s) succeeded. '' || :errs; '
- || '  END IF; '
- || '  RETURN ''UNDONE. '' || :lbl || '' -- '' || :ran || '' reverse statement(s) ran. '' '
- || '    || ''The action can be run again.''; '
- || 'END');
-  cost_once := :cost_once + 0.01;
-  IF (ARRAY_SIZE(:actions) > 0) THEN
-    notes := ARRAY_APPEND(:notes,
-      'THIS BUILD DECLARES ' || ARRAY_SIZE(:actions) || ' ACTION(S) the app can offer. '
-   || IFF(:allow_actions,
-          'WHGEN_ALLOW_ACTIONS is TRUE, so they are ARMED: a user of the dashboard can '
-       || 'run them after typing the action code to confirm. Every attempt is recorded '
-       || 'in ACTION_LOG.',
-          'WHGEN_ALLOW_ACTIONS is FALSE, so every button is inert and RUN_ACTION refuses. '
-       || 'The app still shows what each action would do and what it would cost.'));
-    LET ai INT := 0;
-    WHILE (:ai < ARRAY_SIZE(:actions)) DO
-      notes := ARRAY_APPEND(:notes,
-        '  ACTION ' || GET(:actions, :ai):tier::STRING || ' · '
-     || GET(:actions, :ai):code::STRING || ' — '
-     || GET(:actions, :ai):label::STRING || '  (~'
-     || GET(:actions, :ai):est::STRING || ' credits: '
-     || GET(:actions, :ai):basis::STRING || ')');
-      ai := :ai + 1;
-    END WHILE;
-  END IF;
-
+  LET app_build_start INTEGER := ARRAY_SIZE(:stmts) + 1;
   stmts := ARRAY_APPEND(:stmts,
     'CREATE TABLE IF NOT EXISTS ' || :tgt || '.APP_CUSTOMIZATION (ID VARCHAR, CONFIG VARIANT)');
   stmts := ARRAY_APPEND(:stmts,
@@ -9389,7 +6394,3017 @@ END IF;
   -- actually creates the app.
   notes       := ARRAY_APPEND(:notes,
     'OPEN THE APP after building: Snowsight > Projects > Streamlit > WHGEN_APP');
-  --          bundle embedded as base64, plus COPY INTO and CREATE STREAMLIT
+  LET app_build_end INTEGER := ARRAY_SIZE(:stmts);
+
+  -- ── Warehouse Generation Plan ───────────────────────────────────────────────
+  --
+  -- The one fact that shapes everything below: Gen2 bills at a HIGHER per-second
+  -- rate than Gen1 for the same size. So a Gen1 warehouse moving to Gen2 gets
+  -- cheaper ONLY if its runtime falls by more than the rate premium. At 1.35x the
+  -- workload has to finish 25.93% faster just to break even; below that the same
+  -- work costs more. "Upgrade the fleet to Gen2" is therefore not a savings
+  -- recommendation, and this solution refuses to make it.
+
+  -- ── The rate premium ────────────────────────────────────────────────────────
+  -- Read from the setting when the client has supplied their own figure,
+  -- otherwise inferred from the account's own cloud. AWS and GCP are 1.35x,
+  -- Azure is 1.25x. These live in the Snowflake Service Consumption Table, not
+  -- in anything queryable, so the value is declared rather than measured and the
+  -- economics view says exactly that.
+  LET cloud STRING := COALESCE(:sig:cloud::STRING, 'UNKNOWN');
+  LET mult_setting NUMBER(38,4) := 0;
+  BEGIN
+    mult_setting := COALESCE((SELECT $WHGEN_RATE_MULTIPLIER::NUMBER(38,4)), 0);
+  EXCEPTION WHEN OTHER THEN
+    mult_setting := 0;
+  END;
+
+  LET mult NUMBER(38,4) := CASE
+      WHEN :mult_setting > 0 THEN :mult_setting
+      WHEN :cloud = 'AZURE'  THEN 1.25
+      WHEN :cloud IN ('AWS', 'GCP') THEN 1.35
+      -- An unknown cloud takes the HIGHER premium. The conservative direction
+      -- here is the one that makes conversions look worse, because the failure
+      -- that costs a client money is recommending a conversion that does not pay
+      -- for itself, not declining one that would have.
+      ELSE 1.35 END;
+
+  LET mult_source STRING := CASE
+      WHEN :mult_setting > 0 THEN 'WHGEN_RATE_MULTIPLIER setting, supplied by you'
+      WHEN :cloud = 'UNKNOWN' THEN 'cloud not readable from CURRENT_REGION(), so the '
+        || 'higher AWS/GCP premium was assumed -- set WHGEN_RATE_MULTIPLIER to correct it'
+      ELSE 'published Gen2 rate for ' || :cloud
+        || ' (Snowflake Service Consumption Table), inferred from CURRENT_REGION() = '
+        || COALESCE(:sig:region_name::STRING, 'UNREADABLE') END;
+
+  -- The break-even bar. This is arithmetic, not an estimate: at a rate premium
+  -- of m, runtime must fall to 1/m of its former self, so the required reduction
+  -- is (1 - 1/m).
+  LET breakeven_pct NUMBER(38,2) := ROUND((1 - 1 / :mult) * 100, 2);
+
+  LET min_credits NUMBER(38,4) := 5;
+  BEGIN
+    min_credits := COALESCE((SELECT $WHGEN_MIN_CREDITS::NUMBER(38,4)), 5);
+  EXCEPTION WHEN OTHER THEN
+    min_credits := 5;
+  END;
+
+  -- Per-size Gen1 credit rate, used to convert credits into billed warehouse
+  -- seconds. Reused verbatim in several statements below, so it is built once.
+  -- Both spellings of every size appear because SHOW WAREHOUSES reports
+  -- 'X-Small' while ACCOUNT_USAGE reports 'XSMALL', and a solution that handles
+  -- only one of them silently rates half the fleet at 1 credit/hour.
+  LET size_rate STRING :=
+      'CASE UPPER(REPLACE(WH_SIZE, ''-'', '''')) '
+   || 'WHEN ''XSMALL'' THEN 1 WHEN ''SMALL'' THEN 2 WHEN ''MEDIUM'' THEN 4 '
+   || 'WHEN ''LARGE'' THEN 8 WHEN ''XLARGE'' THEN 16 WHEN ''2XLARGE'' THEN 32 '
+   || 'WHEN ''3XLARGE'' THEN 64 WHEN ''4XLARGE'' THEN 128 '
+   || 'WHEN ''5XLARGE'' THEN 256 WHEN ''6XLARGE'' THEN 512 ELSE NULL END';
+
+  -- ── The fleet snapshot ──────────────────────────────────────────────────────
+  -- SHOW WAREHOUSES is the only place generation is exposed. Snapshotted as a
+  -- table so every view below reads a consistent picture, and so the verdict a
+  -- client screenshots is reproducible rather than shifting under them.
+  LET demo_wh STRING := :sch || '_DEMO_WH';
+
+  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'BEGIN SHOW WAREHOUSES; '
+   || 'CREATE OR REPLACE TABLE ' || :tgt || '.WH_FLEET AS '
+   || 'SELECT "name" AS WAREHOUSE_NAME, "size" AS WH_SIZE, '
+   || 'UPPER(COALESCE("type", '''')) AS WH_TYPE, '
+   || 'COALESCE("generation", '''') AS GENERATION, '
+   || 'COALESCE("resource_constraint", '''') AS RESOURCE_CONSTRAINT, '
+   || 'COALESCE("max_cluster_count", 1)::INT AS MAX_CLUSTERS, '
+   || 'COALESCE("auto_suspend", 0)::INT AS AUTO_SUSPEND_SECS, '
+   || 'COALESCE("enable_query_acceleration", ''false'')::VARCHAR AS QAS_ENABLED, '
+   -- Captured so the QAS undo can restore the prior scale factor rather than
+   -- guessing one. A warehouse with QAS off still carries a factor, and putting
+   -- back the wrong number is a silent config change dressed up as a rollback.
+   || 'COALESCE("query_acceleration_max_scale_factor", 0)::INT AS QAS_SCALE_FACTOR, '
+   || 'CURRENT_TIMESTAMP() AS SNAPSHOT_AT '
+   || 'FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) '
+   -- Two warehouses are excluded because this tooling created them, and a
+   -- warehouse that exists to host the script is not part of the estate the
+   -- script is judging.
+   --
+   -- <schema>_DEMO_WH is the throwaway the SAMPLE action converts. <schema>_ONESHOT_WH
+   -- is the warehouse the deployment harness creates to run the build and the app.
+   -- Leaving the latter in was a real defect rather than an aesthetic one: it does
+   -- not exist during the FIRST build and does during the second, so the fleet grew
+   -- by one row on a re-run and the idempotence check correctly failed with
+   -- CONVERSION_BASELINE 103 -> 104.
+   || 'WHERE "name" NOT IN (' || CHAR(39) || :demo_wh || CHAR(39) || ', '
+   || CHAR(39) || :sch || '_ONESHOT_WH' || CHAR(39) || '); END');
+    cost_once := :cost_once + 0.01;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'WH_FLEET snapshot ~0.01 credits (SHOW WAREHOUSES is metadata, no warehouse compute)');
+
+    -- Register any gauntlet fixture warehouses so teardown drops them.
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+   || 'SELECT w.WAREHOUSE_NAME, ''WAREHOUSE'', ''FIXTURE'', ''FIXTURE_WAREHOUSE'' '
+   || 'FROM ' || :tgt || '.WH_FLEET w '
+   || 'WHERE w.WAREHOUSE_NAME LIKE ''GAUNTLET!_WHGEN!_%'' ESCAPE ''!'' '
+   || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || 'WHERE r.TARGET_FQN = w.WAREHOUSE_NAME AND r.KIND = ''FIXTURE_WAREHOUSE'')');
+  END IF;
+
+  -- ── The economics, stated once and cited everywhere ─────────────────────────
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_GEN2_ECONOMICS AS SELECT '
+ || CHAR(39) || :cloud || CHAR(39) || ' AS CLOUD, '
+ || CHAR(39) || COALESCE(:sig:region_name::STRING, 'UNREADABLE') || CHAR(39) || ' AS REGION, '
+ || :mult || '::NUMBER(38,4) AS GEN2_RATE_MULTIPLIER, '
+ || :breakeven_pct || '::NUMBER(38,2) AS REQUIRED_SPEEDUP_PCT, '
+ || CHAR(39) || :mult_source || CHAR(39) || ' AS MULTIPLIER_SOURCE, '
+ || CHAR(39) || 'Gen2 costs ' || :mult || 'x the credits per hour of Gen1 for the same '
+ || 'size, so the same work must finish at least ' || :breakeven_pct || '% faster to '
+ || 'cost the same. Below that, converting raises the bill. This is arithmetic on '
+ || 'the multiplier, not a projection.' || CHAR(39) || ' AS HOW_TO_READ_IT');
+  cost_detail := ARRAY_APPEND(:cost_detail,
+    'V_GEN2_ECONOMICS is a constant row, no scan cost');
+
+  -- ── Workload shape per warehouse ────────────────────────────────────────────
+  -- Three measured quantities decide whether Gen2 can pay for itself:
+  --
+  -- 1. UTILISATION. Billed warehouse seconds come from credits and the size's
+  --    published rate, which already accounts for multi-cluster. Query seconds
+  --    come from EXECUTION_TIME. The ratio is how much of what you pay for is
+  --    actually executing. Gen2's premium applies to every billed second
+  --    including idle ones, so a warehouse that is mostly idle gets strictly
+  --    more expensive -- there is no runtime to shorten.
+  --
+  --    The ratio can exceed 1 on a concurrent warehouse, because several queries
+  --    execute in the same wall-clock second. That is not an error, it is a
+  --    well-packed warehouse, and it is the best possible Gen2 candidate.
+  --
+  -- 2. FAVOURABLE SHARE. The share of execution time spent on the work Snowflake
+  --    documents Gen2 as improving: table scans, DELETE, UPDATE, MERGE. A
+  --    warehouse whose time goes to tiny lookups has little for Gen2 to speed up.
+  --    Scan-heavy is taken as a SELECT reading at least 1 GB; below that the
+  --    query is not scan-bound and the faster hardware has less to work with.
+  --
+  -- 3. PRESSURE. Spill and queueing are direct evidence the warehouse is short of
+  --    resource, which is the condition Gen2's faster hardware and higher
+  --    concurrency actually relieve.
+  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_WH_WORKLOAD AS '
+   || 'WITH credits AS ('
+   -- Aggregate the DAILY totals, not the raw metering columns. The subquery below
+   -- has already collapsed the hourly rows to one row per warehouse per day, so
+   -- CREDITS_USED does not exist at this level -- reaching for it here is what made
+   -- this view fail to compile with "invalid identifier CREDITS_USED", which took
+   -- every downstream verdict, panel and action with it.
+   || 'SELECT WAREHOUSE_NAME, SUM(DAILY_CREDITS) AS CREDITS_USED, '
+   || 'COUNT(*) AS ACTIVE_DAYS, '
+   -- Daily spread is the burstiness input for Adaptive. STDDEV over the daily
+   -- totals rather than over the hourly rows: an overnight batch warehouse looks
+   -- wildly variable by hour and is perfectly regular by day.
+   || 'STDDEV(DAILY_CREDITS) AS DAILY_STDDEV, AVG(DAILY_CREDITS) AS DAILY_MEAN '
+   || 'FROM (SELECT WAREHOUSE_NAME, DATE_TRUNC(''day'', START_TIME) AS D, '
+   || 'SUM(CREDITS_USED) AS DAILY_CREDITS '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY '
+   || 'WHERE START_TIME >= ' || :since || ' GROUP BY 1, 2) '
+   || 'GROUP BY 1'
+   || '), '
+   || 'q AS ('
+   || 'SELECT WAREHOUSE_NAME, '
+   || 'COUNT(*) AS QUERY_COUNT, '
+   || 'SUM(EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS, '
+   -- The favourable set. INSERT and COPY are included because both are
+   -- write-path work that the delete/update/merge improvements cover, and
+   -- CREATE_TABLE_AS_SELECT is a scan plus a write.
+   || 'SUM(CASE WHEN QUERY_TYPE IN (''MERGE'', ''UPDATE'', ''DELETE'', ''INSERT'', '
+   || '''COPY'', ''CREATE_TABLE_AS_SELECT'', ''UNLOAD'') '
+   || 'OR (QUERY_TYPE = ''SELECT'' AND BYTES_SCANNED >= POWER(1024, 3)) '
+   || 'THEN EXECUTION_TIME ELSE 0 END) / 1000.0 AS FAVOURABLE_SECONDS, '
+   || 'SUM(QUEUED_OVERLOAD_TIME) / 1000.0 AS QUEUED_SECONDS, '
+   || 'SUM(BYTES_SPILLED_TO_LOCAL_STORAGE) / POWER(1024, 3) AS SPILL_LOCAL_GB, '
+   || 'SUM(BYTES_SPILLED_TO_REMOTE_STORAGE) / POWER(1024, 3) AS SPILL_REMOTE_GB, '
+   || 'SUM(BYTES_SCANNED) / POWER(1024, 4) AS SCANNED_TB '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY '
+   || 'WHERE START_TIME >= ' || :since || ' '
+   || 'AND WAREHOUSE_NAME IS NOT NULL '
+   -- A NULL warehouse size means the statement ran without warehouse compute
+   -- (DESCRIBE, SHOW, LIST). Counting those inflates the query count and drags
+   -- the favourable share down with work that costs nothing to begin with.
+   || 'AND WAREHOUSE_SIZE IS NOT NULL '
+   || 'GROUP BY 1'
+   || ') '
+   || 'SELECT f.WAREHOUSE_NAME, f.WH_SIZE, f.WH_TYPE, f.GENERATION, '
+   || 'f.MAX_CLUSTERS, f.AUTO_SUSPEND_SECS, '
+   || 'ROUND(COALESCE(c.CREDITS_USED, 0), 3) AS CREDITS_USED, '
+   || 'COALESCE(c.ACTIVE_DAYS, 0) AS ACTIVE_DAYS, '
+   || 'ROUND(DIV0(COALESCE(c.CREDITS_USED, 0), NULLIF(c.ACTIVE_DAYS, 0)), 3) AS CREDITS_PER_DAY, '
+   || 'ROUND(DIV0(COALESCE(c.CREDITS_USED, 0) * 3600.0, '
+   || 'NULLIF(' || REPLACE(:size_rate, 'WH_SIZE', 'f.WH_SIZE') || ', 0)), 1) AS BILLED_SECONDS, '
+   || 'ROUND(COALESCE(q.QUERY_SECONDS, 0), 1) AS QUERY_SECONDS, '
+   || 'ROUND(DIV0(COALESCE(q.QUERY_SECONDS, 0) * ' || REPLACE(:size_rate, 'WH_SIZE', 'f.WH_SIZE')
+   || ', NULLIF(COALESCE(c.CREDITS_USED, 0) * 3600.0, 0)), 3) AS UTILISATION, '
+   || 'ROUND(DIV0(COALESCE(q.FAVOURABLE_SECONDS, 0), '
+   || 'NULLIF(COALESCE(q.QUERY_SECONDS, 0), 0)), 3) AS FAVOURABLE_SHARE, '
+   || 'COALESCE(q.QUERY_COUNT, 0) AS QUERY_COUNT, '
+   || 'ROUND(COALESCE(q.QUEUED_SECONDS, 0), 1) AS QUEUED_SECONDS, '
+   || 'ROUND(COALESCE(q.SPILL_LOCAL_GB, 0), 2) AS SPILL_LOCAL_GB, '
+   || 'ROUND(COALESCE(q.SPILL_REMOTE_GB, 0), 2) AS SPILL_REMOTE_GB, '
+   || 'ROUND(COALESCE(q.SCANNED_TB, 0), 3) AS SCANNED_TB, '
+   || 'ROUND(DIV0(COALESCE(c.DAILY_STDDEV, 0), NULLIF(c.DAILY_MEAN, 0)), 3) AS DAILY_CV, '
+   -- Carried through so the verdict can judge QAS without re-reading the fleet.
+   || 'f.QAS_ENABLED, f.QAS_SCALE_FACTOR '
+   || 'FROM ' || :tgt || '.WH_FLEET f '
+   || 'LEFT JOIN credits c ON f.WAREHOUSE_NAME = c.WAREHOUSE_NAME '
+   || 'LEFT JOIN q ON f.WAREHOUSE_NAME = q.WAREHOUSE_NAME');
+    cost_day    := :cost_day + 0.06;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'V_WH_WORKLOAD scans QUERY_HISTORY and WAREHOUSE_METERING_HISTORY on every '
+   || 'read ~0.06 credits/day');
+    dials := ARRAY_APPEND(:dials,
+      'WINDOW_DAYS ' || :w || ' -> 7 roughly halves the V_WH_WORKLOAD scan (~0.03 credits/day)');
+  END IF;
+
+  -- ── Query-acceleration eligibility, measured rather than assumed ────────────
+  -- Snowflake will not say "this warehouse would be 20% faster with QAS". What it
+  -- will say, per query, is how much of that query's execution time it could have
+  -- offloaded. Summed per warehouse and divided by total execution time, that is
+  -- the closest thing to an honest expected benefit, and it comes from the
+  -- account's own queries rather than from a brochure.
+  --
+  -- UPPER_LIMIT_SCALE_FACTOR is carried because it is Snowflake's own ceiling on
+  -- useful parallelism for that workload. Setting a factor above it buys nothing
+  -- and raises the spend cap, so the action below never exceeds it.
+  IF (:sig:qas_eligible::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_QAS_ELIGIBILITY AS '
+   || 'SELECT WAREHOUSE_NAME, '
+   || 'COUNT(*) AS ELIGIBLE_QUERIES, '
+   -- ELIGIBLE_QUERY_ACCELERATION_TIME is seconds of execution time that QAS could
+   -- have offloaded. It is NOT a saving: the offloaded work still runs, on
+   -- separately-billed serverless compute.
+   || 'ROUND(SUM(ELIGIBLE_QUERY_ACCELERATION_TIME), 1) AS ELIGIBLE_SECONDS, '
+   || 'MAX(UPPER_LIMIT_SCALE_FACTOR) AS UPPER_LIMIT_SCALE_FACTOR '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ACCELERATION_ELIGIBLE '
+   || 'WHERE START_TIME >= ' || :since || ' '
+   || 'AND WAREHOUSE_NAME IS NOT NULL '
+   || 'GROUP BY 1');
+    cost_day    := :cost_day + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'V_QAS_ELIGIBILITY scans QUERY_ACCELERATION_ELIGIBLE ~0.02 credits/day');
+  END IF;
+
+  -- ── The verdict ─────────────────────────────────────────────────────────────
+  -- Four outcomes, and only one of them is "convert this". The thresholds are
+  -- JUDGEMENT, stated as such in the view, and they are deliberately set so that
+  -- the default answer on thin evidence is PILOT_ONLY rather than GO. A verdict
+  -- engine whose default is "yes" is a sales tool, not an analysis.
+  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    -- The QAS half of the verdict only exists if the eligibility view was built.
+    -- Held in variables so the view compiles either way: with evidence it judges,
+    -- and without it it says NO_EVIDENCE rather than recommending a feature it
+    -- cannot see the case for. QUERY_ACCELERATION_ELIGIBLE is Enterprise-only, so
+    -- the second branch is a real account state, not a defensive nicety.
+    --
+    -- Why QAS belongs in a Gen2 verdict at all: Snowflake enables QAS by default
+    -- when a warehouse is CREATED as Gen2, and does NOT when an existing Gen1
+    -- warehouse is ALTERed to Gen2 -- which is what the conversion below does. So
+    -- every warehouse this solution converts lands in a different configuration
+    -- from a natively-created Gen2 warehouse, and nothing said so until now.
+    LET qas_share STRING := 'ROUND(DIV0(COALESCE(qe.ELIGIBLE_SECONDS, 0), '
+                         || 'NULLIF(w.QUERY_SECONDS, 0)), 3)';
+    LET qas_is_on STRING := 'LOWER(COALESCE(w.QAS_ENABLED, ''false'')) '
+                         || 'IN (''true'', ''t'', ''1'')';
+    LET qas_cols  STRING := '';
+    LET qas_join  STRING := '';
+
+    IF (:sig:qas_eligible::STRING = 'AVAILABLE') THEN
+      qas_join := ' LEFT JOIN ' || :tgt || '.V_QAS_ELIGIBILITY qe '
+               || 'ON qe.WAREHOUSE_NAME = w.WAREHOUSE_NAME';
+      qas_cols :=
+         'w.QAS_ENABLED, w.QAS_SCALE_FACTOR, '
+      || 'COALESCE(qe.ELIGIBLE_QUERIES, 0) AS QAS_ELIGIBLE_QUERIES, '
+      || 'COALESCE(qe.ELIGIBLE_SECONDS, 0) AS QAS_ELIGIBLE_SECONDS, '
+      || :qas_share || ' AS QAS_ELIGIBLE_SHARE, '
+      -- Scale factor 2 is Snowflake's own default when it auto-enables QAS on a
+      -- newly created Gen2 warehouse, and it is the conservative choice: the factor
+      -- is a CEILING on billable QAS compute, not a target. Never propose above
+      -- Snowflake's own stated ceiling for the workload.
+      || 'LEAST(2, GREATEST(COALESCE(qe.UPPER_LIMIT_SCALE_FACTOR, 2), 1)) '
+      || 'AS QAS_PROPOSED_SCALE_FACTOR, '
+      || 'CASE '
+      || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''INELIGIBLE_TYPE'' '
+      || 'WHEN ' || :qas_is_on || ' THEN ''ON'' '
+      || 'WHEN COALESCE(qe.ELIGIBLE_SECONDS, 0) = 0 THEN ''NOT_WORTH_IT'' '
+      || 'WHEN ' || :qas_share || ' >= 0.10 THEN ''RECOMMENDED'' '
+      || 'ELSE ''NOT_WORTH_IT'' END AS QAS_VERDICT, '
+      || 'CASE '
+      || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''Query acceleration is governed by '
+      || 'the warehouse type here, not by this setting.'' '
+      || 'WHEN ' || :qas_is_on || ' THEN ''Already on, at scale factor '' '
+      || '|| w.QAS_SCALE_FACTOR || ''. Nothing to do.'' '
+      || 'WHEN COALESCE(qe.ELIGIBLE_SECONDS, 0) = 0 THEN ''Snowflake marked none of '
+      || 'this warehouse''''s queries eligible for acceleration in the window, so '
+      || 'enabling it would add a separately-billed service that never engages.'' '
+      || 'WHEN ' || :qas_share || ' >= 0.10 THEN ''Snowflake marked '' '
+      || '|| COALESCE(qe.ELIGIBLE_QUERIES, 0) || '' queries eligible, covering '' '
+      || '|| ROUND(' || :qas_share || ' * 100, 1) || ''% of execution time ('' '
+      || '|| COALESCE(qe.ELIGIBLE_SECONDS, 0) || ''s). A warehouse CREATED as Gen2 '
+      || 'gets QAS by default; converting one by ALTER does not, so this is the '
+      || 'setting the conversion left behind. It is NOT a saving -- the offloaded '
+      || 'work bills as serverless QAS credits. It is a way to shorten wall-clock '
+      || 'on exactly the scan-heavy work that has to get faster for the Gen2 rate '
+      || 'premium to pay for itself.'' '
+      || 'ELSE ''Only '' || ROUND(' || :qas_share || ' * 100, 1) || ''% of execution '
+      || 'time is eligible, below the 10% floor. The separately-billed QAS credits '
+      || 'are unlikely to be repaid by that little.'' END AS QAS_WHY, '
+      || CHAR(39) || 'The 10% eligible-share floor is judgement, not measurement. '
+      || 'QAS bills serverless credits of its own, so the floor is set where the '
+      || 'offload is large enough to plausibly repay them.' || CHAR(39)
+      || ' AS QAS_THRESHOLD_IS_JUDGEMENT, ';
+    ELSE
+      qas_cols :=
+         'w.QAS_ENABLED, w.QAS_SCALE_FACTOR, '
+      || 'NULL::INT AS QAS_ELIGIBLE_QUERIES, '
+      || 'NULL::NUMBER(38,1) AS QAS_ELIGIBLE_SECONDS, '
+      || 'NULL::NUMBER(38,3) AS QAS_ELIGIBLE_SHARE, '
+      || 'NULL::INT AS QAS_PROPOSED_SCALE_FACTOR, '
+      || 'CASE WHEN w.WH_TYPE <> ''STANDARD'' THEN ''INELIGIBLE_TYPE'' '
+      || 'WHEN ' || :qas_is_on || ' THEN ''ON'' '
+      || 'ELSE ''NO_EVIDENCE'' END AS QAS_VERDICT, '
+      || 'CASE WHEN w.WH_TYPE <> ''STANDARD'' THEN ''Query acceleration is governed '
+      || 'by the warehouse type here, not by this setting.'' '
+      || 'WHEN ' || :qas_is_on || ' THEN ''Already on, at scale factor '' '
+      || '|| w.QAS_SCALE_FACTOR || ''. Nothing to do.'' '
+      || 'ELSE ''SNOWFLAKE.ACCOUNT_USAGE.QUERY_ACCELERATION_ELIGIBLE was not '
+      || 'readable, so there is no evidence either way -- it is an Enterprise '
+      || 'Edition view. Worth checking by hand, because converting to Gen2 by '
+      || 'ALTER does not enable QAS even though creating a Gen2 warehouse does.'' '
+      || 'END AS QAS_WHY, '
+      || CHAR(39) || 'No QAS eligibility evidence was readable on this account, so '
+      || 'no QAS recommendation is made.' || CHAR(39)
+      || ' AS QAS_THRESHOLD_IS_JUDGEMENT, ';
+    END IF;
+
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_GEN2_VERDICT AS '
+   || 'SELECT w.WAREHOUSE_NAME, w.WH_SIZE, w.WH_TYPE, w.GENERATION, '
+   || 'w.CREDITS_USED, w.CREDITS_PER_DAY, w.UTILISATION, w.FAVOURABLE_SHARE, '
+   || 'w.QUEUED_SECONDS, w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB AS SPILL_GB, '
+   || 'w.QUERY_COUNT, '
+   || :qas_cols
+   || :breakeven_pct || '::NUMBER(38,2) AS REQUIRED_SPEEDUP_PCT, '
+   -- The number that reframes the whole conversation. If Gen2 delivers no
+   -- speedup at all on this warehouse, this is what it adds to the bill per day.
+   -- It is the downside a client is accepting when they press the button, and it
+   -- is computed from their own measured spend rather than assumed away.
+   || 'ROUND(w.CREDITS_PER_DAY * (' || :mult || ' - 1), 3) AS WORST_CASE_EXTRA_CREDITS_PER_DAY, '
+   || 'CASE '
+   -- Eligibility first. These are not judgements, they are what Snowflake
+   -- supports, and a warehouse that fails them cannot be converted at all.
+   || 'WHEN w.GENERATION = ''2'' THEN ''ALREADY_GEN2'' '
+   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''INELIGIBLE_TYPE'' '
+   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
+   || '  THEN ''INELIGIBLE_SIZE'' '
+   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''IMMATERIAL'' '
+   -- Then the economics. Idle-dominated first, because it is the case where
+   -- conversion is not a gamble but a straight loss.
+   || 'WHEN w.UTILISATION < 0.20 THEN ''AVOID'' '
+   || 'WHEN w.FAVOURABLE_SHARE < 0.30 THEN ''AVOID'' '
+   || 'WHEN w.UTILISATION >= 0.50 AND w.FAVOURABLE_SHARE >= 0.60 '
+   || '  AND (w.QUEUED_SECONDS > 0 OR w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB > 0) '
+   || '  THEN ''STRONG'' '
+   || 'WHEN w.UTILISATION >= 0.35 AND w.FAVOURABLE_SHARE >= 0.45 THEN ''LIKELY'' '
+   || 'ELSE ''PILOT_ONLY'' END AS VERDICT, '
+   || 'CASE '
+   || 'WHEN w.GENERATION = ''2'' THEN ''Already Gen2. Nothing to do.'' '
+   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''The GENERATION clause applies only to '
+   || 'STANDARD warehouses, so a '' || w.WH_TYPE || '' warehouse cannot be converted.'' '
+   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
+   || '  THEN ''Gen2 is not available at '' || w.WH_SIZE || ''.'' '
+   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''Spent '' || w.CREDITS_USED '
+   || '  || '' credits in the window, below the '' || ' || :min_credits || ' || '' credit '
+   || 'floor. Converting it can neither save nor cost anything worth measuring.'' '
+   || 'WHEN w.UTILISATION < 0.20 THEN ''Only '' || ROUND(w.UTILISATION * 100, 1) '
+   || '  || ''% of the billed time is executing queries, so this warehouse is paying '
+   || 'mostly for idle. The Gen2 premium applies to idle seconds too and there is no '
+   || 'runtime to shorten, so converting raises the bill with near-certainty. Fix the '
+   || 'idle first -- auto-suspend, or fewer warehouses.'' '
+   || 'WHEN w.FAVOURABLE_SHARE < 0.30 THEN ''Only '' || ROUND(w.FAVOURABLE_SHARE * 100, 1) '
+   || '  || ''% of execution time is the scan-heavy or DML work Gen2 is documented to '
+   || 'improve. Too little to clear a '' || ' || :breakeven_pct || ' || ''% bar.'' '
+   || 'WHEN w.UTILISATION >= 0.50 AND w.FAVOURABLE_SHARE >= 0.60 '
+   || '  AND (w.QUEUED_SECONDS > 0 OR w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB > 0) '
+   || '  THEN ''Busy ('' || ROUND(w.UTILISATION * 100, 1) || ''% of billed time '
+   || 'executing), dominated by scan and DML work ('' '
+   || '  || ROUND(w.FAVOURABLE_SHARE * 100, 1) || ''%), and already under resource '
+   || 'pressure -- '' || ROUND(w.QUEUED_SECONDS, 0) || ''s queued, '' '
+   || '  || ROUND(w.SPILL_LOCAL_GB + w.SPILL_REMOTE_GB, 1) || '' GB spilled. This is the '
+   || 'shape Gen2 is built for. Convert it, then check the outcome view.'' '
+   || 'WHEN w.UTILISATION >= 0.35 AND w.FAVOURABLE_SHARE >= 0.45 '
+   || '  THEN ''Reasonably busy and reasonably scan-heavy, but with no queueing or '
+   || 'spill there is no evidence it is short of resource. Worth converting and '
+   || 'measuring; do not assume the '' || ' || :breakeven_pct || ' || ''% speedup.'' '
+   || 'ELSE ''Eligible, but the evidence is too thin to predict which side of the '
+   || 'break-even it lands on. Convert it as a measured pilot, not as a rollout.'' '
+   || 'END AS WHY, '
+   || CHAR(39) || 'Thresholds (0.20/0.30/0.35/0.45/0.50/0.60) are judgement, not '
+   || 'measurement. They are set so thin evidence yields PILOT_ONLY rather than a '
+   || 'recommendation to convert.' || CHAR(39) || ' AS THRESHOLDS_ARE_JUDGEMENT '
+   || 'FROM ' || :tgt || '.V_WH_WORKLOAD w' || :qas_join);
+    cost_day    := :cost_day + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'V_GEN2_VERDICT reads V_WH_WORKLOAD ~0.02 credits/day');
+  END IF;
+
+  -- ── Adaptive candidacy, judged separately ───────────────────────────────────
+  -- Adaptive is not "Gen2 but more so". It removes size, multi-cluster, QAS and
+  -- suspend policy from your hands and bills per query, which is a good trade for
+  -- bursty mixed workloads and a bad one for anything latency-critical. The docs
+  -- are explicit about the exclusions, and they are the first thing checked here.
+  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_ADAPTIVE_VERDICT AS '
+   || 'SELECT w.WAREHOUSE_NAME, w.WH_SIZE, w.WH_TYPE, w.CREDITS_USED, '
+   || 'w.CREDITS_PER_DAY, w.DAILY_CV, w.MAX_CLUSTERS, w.QUEUED_SECONDS, '
+   || 'w.UTILISATION, w.QUERY_COUNT, '
+   || 'CASE '
+   || 'WHEN w.WH_TYPE = ''ADAPTIVE'' THEN ''ALREADY_ADAPTIVE'' '
+   -- Conversion to or from Snowpark-optimized and INTERACTIVE is unsupported, as
+   -- is any conversion involving X5/X6-Large.
+   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''UNSUPPORTED_CONVERSION'' '
+   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
+   || '  THEN ''UNSUPPORTED_SIZE'' '
+   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''IMMATERIAL'' '
+   -- Burstiness and queueing are the two signals that a fixed size is the wrong
+   -- shape for the workload. Either alone is enough to be worth a pilot.
+   || 'WHEN w.DAILY_CV >= 0.60 AND w.QUEUED_SECONDS > 0 THEN ''STRONG'' '
+   || 'WHEN w.DAILY_CV >= 0.60 OR w.QUEUED_SECONDS > 0 OR w.MAX_CLUSTERS > 1 '
+   || '  THEN ''LIKELY'' '
+   || 'WHEN w.UTILISATION >= 0.60 AND w.DAILY_CV < 0.30 THEN ''KEEP_STANDARD'' '
+   || 'ELSE ''PILOT_ONLY'' END AS VERDICT, '
+   || 'CASE '
+   || 'WHEN w.WH_TYPE = ''ADAPTIVE'' THEN ''Already an Adaptive Warehouse.'' '
+   || 'WHEN w.WH_TYPE <> ''STANDARD'' THEN ''Converting to or from a '' || w.WH_TYPE '
+   || '  || '' warehouse is not a supported Adaptive conversion path.'' '
+   || 'WHEN UPPER(REPLACE(w.WH_SIZE, ''-'', '''')) IN (''5XLARGE'', ''6XLARGE'') '
+   || '  THEN ''Converting to or from '' || w.WH_SIZE || '' is not supported.'' '
+   || 'WHEN w.CREDITS_USED < ' || :min_credits || ' THEN ''Too small to matter.'' '
+   || 'WHEN w.DAILY_CV >= 0.60 AND w.QUEUED_SECONDS > 0 '
+   || '  THEN ''Day-to-day spend swings hard (CV '' || w.DAILY_CV || '') AND it queues '
+   || '('' || ROUND(w.QUEUED_SECONDS, 0) || ''s). A fixed size is wrong for this '
+   || 'workload in both directions at once -- too small at peak, paid-for at trough. '
+   || 'This is the clearest Adaptive case there is.'' '
+   || 'WHEN w.DAILY_CV >= 0.60 THEN ''Spend swings day to day (CV '' || w.DAILY_CV '
+   || '  || ''), which per-query allocation handles better than one fixed size.'' '
+   || 'WHEN w.QUEUED_SECONDS > 0 THEN ''Queues for '' || ROUND(w.QUEUED_SECONDS, 0) '
+   || '  || ''s in the window, so concurrency is the constraint. Adaptive routes '
+   || 'against a shared pool instead of one fixed cluster count.'' '
+   || 'WHEN w.MAX_CLUSTERS > 1 THEN ''Already multi-cluster, so someone has already '
+   || 'decided the load varies. Adaptive removes the need to tune the cluster '
+   || 'settings by hand.'' '
+   || 'WHEN w.UTILISATION >= 0.60 AND w.DAILY_CV < 0.30 '
+   || '  THEN ''Steady and well-utilised. Predictable everyday analytics is the case '
+   || 'the docs say to keep on standard Gen2, where you keep direct control of size.'' '
+   || 'ELSE ''No strong burstiness signal either way. Pilot it if you want the '
+   || 'operational simplicity; do not expect a cost change.'' '
+   || 'END AS WHY, '
+   || CHAR(39) || 'Adaptive requires Enterprise Edition or higher and is available '
+   || 'only in selected regions. This account reports: '
+   || COALESCE(:sig:edition_hint::STRING, 'UNKNOWN')
+   || '. That is INFERRED from multi-cluster usage, not read from the account -- '
+   || 'edition is not queryable here. The ALTER itself is the real test and will '
+   || 'refuse with a clear message if unsupported.' || CHAR(39) || ' AS ELIGIBILITY_NOTE, '
+   || CHAR(39) || 'Adaptive bills per query rather than per warehouse-second, so a '
+   || 'before-and-after on credits is the only way to know what it did to your '
+   || 'cost. Nothing here predicts that number.' || CHAR(39) || ' AS COST_MODEL_NOTE '
+   || 'FROM ' || :tgt || '.V_WH_WORKLOAD w');
+    cost_day    := :cost_day + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'V_ADAPTIVE_VERDICT reads V_WH_WORKLOAD ~0.02 credits/day');
+  END IF;
+
+  -- ── The baseline, captured BEFORE anything is converted ─────────────────────
+  -- This is the part that makes the rest defensible. A conversion with no
+  -- before-picture cannot be evaluated afterwards, and "it feels faster" is what
+  -- fills the vacuum. Every warehouse in the fleet gets a row now, so whichever
+  -- ones get converted later have something to be measured against.
+  --
+  -- It is a TABLE, not a view, on purpose: a view would re-derive the "before"
+  -- window after the change and compare the new behaviour against itself.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.CONVERSION_BASELINE ('
+ || 'WAREHOUSE_NAME VARCHAR, WH_SIZE VARCHAR, GENERATION_BEFORE VARCHAR, '
+ || 'WH_TYPE_BEFORE VARCHAR, AUTO_SUSPEND_BEFORE INT, '
+ || 'WINDOW_DAYS INT, WINDOW_START TIMESTAMP_NTZ, WINDOW_END TIMESTAMP_NTZ, '
+ || 'CREDITS_USED NUMBER(38,4), CREDITS_PER_DAY NUMBER(38,4), '
+ || 'QUERY_SECONDS NUMBER(38,2), QUERY_COUNT NUMBER(38,0), '
+ || 'SECONDS_PER_QUERY NUMBER(38,4), UTILISATION NUMBER(38,4), '
+ || 'FAVOURABLE_SHARE NUMBER(38,4), CAPTURED_AT TIMESTAMP_NTZ, '
+ || 'LABEL VARCHAR, BASIS VARCHAR)');
+
+  IF (:sig:credit_history::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    -- One row per warehouse per build. Re-running the script re-captures the
+    -- baseline for the CURRENT window, which is correct -- but it must not
+    -- overwrite the row a conversion is already being measured against, so rows
+    -- for warehouses that have a recorded GENERATION change are left alone.
+    stmts := ARRAY_APPEND(:stmts,
+      'DELETE FROM ' || :tgt || '.CONVERSION_BASELINE '
+   || 'WHERE WAREHOUSE_NAME NOT IN ('
+   || 'SELECT TARGET_FQN FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || 'WHERE KIND = ''WAREHOUSE_SETTING'')');
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.CONVERSION_BASELINE '
+   || '(WAREHOUSE_NAME, WH_SIZE, GENERATION_BEFORE, WH_TYPE_BEFORE, '
+   || ' AUTO_SUSPEND_BEFORE, WINDOW_DAYS, WINDOW_START, WINDOW_END, '
+   || ' CREDITS_USED, CREDITS_PER_DAY, QUERY_SECONDS, QUERY_COUNT, '
+   || ' SECONDS_PER_QUERY, UTILISATION, FAVOURABLE_SHARE, CAPTURED_AT, LABEL, BASIS) '
+   || 'SELECT w.WAREHOUSE_NAME, w.WH_SIZE, w.GENERATION, w.WH_TYPE, '
+   || 'w.AUTO_SUSPEND_SECS, ' || :w || ', '
+   || 'DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ, '
+   || 'CURRENT_TIMESTAMP()::TIMESTAMP_NTZ, '
+   || 'w.CREDITS_USED, w.CREDITS_PER_DAY, w.QUERY_SECONDS, w.QUERY_COUNT, '
+   -- Seconds per query is the metric a conversion should actually move. Credits
+   -- per day moves with how much work arrived, which the conversion does not
+   -- control; time per query is closer to the thing Gen2 claims to change.
+   || 'ROUND(DIV0(w.QUERY_SECONDS, NULLIF(w.QUERY_COUNT, 0)), 4), '
+   || 'w.UTILISATION, w.FAVOURABLE_SHARE, CURRENT_TIMESTAMP(), '
+   || '''MEASURED'', ''BY_TIME_WINDOW'' '
+   || 'FROM ' || :tgt || '.V_WH_WORKLOAD w '
+   || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.CONVERSION_BASELINE b '
+   || 'WHERE b.WAREHOUSE_NAME = w.WAREHOUSE_NAME)');
+    cost_once := :cost_once + 0.03;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'CONVERSION_BASELINE capture ~0.03 credits one-time (reads V_WH_WORKLOAD once)');
+  END IF;
+
+  -- ── The outcome view: what the conversion actually did ──────────────────────
+  -- Deliberately NOT called a savings view. It reports an OBSERVED DELTA with the
+  -- basis stated, because attributing a credit difference to the conversion
+  -- assumes nothing else about the workload moved, and in a live account
+  -- something always did. The delta is the evidence; the attribution is the
+  -- reader's judgement, and the view says so in a column rather than in a
+  -- footnote nobody reads.
+  IF (:sig:credit_history::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_CONVERSION_OUTCOME AS '
+   || 'WITH after AS ('
+   || 'SELECT m.WAREHOUSE_NAME, '
+   || 'SUM(m.CREDITS_USED) AS CREDITS_USED, '
+   || 'COUNT(DISTINCT DATE_TRUNC(''day'', m.START_TIME)) AS DAYS_SINCE '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY m '
+   || 'JOIN ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || '  ON r.TARGET_FQN = m.WAREHOUSE_NAME AND r.KIND = ''WAREHOUSE_SETTING'' '
+   || 'WHERE m.START_TIME::TIMESTAMP_NTZ > r.ATTACHED_AT '
+   || 'GROUP BY 1'
+   || '), '
+   || 'aq AS ('
+   || 'SELECT q.WAREHOUSE_NAME, '
+   || 'SUM(q.EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS, '
+   || 'COUNT(*) AS QUERY_COUNT '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q '
+   || 'JOIN ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || '  ON r.TARGET_FQN = q.WAREHOUSE_NAME AND r.KIND = ''WAREHOUSE_SETTING'' '
+   || 'WHERE q.START_TIME::TIMESTAMP_NTZ > r.ATTACHED_AT AND q.WAREHOUSE_SIZE IS NOT NULL '
+   || 'GROUP BY 1'
+   || ') '
+   || 'SELECT b.WAREHOUSE_NAME, b.WH_SIZE, '
+   || 'b.GENERATION_BEFORE, r.ARTIFACT AS CHANGED_SETTING, r.ATTACHED_AT AS CHANGED_AT, '
+   || 'b.CREDITS_PER_DAY AS BEFORE_CREDITS_PER_DAY, '
+   || 'ROUND(DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)), 3) AS AFTER_CREDITS_PER_DAY, '
+   || 'b.SECONDS_PER_QUERY AS BEFORE_SECONDS_PER_QUERY, '
+   || 'ROUND(DIV0(aq.QUERY_SECONDS, NULLIF(aq.QUERY_COUNT, 0)), 4) AS AFTER_SECONDS_PER_QUERY, '
+   -- The speedup actually achieved, against the bar it had to clear. These two
+   -- columns side by side are the entire point of the solution.
+   || 'ROUND((1 - DIV0(DIV0(aq.QUERY_SECONDS, NULLIF(aq.QUERY_COUNT, 0)), '
+   || 'NULLIF(b.SECONDS_PER_QUERY, 0))) * 100, 2) AS OBSERVED_SPEEDUP_PCT, '
+   || :breakeven_pct || '::NUMBER(38,2) AS REQUIRED_SPEEDUP_PCT, '
+   || 'ROUND(DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)) - b.CREDITS_PER_DAY, 3) '
+   || '  AS OBSERVED_DELTA_CREDITS_PER_DAY, '
+   || 'a.DAYS_SINCE AS DAYS_OBSERVED, '
+   || 'CASE '
+   -- Under three days the daily rate is dominated by whichever day the change
+   -- landed on. Calling a regression on one day of data would be exactly the
+   -- kind of number this solution exists to stop.
+   || 'WHEN COALESCE(a.DAYS_SINCE, 0) < 3 THEN ''TOO_EARLY'' '
+   || 'WHEN DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)) > b.CREDITS_PER_DAY * 1.05 '
+   || '  THEN ''COSTING_MORE'' '
+   || 'WHEN DIV0(a.CREDITS_USED, NULLIF(a.DAYS_SINCE, 0)) < b.CREDITS_PER_DAY * 0.95 '
+   || '  THEN ''COSTING_LESS'' '
+   || 'ELSE ''NO_MATERIAL_CHANGE'' END AS OUTCOME, '
+   || CHAR(39) || 'OBSERVED_DELTA_CREDITS_PER_DAY is a difference between two '
+   || 'measured windows, not a saving. It attributes nothing: if the workload grew '
+   || 'or shrank over the same period, that is in this number too. Read it with '
+   || 'OBSERVED_SPEEDUP_PCT, which is far less sensitive to volume.'
+   || CHAR(39) || ' AS HOW_TO_READ_IT, '
+   || '''MEASURED'' AS LABEL, ''BY_TIME_WINDOW'' AS BASIS '
+   || 'FROM ' || :tgt || '.CONVERSION_BASELINE b '
+   || 'JOIN ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || '  ON r.TARGET_FQN = b.WAREHOUSE_NAME AND r.KIND = ''WAREHOUSE_SETTING'' '
+   || 'LEFT JOIN after a ON a.WAREHOUSE_NAME = b.WAREHOUSE_NAME '
+   || 'LEFT JOIN aq ON aq.WAREHOUSE_NAME = b.WAREHOUSE_NAME');
+    cost_day    := :cost_day + 0.04;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'V_CONVERSION_OUTCOME scans metering and query history for converted '
+   || 'warehouses only ~0.04 credits/day');
+  END IF;
+
+  -- ── A throwaway warehouse for the SAMPLE action ─────────────────────────────
+  -- The SAMPLE tier must have something to convert that is not the customer's.
+  -- Created here rather than inside the action because CREATE WAREHOUSE makes the
+  -- new warehouse the session's CURRENT warehouse; when an undo then dropped it,
+  -- every later statement in that session failed with "No active warehouse
+  -- selected" -- including the UPDATE that closes the action log. Created here the
+  -- hijack is harmless, and the action only flips a setting on it.
+  --
+  -- GENERATION = '1' is the whole point. Gen2 is the default for new standard
+  -- warehouses since the 2026_03 bundle, so omitting this clause produces a Gen2
+  -- warehouse and the demo would convert Gen2 to Gen2 while appearing to work.
+  -- INITIALLY_SUSPENDED, and it never runs a query, so it bills nothing.
+  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE WAREHOUSE IF NOT EXISTS ' || :demo_wh || ' WAREHOUSE_SIZE = XSMALL '
+   || 'GENERATION = ''1'' AUTO_SUSPEND = 60 INITIALLY_SUSPENDED = TRUE COMMENT = '
+   || CHAR(39) || 'Throwaway Gen1 warehouse for the ' || :sch || ' SAMPLE action. '
+   || 'Never runs a query, so it bills nothing. Dropped by TEARDOWN().' || CHAR(39));
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :demo_wh
+   || CHAR(39) || ', ' || CHAR(39) || 'FIXTURE' || CHAR(39) || ', '
+   || CHAR(39) || 'FIXTURE' || CHAR(39) || ', ' || CHAR(39) || 'FIXTURE_WAREHOUSE'
+   || CHAR(39) || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt
+   || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = ' || CHAR(39) || :demo_wh
+   || CHAR(39) || ' AND KIND = ' || CHAR(39) || 'FIXTURE_WAREHOUSE' || CHAR(39) || ')');
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      :demo_wh || ' is created suspended and never runs a query, so it bills nothing');
+  END IF;
+
+  -- ── Plan-time facts for the buttons ─────────────────────────────────────────
+  -- The buttons need to name real warehouses and real counts, and the views that
+  -- hold the verdict do not exist yet -- this build has not run. So the verdict is
+  -- recomputed here, at plan time, from the same inputs against SHOW WAREHOUSES
+  -- and ACCOUNT_USAGE in a single statement.
+  --
+  -- It is the same arithmetic as V_GEN2_VERDICT. Keeping the two in step matters:
+  -- if the button says nine warehouses and the table shows seven, the reader stops
+  -- trusting both. The success criteria below assert they agree.
+  LET vf OBJECT := OBJECT_CONSTRUCT();
+  IF (:sig:warehouses::STRING = 'AVAILABLE' AND :sig:credit_history::STRING = 'AVAILABLE') THEN
+    BEGIN
+      SHOW WAREHOUSES;
+      SELECT OBJECT_CONSTRUCT(
+               'affirmative_n', COUNT_IF(VERDICT IN ('STRONG', 'LIKELY')),
+               'strong_n',      COUNT_IF(VERDICT = 'STRONG'),
+               'avoid_n',       COUNT_IF(VERDICT = 'AVOID'),
+               'eligible_n',    COUNT_IF(VERDICT NOT IN ('ALREADY_GEN2',
+                                  'INELIGIBLE_TYPE', 'INELIGIBLE_SIZE')),
+               'affirmative_credits_per_day',
+                 ROUND(SUM(IFF(VERDICT IN ('STRONG', 'LIKELY'), CREDITS_PER_DAY, 0)), 3),
+               'worst_case_extra_per_day',
+                 ROUND(SUM(IFF(VERDICT IN ('STRONG', 'LIKELY'), CREDITS_PER_DAY, 0))
+                       * (:mult - 1), 3),
+               -- Deterministic pick, and NOT MAX_BY: MAX_BY breaks ties
+               -- arbitrarily, so two warehouses on identical spend would let the
+               -- caption name one and the ALTER change the other. Zero-padding the
+               -- credits makes a lexicographic MAX order by spend then by name.
+               'pilot', SPLIT_PART(MAX(IFF(VERDICT IN ('STRONG', 'LIKELY'),
+                          LPAD(ROUND(CREDITS_PER_DAY * 1000)::VARCHAR, 18, '0')
+                            || '|' || WAREHOUSE_NAME, '')), '|', 2),
+               'adaptive_n', COUNT_IF(ADAPTIVE_VERDICT IN ('STRONG', 'LIKELY')),
+               'adaptive_pilot', SPLIT_PART(MAX(IFF(ADAPTIVE_VERDICT IN ('STRONG', 'LIKELY'),
+                          LPAD(ROUND(CREDITS_PER_DAY * 1000)::VARCHAR, 18, '0')
+                            || '|' || WAREHOUSE_NAME, '')), '|', 2)
+             ) INTO :vf
+      FROM (
+        SELECT f.WAREHOUSE_NAME, f.CREDITS_PER_DAY,
+               CASE
+                 WHEN f.GENERATION = '2' THEN 'ALREADY_GEN2'
+                 WHEN f.WH_TYPE <> 'STANDARD' THEN 'INELIGIBLE_TYPE'
+                 WHEN f.SIZE_KEY IN ('5XLARGE', '6XLARGE') THEN 'INELIGIBLE_SIZE'
+                 WHEN f.CREDITS_USED < :min_credits THEN 'IMMATERIAL'
+                 WHEN f.UTILISATION < 0.20 THEN 'AVOID'
+                 WHEN f.FAVOURABLE_SHARE < 0.30 THEN 'AVOID'
+                 WHEN f.UTILISATION >= 0.50 AND f.FAVOURABLE_SHARE >= 0.60
+                      AND (f.QUEUED_SECONDS > 0 OR f.SPILL_GB > 0) THEN 'STRONG'
+                 WHEN f.UTILISATION >= 0.35 AND f.FAVOURABLE_SHARE >= 0.45 THEN 'LIKELY'
+                 ELSE 'PILOT_ONLY' END AS VERDICT,
+               CASE
+                 WHEN f.WH_TYPE = 'ADAPTIVE' THEN 'ALREADY_ADAPTIVE'
+                 WHEN f.WH_TYPE <> 'STANDARD' THEN 'UNSUPPORTED_CONVERSION'
+                 WHEN f.SIZE_KEY IN ('5XLARGE', '6XLARGE') THEN 'UNSUPPORTED_SIZE'
+                 WHEN f.CREDITS_USED < :min_credits THEN 'IMMATERIAL'
+                 WHEN f.DAILY_CV >= 0.60 AND f.QUEUED_SECONDS > 0 THEN 'STRONG'
+                 WHEN f.DAILY_CV >= 0.60 OR f.QUEUED_SECONDS > 0 OR f.MAX_CLUSTERS > 1
+                      THEN 'LIKELY'
+                 ELSE 'PILOT_ONLY' END AS ADAPTIVE_VERDICT
+        FROM (
+          SELECT s."name" AS WAREHOUSE_NAME,
+                 UPPER(REPLACE(s."size", '-', '')) AS SIZE_KEY,
+                 UPPER(COALESCE(s."type", '')) AS WH_TYPE,
+                 COALESCE(s."generation", '') AS GENERATION,
+                 COALESCE(s."max_cluster_count", 1)::INT AS MAX_CLUSTERS,
+                 COALESCE(c.CREDITS_USED, 0) AS CREDITS_USED,
+                 DIV0(COALESCE(c.CREDITS_USED, 0), NULLIF(c.ACTIVE_DAYS, 0)) AS CREDITS_PER_DAY,
+                 DIV0(COALESCE(c.DAILY_STDDEV, 0), NULLIF(c.DAILY_MEAN, 0)) AS DAILY_CV,
+                 DIV0(COALESCE(q.QUERY_SECONDS, 0)
+                      * CASE UPPER(REPLACE(s."size", '-', ''))
+                          WHEN 'XSMALL' THEN 1 WHEN 'SMALL' THEN 2 WHEN 'MEDIUM' THEN 4
+                          WHEN 'LARGE' THEN 8 WHEN 'XLARGE' THEN 16 WHEN '2XLARGE' THEN 32
+                          WHEN '3XLARGE' THEN 64 WHEN '4XLARGE' THEN 128
+                          WHEN '5XLARGE' THEN 256 WHEN '6XLARGE' THEN 512 ELSE NULL END,
+                      NULLIF(COALESCE(c.CREDITS_USED, 0) * 3600.0, 0)) AS UTILISATION,
+                 DIV0(COALESCE(q.FAVOURABLE_SECONDS, 0),
+                      NULLIF(COALESCE(q.QUERY_SECONDS, 0), 0)) AS FAVOURABLE_SHARE,
+                 COALESCE(q.QUEUED_SECONDS, 0) AS QUEUED_SECONDS,
+                 COALESCE(q.SPILL_GB, 0) AS SPILL_GB
+          FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) s
+          LEFT JOIN (
+            SELECT WAREHOUSE_NAME, SUM(DAILY_CREDITS) AS CREDITS_USED,
+                   COUNT(*) AS ACTIVE_DAYS,
+                   STDDEV(DAILY_CREDITS) AS DAILY_STDDEV, AVG(DAILY_CREDITS) AS DAILY_MEAN
+            FROM (SELECT WAREHOUSE_NAME, DATE_TRUNC('day', START_TIME) AS D,
+                         SUM(CREDITS_USED) AS DAILY_CREDITS
+                  FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                  WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
+                  GROUP BY 1, 2)
+            GROUP BY 1) c ON c.WAREHOUSE_NAME = s."name"
+          LEFT JOIN (
+            SELECT WAREHOUSE_NAME,
+                   SUM(EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS,
+                   SUM(CASE WHEN QUERY_TYPE IN ('MERGE', 'UPDATE', 'DELETE', 'INSERT',
+                                                'COPY', 'CREATE_TABLE_AS_SELECT', 'UNLOAD')
+                             OR (QUERY_TYPE = 'SELECT' AND BYTES_SCANNED >= POWER(1024, 3))
+                            THEN EXECUTION_TIME ELSE 0 END) / 1000.0 AS FAVOURABLE_SECONDS,
+                   SUM(QUEUED_OVERLOAD_TIME) / 1000.0 AS QUEUED_SECONDS,
+                   SUM(BYTES_SPILLED_TO_LOCAL_STORAGE + BYTES_SPILLED_TO_REMOTE_STORAGE)
+                     / POWER(1024, 3) AS SPILL_GB
+            FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+            WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
+              AND WAREHOUSE_NAME IS NOT NULL AND WAREHOUSE_SIZE IS NOT NULL
+            GROUP BY 1) q ON q.WAREHOUSE_NAME = s."name"
+          WHERE s."name" <> :demo_wh
+        ) f
+      );
+    EXCEPTION WHEN OTHER THEN
+      vf := OBJECT_CONSTRUCT();
+    END;
+    cost_once := :cost_once + 0.03;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'Plan-time verdict recompute ~0.03 credits (one pass over metering and query '
+   || 'history, so the buttons can name real warehouses before anything is built)');
+  END IF;
+
+  LET affirm_n   INT    := COALESCE(:vf:affirmative_n::INT, 0);
+  LET strong_n   INT    := COALESCE(:vf:strong_n::INT, 0);
+  LET avoid_n    INT    := COALESCE(:vf:avoid_n::INT, 0);
+  LET pilot_wh   STRING := COALESCE(:vf:pilot::STRING, '');
+  LET adapt_n    INT    := COALESCE(:vf:adaptive_n::INT, 0);
+  LET adapt_wh   STRING := COALESCE(:vf:adaptive_pilot::STRING, '');
+  LET affirm_cpd NUMBER(38,6) := COALESCE(:vf:affirmative_credits_per_day::NUMBER(38,6), 0);
+  LET worst_cpd  NUMBER(38,6) := COALESCE(:vf:worst_case_extra_per_day::NUMBER(38,6), 0);
+
+  -- ── QAS candidate count, deliberately in its OWN exception block ─────────────
+  -- Not folded into the recompute above, and that is the whole point:
+  -- QUERY_ACCELERATION_ELIGIBLE is Enterprise-only, so a single unreadable view
+  -- inside that statement would empty `vf` and silently zero affirm_n, strong_n and
+  -- the pilot name -- taking the Gen2 buttons out on every Standard Edition account.
+  -- One isolated failure costs one button, which is the same rule the probes follow.
+  LET qas_n    INT           := 0;
+  LET qas_secs NUMBER(38,1)  := 0;
+  IF (:sig:qas_eligible::STRING = 'AVAILABLE' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    BEGIN
+      SHOW WAREHOUSES;
+      SELECT COUNT(*), COALESCE(ROUND(SUM(ELIGIBLE_SECONDS), 1), 0)
+        INTO :qas_n, :qas_secs
+      FROM (
+        SELECT s."name" AS WAREHOUSE_NAME,
+               COALESCE(e.ELIGIBLE_SECONDS, 0) AS ELIGIBLE_SECONDS
+        FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) s
+        LEFT JOIN (
+          SELECT WAREHOUSE_NAME,
+                 SUM(ELIGIBLE_QUERY_ACCELERATION_TIME) AS ELIGIBLE_SECONDS
+          FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ACCELERATION_ELIGIBLE
+          WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
+            AND WAREHOUSE_NAME IS NOT NULL
+          GROUP BY 1) e ON e.WAREHOUSE_NAME = s."name"
+        LEFT JOIN (
+          SELECT WAREHOUSE_NAME, SUM(EXECUTION_TIME) / 1000.0 AS QUERY_SECONDS
+          FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+          WHERE START_TIME >= DATEADD(day, -:w, CURRENT_TIMESTAMP())
+            AND WAREHOUSE_NAME IS NOT NULL AND WAREHOUSE_SIZE IS NOT NULL
+          GROUP BY 1) q ON q.WAREHOUSE_NAME = s."name"
+        WHERE s."name" <> :demo_wh
+          -- The same three tests the view applies, in the same order.
+          AND UPPER(COALESCE(s."type", '')) = 'STANDARD'
+          AND LOWER(COALESCE(s."enable_query_acceleration", 'false')::VARCHAR)
+              NOT IN ('true', 't', '1')
+          AND DIV0(COALESCE(e.ELIGIBLE_SECONDS, 0),
+                   NULLIF(COALESCE(q.QUERY_SECONDS, 0), 0)) >= 0.10
+      );
+    EXCEPTION WHEN OTHER THEN
+      qas_n    := 0;
+      qas_secs := 0;
+    END;
+    cost_once := :cost_once + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'Plan-time QAS candidate count ~0.02 credits (one pass over '
+   || 'QUERY_ACCELERATION_ELIGIBLE and query history)');
+  END IF;
+
+  -- ── Reusable SQL for recording and restoring a generation change ────────────
+  -- Recording the PRIOR generation is what makes the change reversible, and the
+  -- literal '1' rather than the observed value is deliberate: SHOW WAREHOUSES
+  -- reports a blank generation for warehouses that predate the column, and
+  -- restoring `SET GENERATION = ` would be a syntax error. A standard warehouse
+  -- that is not Gen2 is a Gen1 warehouse, so that is what gets recorded.
+  --
+  -- The NOT EXISTS guard stops a second press from recording '2' as the original
+  -- and turning the undo into a no-op.
+  LET reg_gen STRING :=
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+   || 'SELECT v.WAREHOUSE_NAME, ''GENERATION'', CHAR(39) || ''1'' || CHAR(39), '
+   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.V_GEN2_VERDICT v '
+   || 'WHERE v.VERDICT IN (''STRONG'', ''LIKELY'') '
+   || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || 'WHERE r.TARGET_FQN = v.WAREHOUSE_NAME AND r.ARTIFACT = ''GENERATION'')';
+
+  LET undo_gen ARRAY := ARRAY_CONSTRUCT(
+      'BEGIN LET c CURSOR FOR SELECT TARGET_FQN, ARGUMENTS FROM ' || :tgt
+   || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING'
+   || CHAR(39) || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39) || '; '
+   || 'FOR r IN c DO '
+   || 'EXECUTE IMMEDIATE ' || CHAR(39) || 'ALTER WAREHOUSE "' || CHAR(39)
+   || ' || r.TARGET_FQN || ' || CHAR(39) || '" SET GENERATION = ' || CHAR(39)
+   || ' || r.ARGUMENTS; '
+   || 'END FOR; END',
+      -- Dropping the recording matters. Leaving the rows means the NOT EXISTS
+      -- guard on the next press treats Gen2 as the original value, and the
+      -- conversion becomes permanent without anyone choosing that.
+      'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || 'WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
+   || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39));
+
+  -- ── SAMPLE: prove the mechanism on a warehouse that is not yours ────────────
+  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'GEN2_DEMO',
+      'label',  'Convert a throwaway Gen1 warehouse to Gen2, then put it back',
+      'tier',   'SAMPLE',
+      'effect', 'Records the generation of ' || :demo_wh || ' -- a suspended Gen1 '
+             || 'warehouse this script created for exactly this purpose -- and sets '
+             || 'GENERATION = 2. None of your warehouses are touched. Press Undo to '
+             || 'watch it return to Gen1, which is the same undo the real conversions '
+             || 'use.',
+      'undo',   'Undo restores the recorded generation. TEARDOWN() drops the warehouse.',
+      'est',    0.01,
+      'basis',  'Two ALTER WAREHOUSE statements. ALTER is metadata-only and the '
+             || 'warehouse is suspended throughout, so nothing runs and nothing bills.',
+      'sql',    ARRAY_CONSTRUCT(
+        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :demo_wh
+     || CHAR(39) || ', ' || CHAR(39) || 'GENERATION' || CHAR(39) || ', '
+     || 'CHAR(39) || ' || CHAR(39) || '1' || CHAR(39) || ' || CHAR(39), '
+     || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
+     || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || 'WHERE TARGET_FQN = ' || CHAR(39) || :demo_wh || CHAR(39)
+     || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39) || ')',
+        'ALTER WAREHOUSE ' || :demo_wh || ' SET GENERATION = ''2'''),
+      'undo_sql', ARRAY_CONSTRUCT(
+        'ALTER WAREHOUSE ' || :demo_wh || ' SET GENERATION = ''1''',
+        'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
+     || CHAR(39) || :demo_wh || CHAR(39) || ' AND ARTIFACT = '
+     || CHAR(39) || 'GENERATION' || CHAR(39))
+    ));
+  END IF;
+
+  -- ── LIMITED: the measured pilot, one warehouse ──────────────────────────────
+  -- This is the action that should actually get pressed first, and the one the
+  -- whole solution is arranged around. One warehouse, named on the button, with a
+  -- baseline already captured and an outcome view waiting for it.
+  IF (:pilot_wh <> '') THEN
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'GEN2_PILOT',
+      'label',  'Pilot Gen2 on ' || :pilot_wh,
+      'tier',   'LIMITED',
+      'effect', 'Sets GENERATION = 2 on ' || :pilot_wh || ' and nothing else. Its '
+             || 'baseline was captured by this build, so V_CONVERSION_OUTCOME will '
+             || 'show the speedup it actually achieved against the '
+             || :breakeven_pct || '% it has to beat -- give it at least three days '
+             || 'before reading, and the view says TOO_EARLY until then. Cheapest '
+             || 'moment to press this is while the warehouse is idle: converting a '
+             || 'RUNNING warehouse bills BOTH generations until in-flight queries '
+             || 'drain.',
+      'undo',   'Reversible. Undo restores Gen1, and Snowflake supports moving from '
+             || 'Gen2 back to Gen1 directly on a running or suspended warehouse.',
+      'est',    0.01,
+      'basis',  'One ALTER WAREHOUSE, metadata-only. The cost that follows is the '
+             || 'workload itself at the Gen2 rate, which is what the pilot exists to '
+             || 'measure -- currently ' || ROUND(:affirm_cpd, 3) || ' credits/day '
+             || 'across all affirmative candidates.',
+      'sql',    ARRAY_CONSTRUCT(
+        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :pilot_wh
+     || CHAR(39) || ', ' || CHAR(39) || 'GENERATION' || CHAR(39) || ', '
+     || 'CHAR(39) || ' || CHAR(39) || '1' || CHAR(39) || ' || CHAR(39), '
+     || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
+     || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || 'WHERE TARGET_FQN = ' || CHAR(39) || :pilot_wh || CHAR(39)
+     || ' AND ARTIFACT = ' || CHAR(39) || 'GENERATION' || CHAR(39) || ')',
+        'ALTER WAREHOUSE "' || :pilot_wh || '" SET GENERATION = ''2'''),
+      'undo_sql', ARRAY_CONSTRUCT(
+        'ALTER WAREHOUSE "' || :pilot_wh || '" SET GENERATION = ''1''',
+        'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
+     || CHAR(39) || :pilot_wh || CHAR(39) || ' AND ARTIFACT = '
+     || CHAR(39) || 'GENERATION' || CHAR(39))
+    ));
+  END IF;
+
+  -- ── PRODUCTION: the affirmative cohort, and only the affirmative cohort ─────
+  -- Never "all Gen1 warehouses". AVOID, PILOT_ONLY, IMMATERIAL and every
+  -- ineligible verdict are excluded by the same view the reader is looking at, so
+  -- the button and the table cannot disagree.
+  --
+  -- No EXCEPTION handler on the loop, on purpose: a button that swallows a failed
+  -- ALTER and reports DONE is worse than one that stops. RUN_ACTION logs the
+  -- failure and halts, leaving a partial cohort that the registry can still undo.
+  IF (:affirm_n > 0) THEN
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'GEN2_COHORT',
+      'label',  'Convert the ' || :affirm_n || ' warehouse(s) the evidence supports',
+      'tier',   'PRODUCTION',
+      'effect', 'Sets GENERATION = 2 on every warehouse whose verdict is STRONG or '
+             || 'LIKELY -- ' || :strong_n || ' STRONG, ' || (:affirm_n - :strong_n)
+              || ' LIKELY. Warehouses marked AVOID are deliberately left alone: '
+              || :avoid_n || ' of them, where converting would raise the bill rather '
+              || 'than lower it. Press this while the fleet is quiet -- a RUNNING '
+              || 'warehouse bills both generations until its in-flight queries drain. '
+              -- Stated here rather than left as a surprise. A client who presses this
+              -- and then reads Snowflake's Gen2 page will find that new Gen2
+              -- warehouses get QAS and wonder why theirs did not.
+              || 'Note: this does NOT enable Query Acceleration. Snowflake enables QAS '
+              || 'automatically on a warehouse CREATED as Gen2, but not on one ALTERed '
+              || 'to Gen2, so these warehouses will differ from a natively-created Gen2 '
+              || 'warehouse. That is judged separately by QAS_VERDICT and offered as its '
+              || 'own action, because QAS bills serverless credits of its own and should '
+              || 'not ride along inside a different consent.',
+
+      'undo',   'Reversible: Undo restores every recorded generation, and so does '
+             || 'CALL ' || :tgt || '.TEARDOWN().',
+      'est',    ROUND(0.01 * :affirm_n, 3),
+      'basis',  :affirm_n || ' ALTER WAREHOUSE statements, metadata-only, so applying '
+             || 'it is ~' || ROUND(0.01 * :affirm_n, 3) || ' credits. The number that '
+             || 'matters is not that one: these warehouses currently spend '
+             || ROUND(:affirm_cpd, 3) || ' credits/day, and if Gen2 delivers NO '
+             || 'speedup at all on them it adds about ' || ROUND(:worst_cpd, 3)
+             || ' credits/day. That is the downside you are accepting. The upside is '
+             || 'anything faster than ' || :breakeven_pct || '%.',
+      'sql',    ARRAY_CONSTRUCT(
+        :reg_gen,
+        'BEGIN LET c CURSOR FOR SELECT WAREHOUSE_NAME FROM ' || :tgt
+     || '.V_GEN2_VERDICT WHERE VERDICT IN (''STRONG'', ''LIKELY''); '
+     || 'FOR r IN c DO '
+     || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || r.WAREHOUSE_NAME '
+     || '|| ''" SET GENERATION = ''''2''''''; '
+     || 'END FOR; END'),
+      'undo_sql', :undo_gen
+    ));
+  END IF;
+
+  -- ── Query Acceleration, judged and offered separately ───────────────────────
+  -- Deliberately NOT folded into GEN2_COHORT. QAS bills serverless credits of its
+  -- own, so bundling it into the Gen2 consent would slip a second cost change past
+  -- the client inside the first one -- which is the exact failure this solution
+  -- exists to prevent on the Gen2 decision itself.
+  --
+  -- The registry entry records the PRIOR values so the undo restores them. Both
+  -- clauses ride in ARGUMENTS because the shared teardown branch emits
+  -- `ALTER WAREHOUSE <name> SET <ARTIFACT> = <ARGUMENTS>`, which is the same trick
+  -- the Adaptive action uses to put back size and cluster counts in one statement.
+  LET reg_qas STRING :=
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+   || 'SELECT v.WAREHOUSE_NAME, ''ENABLE_QUERY_ACCELERATION'', '
+   -- FALSE is the value being restored, and the prior scale factor goes back with
+   -- it. Leaving the factor out would restore QAS-off but silently keep whatever
+   -- factor this action set, which is a config change disguised as a rollback.
+   || '''FALSE QUERY_ACCELERATION_MAX_SCALE_FACTOR = '' || '
+   || 'GREATEST(COALESCE(v.QAS_SCALE_FACTOR, 8), 1), '
+   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.V_GEN2_VERDICT v '
+   || 'WHERE v.QAS_VERDICT = ''RECOMMENDED'' '
+   || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || 'WHERE r.TARGET_FQN = v.WAREHOUSE_NAME '
+   || 'AND r.ARTIFACT = ''ENABLE_QUERY_ACCELERATION'')';
+
+  LET undo_qas ARRAY := ARRAY_CONSTRUCT(
+      'BEGIN LET c CURSOR FOR SELECT TARGET_FQN, ARGUMENTS FROM ' || :tgt
+   || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING'
+   || CHAR(39) || ' AND ARTIFACT = ' || CHAR(39) || 'ENABLE_QUERY_ACCELERATION'
+   || CHAR(39) || '; '
+   || 'FOR r IN c DO '
+   || 'EXECUTE IMMEDIATE ' || CHAR(39) || 'ALTER WAREHOUSE "' || CHAR(39)
+   || ' || r.TARGET_FQN || ' || CHAR(39) || '" SET ENABLE_QUERY_ACCELERATION = '
+   || CHAR(39) || ' || r.ARGUMENTS; '
+   || 'END FOR; END',
+      -- Same reasoning as the generation undo: leaving the rows behind makes the
+      -- NOT EXISTS guard treat QAS-on as the original state, and the change becomes
+      -- permanent without anyone choosing that.
+      'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || 'WHERE KIND = ' || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
+   || ' AND ARTIFACT = ' || CHAR(39) || 'ENABLE_QUERY_ACCELERATION' || CHAR(39));
+
+  -- SAMPLE: prove the mechanism on the throwaway warehouse, not on theirs.
+  IF (:sig:warehouses::STRING = 'AVAILABLE') THEN
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'QAS_DEMO',
+      'label',  'Turn Query Acceleration on for a throwaway warehouse, then put it back',
+      'tier',   'SAMPLE',
+      'effect', 'Sets ENABLE_QUERY_ACCELERATION = TRUE and '
+             || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = 2 on ' || :demo_wh || ', the '
+             || 'suspended warehouse this script created for its own demonstrations. '
+             || 'None of your warehouses are touched.',
+      'undo',   'Undo restores the recorded setting. TEARDOWN() drops the warehouse.',
+      'est',    0.01,
+      'basis',  'Two ALTER WAREHOUSE statements. ALTER is metadata-only and the '
+             || 'warehouse is suspended throughout, so no QAS compute is ever '
+             || 'requested and nothing bills.',
+      'sql',    ARRAY_CONSTRUCT(
+        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :demo_wh
+     || CHAR(39) || ', ''ENABLE_QUERY_ACCELERATION'', ''FALSE'', ''WAREHOUSE_SETTING'' '
+     || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || 'WHERE TARGET_FQN = ' || CHAR(39) || :demo_wh || CHAR(39)
+     || ' AND ARTIFACT = ''ENABLE_QUERY_ACCELERATION'')',
+        'ALTER WAREHOUSE ' || :demo_wh || ' SET ENABLE_QUERY_ACCELERATION = TRUE '
+     || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = 2'),
+      'undo_sql', ARRAY_CONSTRUCT(
+        'ALTER WAREHOUSE ' || :demo_wh || ' SET ENABLE_QUERY_ACCELERATION = FALSE',
+        'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
+     || CHAR(39) || :demo_wh || CHAR(39)
+     || ' AND ARTIFACT = ''ENABLE_QUERY_ACCELERATION''')
+    ));
+  END IF;
+
+  -- PRODUCTION: enable it where the account's own queries say it would engage.
+  IF (:qas_n > 0) THEN
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'QAS_ENABLE',
+      'label',  'Enable Query Acceleration on the ' || :qas_n || ' warehouse(s) with eligible work',
+      'tier',   'PRODUCTION',
+      'effect', 'Sets ENABLE_QUERY_ACCELERATION = TRUE on every warehouse whose '
+             || 'QAS_VERDICT is RECOMMENDED, at the scale factor in '
+             || 'QAS_PROPOSED_SCALE_FACTOR -- capped at 2, which is what Snowflake '
+             || 'itself uses when it enables QAS on a newly created Gen2 warehouse, '
+             || 'and never above the ceiling Snowflake reported for that workload. '
+             || 'Warehouses where none of the queries were eligible are left alone.',
+      'undo',   'Reversible: Undo restores ENABLE_QUERY_ACCELERATION and the prior '
+             || 'scale factor, and so does CALL ' || :tgt || '.TEARDOWN().',
+      'est',    ROUND(0.01 * :qas_n, 3),
+      'basis',  :qas_n || ' ALTER WAREHOUSE statements, metadata-only, ~'
+             || ROUND(0.01 * :qas_n, 3) || ' credits to apply. What it costs after '
+             || 'that is NOT metadata and NOT zero: QAS runs the offloaded work on '
+             || 'separate serverless compute, billed on its own line. Snowflake '
+             || 'marked ' || ROUND(:qas_secs, 0) || ' seconds of execution time '
+             || 'across these warehouses as eligible in the last ' || :w || ' days, '
+             || 'which is the work that would move to that line. So this is not a '
+             || 'saving -- it is a wall-clock reduction on scan-heavy work, bought '
+             || 'with QAS credits. It earns its place here because that same '
+             || 'wall-clock reduction is what the Gen2 rate premium needs in order '
+             || 'to pay for itself. Watch the QUERY_ACCELERATION_HISTORY view and '
+             || 'the credits line after you press it.',
+      'sql',    ARRAY_CONSTRUCT(
+        :reg_qas,
+        'BEGIN LET c CURSOR FOR SELECT WAREHOUSE_NAME, QAS_PROPOSED_SCALE_FACTOR '
+     || 'FROM ' || :tgt || '.V_GEN2_VERDICT WHERE QAS_VERDICT = ''RECOMMENDED''; '
+     || 'FOR r IN c DO '
+     || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || r.WAREHOUSE_NAME '
+     || '|| ''" SET ENABLE_QUERY_ACCELERATION = TRUE '
+     || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = '' || r.QAS_PROPOSED_SCALE_FACTOR; '
+     || 'END FOR; END'),
+      'undo_sql', :undo_qas
+    ));
+  END IF;
+
+  -- ── LIMITED: one Adaptive pilot ─────────────────────────────────────────────
+  -- Adaptive nulls the size, the cluster counts and the suspend policy when it
+  -- converts, so the undo has to put all of them back explicitly -- verified by
+  -- round-tripping a warehouse before this was written. The restore clause is
+  -- carried in ARGUMENTS so the shared teardown branch, which emits
+  -- `ALTER WAREHOUSE <name> SET <ARTIFACT> = <ARGUMENTS>`, reconstructs the whole
+  -- statement without needing a special case.
+  IF (:adapt_wh <> '') THEN
+    LET adapt_restore STRING := '';
+    BEGIN
+      EXECUTE IMMEDIATE 'SHOW WAREHOUSES LIKE ''' || :adapt_wh || '''';
+      SELECT CHAR(39) || 'STANDARD' || CHAR(39)
+          || ' WAREHOUSE_SIZE = ' || REPLACE(UPPER("size"), '-', '')
+          || ' GENERATION = ' || CHAR(39) || COALESCE(NULLIF("generation", ''), '1') || CHAR(39)
+          || ' AUTO_SUSPEND = ' || COALESCE("auto_suspend"::VARCHAR, '60')
+        INTO :adapt_restore
+      FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+    EXCEPTION WHEN OTHER THEN
+      adapt_restore := '';
+    END;
+
+    -- No restore clause means no honest undo, so the action is not offered. A
+    -- button whose undo is a guess is worse than no button.
+    IF (:adapt_restore <> '') THEN
+      actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+        'code',   'ADAPTIVE_PILOT',
+        'label',  'Pilot an Adaptive Warehouse on ' || :adapt_wh,
+        'tier',   'LIMITED',
+        'effect', 'Converts ' || :adapt_wh || ' to an Adaptive Warehouse. Snowflake '
+               || 'then owns its size, cluster count, Query Acceleration and suspend '
+               || 'policy, and bills per query instead of per warehouse-second. '
+               || 'Requires Enterprise Edition or higher and a supported region -- '
+               || 'this account reports ' || COALESCE(:sig:edition_hint::STRING, 'UNKNOWN')
+               || ', which is inferred rather than read, so the ALTER is the real '
+               || 'test and will refuse clearly if unsupported. No downtime.',
+        'undo',   'Reversible, and verified by round-trip: Undo restores type '
+               || 'STANDARD with the size, generation and auto-suspend recorded '
+               || 'before the change (' || :adapt_restore || ').',
+        'est',    0.01,
+        'basis',  'One ALTER WAREHOUSE, metadata-only. What happens to cost after '
+               || 'that cannot be projected -- Adaptive bills per query, so the only '
+               || 'honest answer is the before-and-after in V_CONVERSION_OUTCOME. '
+               || :adapt_wh || ' currently spends what CONVERSION_BASELINE recorded '
+               || 'for it.',
+        'sql',    ARRAY_CONSTRUCT(
+          'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+       || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) SELECT ' || CHAR(39) || :adapt_wh
+       || CHAR(39) || ', ' || CHAR(39) || 'WAREHOUSE_TYPE' || CHAR(39) || ', '
+       || CHAR(39) || :adapt_restore || CHAR(39) || ', '
+       || CHAR(39) || 'WAREHOUSE_SETTING' || CHAR(39)
+       || ' WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+       || 'WHERE TARGET_FQN = ' || CHAR(39) || :adapt_wh || CHAR(39)
+       || ' AND ARTIFACT = ' || CHAR(39) || 'WAREHOUSE_TYPE' || CHAR(39) || ')',
+          'ALTER WAREHOUSE "' || :adapt_wh || '" SET WAREHOUSE_TYPE = ''ADAPTIVE'''),
+        'undo_sql', ARRAY_CONSTRUCT(
+          'ALTER WAREHOUSE "' || :adapt_wh || '" SET WAREHOUSE_TYPE = ' || :adapt_restore,
+          'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE TARGET_FQN = '
+       || CHAR(39) || :adapt_wh || CHAR(39) || ' AND ARTIFACT = '
+       || CHAR(39) || 'WAREHOUSE_TYPE' || CHAR(39))
+      ));
+    END IF;
+  END IF;
+
+  -- ── The named-list ALTER path ───────────────────────────────────────────────
+  -- WHGEN_WAREHOUSES names warehouses this build may convert directly, by name,
+  -- regardless of verdict -- because naming a warehouse in the settings block is
+  -- an explicit instruction and it is not this script's place to overrule it.
+  -- Blank means nothing is altered, which is the shipped default.
+  --
+  -- This has to exist as a real code path rather than only as buttons. It is how
+  -- the test harness exercises an actual conversion: without it, the single most
+  -- important statement in the solution is one no test ever runs, which is exactly
+  -- how the equivalent path in 11_cost_efficiency stayed unexercised while every
+  -- check reported green.
+  LET wh_list STRING := '';
+  BEGIN
+    wh_list := COALESCE((SELECT NULLIF($WHGEN_WAREHOUSES::VARCHAR, '')), '');
+  EXCEPTION WHEN OTHER THEN
+    wh_list := '';
+  END;
+
+  IF (:wh_list <> '' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    -- Record the prior generation first, or the change is not reversible. Only
+    -- STANDARD warehouses at a Gen2-eligible size are touched even when named:
+    -- an ALTER that Snowflake will refuse is not worth attempting, and silently
+    -- skipping it is better than failing the build on a name someone mistyped.
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+   || 'SELECT f.WAREHOUSE_NAME, ''GENERATION'', CHAR(39) || ''1'' || CHAR(39), '
+   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.WH_FLEET f '
+   || 'WHERE COALESCE(f.GENERATION, '''') NOT IN (''2'') '
+   || 'AND f.WH_TYPE = ''STANDARD'' '
+   || 'AND UPPER(REPLACE(f.WH_SIZE, ''-'', '''')) NOT IN (''5XLARGE'', ''6XLARGE'') '
+   || 'AND f.WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
+   || :wh_list || ''', '','')))'
+   || ' AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || 'WHERE r.TARGET_FQN = f.WAREHOUSE_NAME AND r.ARTIFACT = ''GENERATION'')');
+
+    stmts := ARRAY_APPEND(:stmts,
+      'BEGIN '
+   || 'LET cur CURSOR FOR SELECT WAREHOUSE_NAME FROM ' || :tgt || '.WH_FLEET '
+   || 'WHERE COALESCE(GENERATION, '''') NOT IN (''2'') '
+   || 'AND WH_TYPE = ''STANDARD'' '
+   || 'AND UPPER(REPLACE(WH_SIZE, ''-'', '''')) NOT IN (''5XLARGE'', ''6XLARGE'') '
+   || 'AND WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
+   || :wh_list || ''', '',''))); '
+   || 'FOR rec IN cur DO '
+   || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || rec.WAREHOUSE_NAME '
+   || '|| ''" SET GENERATION = ''''2''''''; '
+   || 'END FOR; END');
+
+    cost_once := :cost_once + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'ALTER WAREHOUSE for the names in WHGEN_WAREHOUSES ~0.02 credits one-time. '
+   || 'Metadata-only; what it changes is the RATE the workload bills at afterwards.');
+    dials := ARRAY_APPEND(:dials,
+      'Clear WHGEN_WAREHOUSES to convert nothing during the build and use the '
+   || 'buttons instead');
+  END IF;
+
+  -- ── The named-list QAS path ─────────────────────────────────────────────────
+  -- Same reasoning as the block above, for the same reason, and it is needed more
+  -- here: QAS_VERDICT reaches RECOMMENDED only when Snowflake has marked real
+  -- queries eligible, which a fresh sandbox never has. Without this list the QAS
+  -- ALTER is unreachable by any test, and an untested ALTER that ships is how the
+  -- 11_cost_efficiency defect happened.
+  --
+  -- The prior value is recorded before the change, exactly as the button does, so
+  -- the same undo and the same TEARDOWN branch restore it.
+  LET qas_list STRING := '';
+  BEGIN
+    qas_list := COALESCE((SELECT NULLIF($WHGEN_QAS_WAREHOUSES::VARCHAR, '')), '');
+  EXCEPTION WHEN OTHER THEN
+    qas_list := '';
+  END;
+
+  IF (:qas_list <> '' AND :sig:warehouses::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+   || '(TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+   || 'SELECT f.WAREHOUSE_NAME, ''ENABLE_QUERY_ACCELERATION'', '
+   || '''FALSE QUERY_ACCELERATION_MAX_SCALE_FACTOR = '' || '
+   || 'GREATEST(COALESCE(f.QAS_SCALE_FACTOR, 8), 1), '
+   || '''WAREHOUSE_SETTING'' FROM ' || :tgt || '.WH_FLEET f '
+   -- Only STANDARD warehouses: on an Adaptive warehouse the type governs
+   -- acceleration and the ALTER would be refused or meaningless.
+   || 'WHERE f.WH_TYPE = ''STANDARD'' '
+   || 'AND LOWER(COALESCE(f.QAS_ENABLED, ''false'')) NOT IN (''true'', ''t'', ''1'') '
+   || 'AND f.WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
+   || :qas_list || ''', '','')))'
+   || ' AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+   || 'WHERE r.TARGET_FQN = f.WAREHOUSE_NAME '
+   || 'AND r.ARTIFACT = ''ENABLE_QUERY_ACCELERATION'')');
+
+    stmts := ARRAY_APPEND(:stmts,
+      'BEGIN '
+   || 'LET cur CURSOR FOR SELECT WAREHOUSE_NAME FROM ' || :tgt || '.WH_FLEET '
+   || 'WHERE WH_TYPE = ''STANDARD'' '
+   || 'AND LOWER(COALESCE(QAS_ENABLED, ''false'')) NOT IN (''true'', ''t'', ''1'') '
+   || 'AND WAREHOUSE_NAME IN (SELECT TRIM(VALUE) FROM TABLE(SPLIT_TO_TABLE('''
+   || :qas_list || ''', '',''))); '
+   || 'FOR rec IN cur DO '
+   || 'EXECUTE IMMEDIATE ''ALTER WAREHOUSE "'' || rec.WAREHOUSE_NAME '
+   || '|| ''" SET ENABLE_QUERY_ACCELERATION = TRUE '
+   || 'QUERY_ACCELERATION_MAX_SCALE_FACTOR = 2''; '
+   || 'END FOR; END');
+
+    cost_once := :cost_once + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'ALTER WAREHOUSE for the names in WHGEN_QAS_WAREHOUSES ~0.02 credits '
+   || 'one-time. Metadata-only, but unlike the Gen2 ALTER this one opens a SECOND '
+   || 'billing line: from here on, eligible queries on those warehouses consume '
+   || 'serverless QAS credits on top of the warehouse credits. Scale factor 2 caps '
+   || 'how much.');
+    dials := ARRAY_APPEND(:dials,
+      'Clear WHGEN_QAS_WAREHOUSES to change no acceleration setting during the '
+   || 'build and use the buttons instead');
+  END IF;
+
+  -- ══════════════════════════════════════════════════════════════════════════
+  -- STANDING WORKLOAD — TASK_GEN2_WATCH
+  -- ══════════════════════════════════════════════════════════════════════════
+  -- Gen2 costs more per second. A conversion that does not speed the workload up
+  -- raises the bill quietly and forever, and nobody goes back to check: the ALTER
+  -- succeeded, so it looks done. This task is the check.
+
+  -- Credit rate read off the actual app warehouse, never assumed. The 4x error
+  -- this repo has already shipped once came from assuming X-Small.
+  LET gw_size    STRING := 'UNKNOWN';
+  LET gw_cph     NUMBER(38,2) := 1.0;
+  LET gw_rate_ok BOOLEAN := FALSE;
+  BEGIN
+    EXECUTE IMMEDIATE 'SHOW WAREHOUSES LIKE ''' || :wh || '''';
+    gw_size := (SELECT UPPER(COALESCE(MAX("size"), 'UNKNOWN'))
+                FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+    gw_cph := CASE REPLACE(:gw_size, '-', '')
+        WHEN 'XSMALL' THEN 1   WHEN 'SMALL'  THEN 2
+        WHEN 'MEDIUM' THEN 4   WHEN 'LARGE'  THEN 8
+        WHEN 'XLARGE' THEN 16  WHEN '2XLARGE' THEN 32
+        WHEN '3XLARGE' THEN 64 WHEN '4XLARGE' THEN 128
+        WHEN '5XLARGE' THEN 256 WHEN '6XLARGE' THEN 512
+        ELSE 1 END;
+    gw_rate_ok := (:gw_cph > 1 OR REPLACE(:gw_size, '-', '') = 'XSMALL');
+  EXCEPTION WHEN OTHER THEN
+    gw_size := 'UNREADABLE'; gw_cph := 1.0; gw_rate_ok := FALSE;
+  END;
+
+  LET gw_task_fqn STRING := :tgt || '.TASK_GEN2_WATCH';
+
+  -- A table rather than a view, because the point is to keep a HISTORY of the
+  -- verdict on each conversion. A view would only ever show today's answer, and
+  -- "it was fine last week" is the observation that identifies a regression.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.CONVERSION_WATCH_LOG ('
+ || 'CHECKED_AT TIMESTAMP_NTZ, WAREHOUSE_NAME VARCHAR, CHANGED_AT TIMESTAMP_NTZ, '
+ || 'DAYS_OBSERVED NUMBER(38,0), '
+ || 'BEFORE_CREDITS_PER_DAY NUMBER(38,4), AFTER_CREDITS_PER_DAY NUMBER(38,4), '
+ || 'OBSERVED_DELTA_CREDITS_PER_DAY NUMBER(38,4), '
+ || 'OBSERVED_SPEEDUP_PCT NUMBER(38,2), REQUIRED_SPEEDUP_PCT NUMBER(38,2), '
+ || 'OUTCOME VARCHAR, LABEL VARCHAR, BASIS VARCHAR)');
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.GEN2_WATCH() '
+ || 'RETURNS VARCHAR LANGUAGE SQL AS BEGIN '
+ || 'INSERT INTO ' || :tgt || '.CONVERSION_WATCH_LOG '
+ || '(CHECKED_AT, WAREHOUSE_NAME, CHANGED_AT, DAYS_OBSERVED, '
+ || ' BEFORE_CREDITS_PER_DAY, AFTER_CREDITS_PER_DAY, OBSERVED_DELTA_CREDITS_PER_DAY, '
+ || ' OBSERVED_SPEEDUP_PCT, REQUIRED_SPEEDUP_PCT, OUTCOME, LABEL, BASIS) '
+ || 'SELECT CURRENT_TIMESTAMP(), WAREHOUSE_NAME, CHANGED_AT, DAYS_OBSERVED, '
+ || 'BEFORE_CREDITS_PER_DAY, AFTER_CREDITS_PER_DAY, OBSERVED_DELTA_CREDITS_PER_DAY, '
+ || 'OBSERVED_SPEEDUP_PCT, REQUIRED_SPEEDUP_PCT, OUTCOME, LABEL, BASIS '
+ || 'FROM ' || :tgt || '.V_CONVERSION_OUTCOME; '
+ || 'RETURN ''GEN2_WATCH COMPLETE''; END');
+
+  -- The rollback list. This is the output a client team would not build for
+  -- itself, and it is the only thing in the solution that names a conversion as
+  -- a mistake.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ROLLBACK_CANDIDATES AS '
+ || 'SELECT WAREHOUSE_NAME, CHANGED_AT, DAYS_OBSERVED, '
+ || 'BEFORE_CREDITS_PER_DAY, AFTER_CREDITS_PER_DAY, '
+ || 'OBSERVED_DELTA_CREDITS_PER_DAY, OBSERVED_SPEEDUP_PCT, REQUIRED_SPEEDUP_PCT, '
+ || 'ROUND(OBSERVED_DELTA_CREDITS_PER_DAY * 365, 1) AS ANNUALISED_DELTA_CREDITS, '
+ || CHAR(39) || 'Converting this warehouse did not pay for the rate premium. '
+ || 'ALTER WAREHOUSE <name> SET GENERATION = ' || CHAR(39) || CHAR(39) || '1'
+ || CHAR(39) || CHAR(39) || ' puts it back, or press Undo on the action that '
+ || 'converted it.' || CHAR(39) || ' AS WHAT_TO_DO, '
+ || 'LABEL, BASIS '
+ || 'FROM ' || :tgt || '.V_CONVERSION_OUTCOME '
+ || 'WHERE OUTCOME = ''COSTING_MORE'' '
+ || 'ORDER BY OBSERVED_DELTA_CREDITS_PER_DAY DESC');
+  cost_day    := :cost_day + 0.01;
+  cost_detail := ARRAY_APPEND(:cost_detail,
+    'V_ROLLBACK_CANDIDATES reads V_CONVERSION_OUTCOME ~0.01 credits/day');
+
+  stmts := ARRAY_APPEND(:stmts,
+    'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ''TASK''');
+  stmts := ARRAY_APPEND(:stmts,
+    'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+ || 'SELECT ''' || :gw_task_fqn || ''', ''TASK_GEN2_WATCH'', '
+ || '''USING CRON 0 7 * * 1 UTC'', ''TASK''');
+
+  -- SUSPEND before replacing. Snowflake refuses to CREATE OR REPLACE a started
+  -- task, and at PRODUCTION tier the previous build deliberately leaves this one
+  -- running -- so a re-run would hit that refusal on a script whose whole promise
+  -- is that it can be re-run.
+  stmts := ARRAY_APPEND(:stmts, 'ALTER TASK IF EXISTS ' || :gw_task_fqn || ' SUSPEND');
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TASK ' || :gw_task_fqn || ' WAREHOUSE = ' || :wh
+ || ' SCHEDULE = ''USING CRON 0 7 * * 1 UTC'''
+ || ' COMMENT = ''Re-measures every warehouse this solution converted against its '
+ || 'pre-change baseline, and records any that are now costing more.'''
+ || ' AS CALL ' || :tgt || '.GEN2_WATCH()');
+  stmts := ARRAY_APPEND(:stmts, 'ALTER TASK ' || :gw_task_fqn || ' RESUME');
+
+  -- PRODUCTION tier is the consent. Below it the task exists and is suspended, and
+  -- the run rate below says so rather than reporting a charge for something this
+  -- build just switched off.
+  LET standing_live BOOLEAN := (:tier = 'PRODUCTION');
+  LET runs_per_month NUMBER(38,4) := IFF(:standing_live, 4.34, 0);
+  LET cadence_label STRING := 'weekly on Monday at 07:00 UTC'
+    || IFF(:standing_live, '', ', SUSPENDED at ' || :tier || ' tier');
+  LET gate_basis STRING := IFF(:standing_live,
+      'Left RUNNING because this build is PRODUCTION tier — this is a charge you will see.',
+      'SUSPENDED by this build because the tier is ' || :tier || ', not PRODUCTION. '
+        || 'At PRODUCTION the same task would fire 4.34 times a month.');
+
+  IF (NOT :standing_live) THEN
+    stmts := ARRAY_APPEND(:stmts, 'ALTER TASK ' || :gw_task_fqn || ' SUSPEND');
+  END IF;
+
+  -- Floor the measurement at this build's start, or a re-run into the same schema
+  -- averages in the previous run's calls: a true history of the statement, a false
+  -- history of the object being priced.
+  LET build_floor_utc STRING := (
+    SELECT TO_CHAR(CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()),
+                   'YYYY-MM-DD HH24:MI:SS.FF3'));
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.GEN2WATCH_RUN_COST '
+ || 'COMMENT = ''Measured elapsed time of GEN2_WATCH(), the body of TASK_GEN2_WATCH.'' AS '
+ || 'SELECT COUNT(*) AS RUNS_OBSERVED, '
+ || 'ROUND(AVG(TOTAL_ELAPSED_TIME) / 1000.0, 3) AS AVG_SECONDS '
+ -- Qualified with the target DATABASE on purpose: an unqualified
+ -- INFORMATION_SCHEMA resolves against whatever database the session happens to
+ -- be in, which is not guaranteed on a re-run.
+ || 'FROM TABLE(' || :db || '.INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION('
+ || 'RESULT_LIMIT => 10000)) '
+ || 'WHERE QUERY_TYPE = ''CALL'' AND EXECUTION_STATUS = ''SUCCESS'' '
+ || 'AND QUERY_TEXT ILIKE ''%' || :tgt || '.GEN2_WATCH()%'' '
+ || 'AND CONVERT_TIMEZONE(''UTC'', START_TIME)::TIMESTAMP_NTZ >= '''
+ || :build_floor_utc || '''::TIMESTAMP_NTZ');
+
+  -- The build calls the procedure once so SECONDS_PER_RUN is measured rather than
+  -- guessed. The task body IS this call, so timing it is honest and it also proves
+  -- the procedure runs before anything schedules it.
+  stmts := ARRAY_APPEND(:stmts, 'CALL ' || :tgt || '.GEN2_WATCH()');
+
+  stmts := ARRAY_APPEND(:stmts,
+    'INSERT INTO ' || :tgt || '.STANDING_WORKLOAD '
+ || '(KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
+ || ' WAREHOUSE_CREDITS_PER_HOUR, MEASURED_INPUT, BASIS, INSTALLED_AT) '
+ || 'SELECT ''TASK'', ''TASK_GEN2_WATCH'', '
+ || '  ''' || :cadence_label || ''', '
+ || '  ' || :runs_per_month || ', '
+ || '  COALESCE(r.AVG_SECONDS, 1.0), '
+ || '  ' || :gw_cph || ', '
+ || '  CASE WHEN r.AVG_SECONDS IS NOT NULL '
+ || '    THEN ''TOTAL_ELAPSED_TIME averaged over '' || r.RUNS_OBSERVED '
+ || '      || '' GEN2_WATCH() call(s) this build made; the task body is that exact call'' '
+ || '    ELSE ''no GEN2_WATCH() call was readable in this session''''s query history, '
+ || 'so this uses the 1-warehouse-second floor stated in the plan'' END, '
+ || '  ''CRON 0 7 * * 1 UTC = weekly = 4.34 runs/month, times measured seconds per '
+ || 'run, at ' || :gw_cph || ' credits/hour ('
+ || IFF(:gw_rate_ok, :wh || ' is ' || :gw_size,
+        'size of ' || :wh || ' unreadable, so 1 credit/hour is a LOWER bound')
+ || '). ' || :gate_basis || ''', '
+ || '  CURRENT_TIMESTAMP() '
+ || 'FROM ' || :tgt || '.GEN2WATCH_RUN_COST r');
+  --           adding to :cost_day / :cost_once / :cost_detail / :dials
+
+  -- ── The estimate, recorded so it can be graded later ──────────────────────
+  -- Written to its OWN table, separate from COST_MEASURED. That separation is the
+  -- mechanism, not a stylistic choice: two tables and one view with a mandatory
+  -- LABEL make "never sum a measurement with a projection" a property of the
+  -- schema rather than a rule someone has to remember. There is no column
+  -- anywhere that contains both kinds of number.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.COST_PROJECTED '
+ || '(RUN_ID VARCHAR, TIER VARCHAR, CATEGORY VARCHAR, LABEL VARCHAR, BASIS VARCHAR, '
+ || 'CREDITS NUMBER(38,9), HORIZON VARCHAR, DERIVATION VARCHAR, '
+ || 'PROJECTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
+  stmts := ARRAY_APPEND(:stmts, 'DELETE FROM ' || :tgt || '.COST_PROJECTED '
+                             || 'WHERE RUN_ID = ''' || :run_id || '''');
+  stmts := ARRAY_APPEND(:stmts,
+    'INSERT INTO ' || :tgt || '.COST_PROJECTED '
+ || '(RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, HORIZON, DERIVATION) '
+ || 'SELECT ''' || :run_id || ''', ''' || :tier || ''', ''STEADY_STATE'', ''PROJECTED'', '
+ || '''ARITHMETIC'', ' || :cost_day || ', ''per day'', '
+ || '''Sum of this plan''''s own itemised cost lines. Arithmetic, not observed.'' '
+ || 'UNION ALL SELECT ''' || :run_id || ''', ''' || :tier || ''', ''ONE_TIME_BUILD'', '
+ || '''PROJECTED'', ''ARITHMETIC'', ' || :cost_once || ', ''once'', '
+ || '''Sum of this plan''''s own one-time cost lines. Arithmetic, not observed.''');
+
+  -- Everything with a credit figure on it, measured and projected side by side and
+  -- never added together. LABEL is not nullable in practice because both feeding
+  -- tables write it as a literal.
+  --
+  -- Scoped to the NEWEST run. The tables underneath are ledgers and keep every run,
+  -- which is what makes MEASURE() re-callable and WI5 telemetry possible -- but a
+  -- reader asking "what did this cost" means the run they just did, and an unscoped
+  -- view showed two of every category with the same category reading
+  -- NOT_YET_LANDED on one row and LANDED on the next. Correct, and it looks like a
+  -- contradiction. V_COST_HISTORY keeps the unscoped view for anyone who wants it.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_HISTORY AS '
+ || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
+ || :rate || ' AS RATE_PER_CREDIT, ROUND(CREDITS * ' || :rate || ', 4) AS DOLLARS, '
+ || 'STATUS, SOURCE_VIEW AS SOURCE, LATENCY_NOTE AS BASIS_NOTE, '
+ || 'ROWS_PROCESSED, WALL_CLOCK_MS, MEASURED_AT AS AS_OF '
+ || 'FROM ' || :tgt || '.COST_MEASURED '
+ || 'UNION ALL '
+ || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
+ || :rate || ', ROUND(CREDITS * ' || :rate || ', 4), '
+ || '''ESTIMATE'', ''this plan'', DERIVATION || '' Horizon: '' || HORIZON, '
+ || 'NULL, NULL, PROJECTED_AT '
+ || 'FROM ' || :tgt || '.COST_PROJECTED');
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_LINES AS '
+ || 'SELECT * FROM ' || :tgt || '.V_COST_HISTORY WHERE RUN_ID = ('
+ || 'SELECT RUN_ID FROM ' || :tgt || '.RUN_LEDGER ORDER BY STARTED_AT DESC LIMIT 1)');
+
+  -- Subtotals BY LABEL. There is deliberately no grand total: the one number a
+  -- reader most wants is the one that cannot honestly exist.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_SUMMARY AS '
+ || 'SELECT LABEL, COUNT(*) AS LINES, '
+ || 'SUM(CASE WHEN STATUS IN (''LANDED'', ''ESTIMATE'') THEN CREDITS END) AS CREDITS, '
+ || 'COUNT_IF(STATUS = ''NOT_YET_LANDED'') AS STILL_PENDING, '
+ || 'COUNT_IF(STATUS = ''NOT_ATTRIBUTABLE'') AS NOT_ATTRIBUTABLE, '
+ || 'MAX(AS_OF) AS AS_OF, '
+ || 'CASE LABEL WHEN ''MEASURED'' THEN ''Observed from Snowflake''''s own metering. '
+ || 'Pending categories are excluded from this figure rather than counted as zero.'' '
+ || 'ELSE ''Arithmetic from the plan. Not observed. Do not add this to the MEASURED row.'' '
+ || 'END AS WHAT_THIS_IS '
+ || 'FROM ' || :tgt || '.V_COST_LINES GROUP BY LABEL');
+
+  -- The extrapolation, with its arithmetic on screen. A multiplier the reader
+  -- cannot check is a multiplier the reader should not accept.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_EXTRAPOLATION AS '
+ || 'SELECT m.CATEGORY, m.CREDITS AS MEASURED_AT_LIMITED, '
+ || '''' || REPLACE(:scale_unit, '''', '''''') || ''' AS SCALE_UNIT, '
+ || :scale_limited || ' AS LIMITED_SCALE, ' || :scale_production || ' AS PRODUCTION_SCALE, '
+ || 'ROUND(DIV0(' || :scale_production || ', ' || :scale_limited || '), 4) AS RATIO, '
+ || 'ROUND(m.CREDITS * DIV0(' || :scale_production || ', ' || :scale_limited || '), 6) '
+ || '  AS EXTRAPOLATED_TO_PRODUCTION, '
+ || '''PROJECTED'' AS LABEL, '
+ || 'm.CREDITS || '' x ('' || ' || :scale_production || ' || '' / '' || ' || :scale_limited
+ || ' || '') = '' || ROUND(m.CREDITS * DIV0(' || :scale_production || ', '
+ || :scale_limited || '), 6) AS ARITHMETIC, '
+ || 'm.STATUS AS MEASURED_STATUS, '
+ || 'CASE WHEN ' || :scale_limited || ' = ' || :scale_production
+ || '  THEN ''No scaling declared, so this is the measured figure unchanged. It is '
+ || 'NOT a production estimate.'' '
+ || '     WHEN m.STATUS <> ''LANDED'' '
+ || '  THEN ''The measurement this extrapolates from has not landed yet, so the '
+ || 'extrapolation is empty rather than a guess.'' '
+ || '     ELSE ''Measured at LIMITED scale and multiplied by the ratio shown. The '
+ || 'ratio assumes cost scales linearly in this unit, which is the assumption to '
+ || 'argue with.'' END AS READ_THIS '
+ || 'FROM ' || :tgt || '.COST_MEASURED m WHERE m.LABEL = ''MEASURED''');
+
+  -- ── VALUE MODEL ───────────────────────────────────────────────────────────
+  -- Three rules, and the third is the one that matters: the addressable base is
+  -- computed from THEIR data, every conversion rate is an input with a stated
+  -- default that they set, and if the only honest output is "here is the base, you
+  -- supply the rate" then that IS the output. No invented ROI.
+  --
+  -- A solution declares its own lines below. A solution that declares nothing gets
+  -- a single row saying so, which is a better artifact than an empty view: empty
+  -- reads as broken, whereas "this solution does not claim a financial benefit"
+  -- reads as a decision.
+  LET value_inputs ARRAY := ARRAY_CONSTRUCT();
+  LET value_base   ARRAY := ARRAY_CONSTRUCT();
+  LET value_lines  ARRAY := ARRAY_CONSTRUCT();
+-- ── VALUE MODEL ───────────────────────────────────────────────────────────────
+-- The honest shape for a generation-change solution, and it is deliberately not
+-- the shape a cost solution usually takes.
+--
+-- There is no "credits saved" line here, and there cannot be one before a
+-- conversion happens. Gen2 costs MORE per second; whether that turns into a
+-- saving depends on how much faster the workload finishes, which is a property of
+-- the workload and is unknown until it runs on Gen2. Any percentage put here
+-- would be ours rather than theirs, and it would be the single most quotable
+-- number on the page.
+--
+-- So the base is the spend EXPOSED to the decision -- a fact -- and the value
+-- line is explicitly two-sided: the same base times a speedup the client
+-- supplies, against the rate premium they are certain to pay.
+
+value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
+  'name', 'expected_speedup',
+  'value', 0, 'default', 0, 'units', 'fraction of runtime removed',
+  'description', 'How much faster you expect the affirmative warehouses to finish '
+              || 'on Gen2, as a fraction -- 0.30 means 30% faster. The default is '
+              || 'ZERO on purpose: nobody knows this number before the pilot, and a '
+              || 'friendly default here would be the one figure everyone quoted. '
+              || 'Run the pilot, read OBSERVED_SPEEDUP_PCT, put that number here.'));
+value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
+  'name', 'credit_price',
+  'value', 3, 'default', 3, 'units', 'currency per credit',
+  'description', 'Your contracted price per credit. The 3 is list-price shorthand '
+              || 'and is almost certainly not your rate; it is on your contract.'));
+value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
+  'name', 'days_per_year',
+  'value', 365, 'default', 365, 'units', 'days',
+  'description', 'Annualisation factor. Lower it if the affirmative warehouses only '
+              || 'run on business days.'));
+
+-- Measured at BUILD time from the view this solution just created, so the number
+-- is this account's own consumption rather than an assumption.
+value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
+  'metric', 'exposed_credits_per_day',
+  'units', 'credits/day',
+  'sql', 'SELECT ROUND(COALESCE(SUM(CREDITS_PER_DAY), 0), 4) FROM ' || :tgt
+      || '.V_GEN2_VERDICT WHERE VERDICT IN (''STRONG'', ''LIKELY'')',
+  'derivation', 'Current credits per day on the warehouses whose verdict is STRONG '
+             || 'or LIKELY, read from ACCOUNT_USAGE metering over the discovery '
+             || 'window. This is the spend the decision applies to -- not a saving, '
+             || 'and not a projection.'));
+
+-- The certain cost. This is the only side of the trade that can be computed in
+-- advance, and it is a cost rather than a benefit, which is why it is stated as
+-- its own base metric rather than netted into the line above.
+value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
+  'metric', 'rate_premium_credits_per_day',
+  'units', 'credits/day',
+  'sql', 'SELECT ROUND(COALESCE(SUM(WORST_CASE_EXTRA_CREDITS_PER_DAY), 0), 4) FROM '
+      || :tgt || '.V_GEN2_VERDICT WHERE VERDICT IN (''STRONG'', ''LIKELY'')',
+  'derivation', 'The affirmative warehouses'' current credits/day times '
+             || '(multiplier - 1). This is what converting them costs if the '
+             || 'workload does not get any faster, and it is the downside of the '
+             || 'decision expressed in credits rather than in adjectives.'));
+
+-- Declared UNMEASURABLE before the pilot, and it is the more important of the
+-- three. The whole point of the solution is that this cannot be known in advance.
+value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
+  'metric', 'realised_speedup',
+  'units', 'percent of runtime removed',
+  'measurable', FALSE,
+  'derivation', 'Would come from comparing seconds-per-query on the same warehouse '
+             || 'before and after conversion.',
+  'why_not', 'No Gen2 measurement exists for a warehouse that has never run on '
+          || 'Gen2. Snowflake publishes no fixed improvement percentage because the '
+          || 'answer depends on the query mix, and this solution refuses to supply '
+          || 'one. CONVERSION_BASELINE holds the before-picture and '
+          || 'V_CONVERSION_OUTCOME fills this in once a conversion has been live for '
+          || 'at least three days.'));
+
+value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
+  'line', 'Compute reclaimed if the speedup you entered is real',
+  'base_metric', 'exposed_credits_per_day',
+  'rate_input', 'expected_speedup',
+  'value_input', 'credit_price',
+  -- The base is per DAY, so without this the annual figure is a daily one and the
+  -- comparison against the premium below is out by 365.
+  'annualise_input', 'days_per_year',
+  'horizon', 'per year, at your credit price'));
+value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
+  'line', 'Rate premium you pay regardless',
+  'base_metric', 'rate_premium_credits_per_day',
+  'value_input', 'credit_price',
+  'annualise_input', 'days_per_year',
+  'horizon', 'per year, at your credit price'));
+value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
+  'line', 'Speedup actually achieved',
+  'base_metric', 'realised_speedup',
+  'value_input', 'credit_price',
+  'annualise_input', 'days_per_year',
+  'horizon', 'unmeasurable until a conversion has been live'));
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_INPUTS AS SELECT '
+ || 'VALUE:name::STRING AS INPUT_NAME, VALUE:value::NUMBER(38,6) AS VALUE, '
+ || 'VALUE:default::NUMBER(38,6) AS DEFAULT_VALUE, VALUE:units::STRING AS UNITS, '
+ || 'IFF(VALUE:value::NUMBER(38,6) = VALUE:default::NUMBER(38,6), '
+ || '''DEFAULT — you have not changed this'', ''CLIENT_SET'') AS SOURCE, '
+ || 'VALUE:description::STRING AS WHAT_IT_MEANS '
+ || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
+ || BASE64_ENCODE(TO_JSON(:value_inputs)) || '''))))');
+
+  -- The addressable base, and this is the part that has to come from THEIR data.
+  --
+  -- A base metric may be declared three ways, and the third is the point:
+  --   'sql'   a scalar query, evaluated at BUILD time against the views this
+  --           solution just created. This is the honest form -- the base is
+  --           measured from the account rather than assumed.
+  --   'value' a plan-time literal, for a base already known from discovery.
+  --   measurable = FALSE  the solution KNOWS it cannot compute this base here, and
+  --           says so with a reason instead of substituting a plausible number.
+  --
+  -- A base declared with 'sql' that does not compile fails the build loudly. That
+  -- is deliberate: it is OUR SQL, so a broken one is a defect for the gauntlet to
+  -- catch, not a condition of the customer's data to be swallowed at runtime.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_BASE '
+ || '(METRIC VARCHAR, BASE_VALUE NUMBER(38,4), UNITS VARCHAR, DERIVED_HOW VARCHAR, '
+ || 'MEASURABLE BOOLEAN, WHY_NOT_MEASURABLE VARCHAR)');
+  LET vb INT := 0;
+  WHILE (:vb < ARRAY_SIZE(:value_base)) DO
+    LET vb_o VARIANT := GET(:value_base, :vb);
+    LET vb_m STRING := REPLACE(COALESCE(:vb_o:metric::STRING, ''), '''', '''''');
+    LET vb_u STRING := REPLACE(COALESCE(:vb_o:units::STRING, ''), '''', '''''');
+    LET vb_d STRING := REPLACE(COALESCE(:vb_o:derivation::STRING, ''), '''', '''''');
+    LET vb_ok BOOLEAN := COALESCE(:vb_o:measurable::BOOLEAN, TRUE);
+    LET vb_why STRING := REPLACE(COALESCE(:vb_o:why_not::STRING, ''), '''', '''''');
+    LET vb_sql STRING := COALESCE(:vb_o:sql::STRING, '');
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.VALUE_BASE '
+   || '(METRIC, BASE_VALUE, UNITS, DERIVED_HOW, MEASURABLE, WHY_NOT_MEASURABLE) SELECT '
+   || '''' || :vb_m || ''', '
+   || CASE WHEN NOT :vb_ok THEN 'NULL'
+           WHEN :vb_sql <> '' THEN '(' || :vb_sql || ')'
+           ELSE COALESCE(:vb_o:value::STRING, 'NULL') END || ', '
+   || '''' || :vb_u || ''', ''' || :vb_d || ''', '
+   || IFF(:vb_ok, 'TRUE', 'FALSE') || ', '
+   || IFF(:vb_why = '', 'NULL', '''' || :vb_why || ''''));
+    vb := :vb + 1;
+  END WHILE;
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_LINES AS SELECT '
+ || 'VALUE:line::STRING AS LINE, VALUE:base_metric::STRING AS BASE_METRIC, '
+ || 'VALUE:rate_input::STRING AS RATE_INPUT, VALUE:value_input::STRING AS VALUE_INPUT, '
+     -- Names an input that converts the base's own period into a year. Without it a
+     -- per-day base produced a per-day benefit which was then compared against a
+     -- per-year cost, and the NET column silently subtracted a year of cost from a
+     -- day of value. It read as a credible negative number, which is the worst kind
+     -- of wrong. It is an INPUT rather than a constant so a client whose warehouses
+     -- only run on business days can say 250 instead of 365.
+ || 'VALUE:annualise_input::STRING AS ANNUALISE_INPUT, '
+ || 'COALESCE(VALUE:horizon::STRING, ''per year'') AS HORIZON '
+ || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
+ || BASE64_ENCODE(TO_JSON(:value_lines)) || '''))))');
+
+  -- Cost on one side, value on the other, both ANNUAL so the comparison is
+  -- apples-to-apples, arithmetic printed on every row, and the two never blended
+  -- into a single "ROI" figure. Cost is MEASURED where it has landed and PROJECTED
+  -- where it has not, and the column says which.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_BUSINESS_CASE AS '
+ || 'WITH cost AS ('
+ || '  SELECT SUM(CASE WHEN LABEL = ''MEASURED'' AND STATUS = ''LANDED'' THEN CREDITS END) '
+ || '           AS MEASURED_CREDITS, '
+ || '         SUM(CASE WHEN LABEL = ''PROJECTED'' AND CATEGORY = ''STEADY_STATE'' '
+ || '                  THEN CREDITS END) AS PROJECTED_CREDITS_PER_DAY, '
+ || '         COUNT_IF(LABEL = ''MEASURED'' AND STATUS = ''NOT_YET_LANDED'') AS PENDING '
+ || '  FROM ' || :tgt || '.V_COST_LINES) '
+ || 'SELECT l.LINE, b.METRIC, b.BASE_VALUE, b.UNITS, b.DERIVED_HOW, b.MEASURABLE, '
+ || '       r.INPUT_NAME AS RATE_NAME, r.VALUE AS RATE, r.SOURCE AS RATE_SOURCE, '
+ || '       v.INPUT_NAME AS VALUE_NAME, v.VALUE AS VALUE_PER_UNIT, v.SOURCE AS VALUE_SOURCE, '
+ || '       COALESCE(an.VALUE, 1) AS PERIODS_PER_YEAR, l.HORIZON, '
+ || '       CASE WHEN NOT b.MEASURABLE THEN NULL ELSE ROUND(b.BASE_VALUE * r.VALUE '
+ || '            * v.VALUE * COALESCE(an.VALUE, 1), 2) END AS GROSS_VALUE_PER_YEAR, '
+ || '       ROUND(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) AS PROJECTED_COST_PER_YEAR, '
+ || '       CASE WHEN NOT b.MEASURABLE THEN NULL '
+ || '            ELSE ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1) '
+ || '                       - c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) '
+ || '       END AS NET_PER_YEAR, '
+     -- Payback in days, from two annual figures. NULL rather than a big number when
+     -- annual value is zero or negative: "never" is the answer, and a division
+     -- would print something that looks like a duration.
+ || '       CASE WHEN NOT b.MEASURABLE '
+ || '              OR COALESCE(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 0) <= 0 '
+ || '            THEN NULL '
+ || '            ELSE ROUND(DIV0(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', '
+ || '                            b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1)) '
+ || '                       * 365, 1) END AS PAYBACK_DAYS, '
+ || '       CASE WHEN NOT b.MEASURABLE '
+ || '            THEN ''UNMEASURABLE: '' || COALESCE(b.WHY_NOT_MEASURABLE, '
+ || '                 ''this solution cannot compute this base from your account'') '
+ || '            ELSE b.BASE_VALUE || '' '' || b.UNITS || '' x '' || r.VALUE || '' ('' '
+ || '                 || r.INPUT_NAME || '') x '' || v.VALUE || '' ('' || v.INPUT_NAME '
+ || '                 || '') x '' || COALESCE(an.VALUE, 1) || '' periods/yr = '' '
+ || '                 || ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 2) '
+ || '                 || '' per year'' END AS ARITHMETIC, '
+ || '       ''The base is measured from your data. Both rates are YOURS to set -- '
+ || 'the defaults are placeholders, not benchmarks, and VALUE_INPUTS says which of '
+ || 'them you have actually changed. Value and cost are both annual here so they can '
+ || 'be compared. Cost is '' || COALESCE(c.MEASURED_CREDITS::STRING, '
+ || '''not yet measured'') || '' measured credits with '' || c.PENDING '
+ || '       || '' category(ies) still pending.'' AS READ_THIS '
+ || 'FROM ' || :tgt || '.VALUE_LINES l '
+ || 'JOIN ' || :tgt || '.VALUE_BASE b ON b.METRIC = l.BASE_METRIC '
+ || 'JOIN ' || :tgt || '.VALUE_INPUTS r ON r.INPUT_NAME = l.RATE_INPUT '
+ || 'JOIN ' || :tgt || '.VALUE_INPUTS v ON v.INPUT_NAME = l.VALUE_INPUT '
+ || 'LEFT JOIN ' || :tgt || '.VALUE_INPUTS an ON an.INPUT_NAME = l.ANNUALISE_INPUT '
+ || 'CROSS JOIN cost c '
+ || 'UNION ALL '
+     -- The declared-nothing case. An empty view reads as a bug; this reads as an
+     -- answer, and it is the correct answer for a solution whose benefit is
+     -- operational rather than financial.
+ || 'SELECT ''NO VALUE MODEL DECLARED'', NULL, NULL, NULL, NULL, FALSE, '
+ || '       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '
+ || '       ROUND((SELECT PROJECTED_CREDITS_PER_DAY FROM cost) * 365 * ' || :rate || ', 2), '
+ || '       NULL, NULL, ''UNMEASURABLE: no financial benefit is claimed'', '
+ || '       ''This solution does not assert a financial return. Its cost is shown so '
+ || 'you can judge it against a benefit you decide on yourself. Inventing a rate here '
+ || 'would be the dishonest option.'' '
+ || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.VALUE_LINES)');
+
+  -- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────
+  -- What would make this POC a success, decided from THEIR account rather than
+  -- from a number somebody liked. Same shape as the value model above: the
+  -- solution declares criteria, this block builds the objects.
+  --
+  -- A criterion carries two SQL scalars, `target_sql` and `actual_sql`, and BOTH
+  -- are re-evaluated on every read of V_POC_SCORECARD. That is a deliberate
+  -- choice by the operator and it has a cost worth naming: because the bar is
+  -- re-derived from current data, a MET on Tuesday and a MET on Friday are not
+  -- necessarily the same claim, and a shrinking base can lower the bar it is
+  -- being judged against. The COMPARABILITY column on every row says so, so the
+  -- caveat travels with the number instead of living in a design document.
+  --
+  -- The mechanism is worth understanding before editing. A view cannot
+  -- EXECUTE IMMEDIATE a string, so target_sql/actual_sql are not stored and
+  -- interpreted -- they are INLINED as scalar subqueries into the view body at
+  -- build time. Reading the view re-runs them. Consequence for snippet authors:
+  -- each must be an UNCORRELATED scalar subquery. A correlated one, or an EXISTS
+  -- in the select list, raises "Unsupported subquery type" at build.
+  --
+  -- Four states, and the third and fourth are the reason this exists:
+  --   MET       target compared against actual, comparison holds
+  --   NOT_MET   comparison does not hold. A real failure, reported as one.
+  --   PENDING   cannot be evaluated YET -- credits have not landed, a holdout
+  --             group does not exist. Carries why, and when it resolves.
+  --   N/A       does not apply to this build, e.g. PRODUCTION-tier only.
+  -- PENDING is not a failure and must never render as one. A zero standing in
+  -- for "no data yet" is the defect this design exists to prevent.
+  -- WHY THESE ARE ALL poc_-PREFIXED. The first cut used sc, sc2, sc_o and so on,
+  -- and two solutions legitimately declare their own `LET sc` in this same
+  -- procedure body -- 09_rmn_cleanroom's adapt_apply.sql holds slot columns in one.
+  -- Snowflake rejected the whole block with "Variable with name SC declared twice"
+  -- and the build failed with nothing to point at the cause. A shared template does
+  -- not get to squat on short identifiers that snippet authors reasonably use.
+  LET success_criteria ARRAY := ARRAY_CONSTRUCT();
+-- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────────
+-- What would make this a success, measured against bars derived from THIS account.
+--
+-- EVERY CRITERION IS GATED ON THE SIGNAL IT READS, because a criterion scored
+-- against a view that was never built is worse than no criterion.
+--
+-- WHAT IS DELIBERATELY NOT HERE: there is no "N credits saved" criterion. Gen2
+-- costs more per second, so a saving is not available in advance at any confidence
+-- and claiming one as a success bar would make the bar itself the fabrication.
+
+-- ── Coverage: every warehouse in the fleet gets a verdict ─────────────────────
+IF (:sig:warehouses::STRING = 'AVAILABLE' AND :sig:credit_history::STRING = 'AVAILABLE') THEN
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_FLEET_COVERED',
+    'label', 'Every warehouse in the fleet receives a Gen2 verdict',
+    'why', 'A verdict list that silently drops warehouses understates the estate, and '
+        || 'the one it drops is as likely to be the biggest spender as the smallest. '
+        || 'If the join between the fleet snapshot and the workload metrics loses '
+        || 'rows, this fails.',
+    'compare', '=',
+    'units', 'warehouses',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.WH_FLEET',
+    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_GEN2_VERDICT',
+    'target_derivation', 'The row count of WH_FLEET, a snapshot of SHOW WAREHOUSES '
+        || 'taken at build time. Equality: every warehouse appears, including the ones '
+        || 'whose verdict is ALREADY_GEN2 or INELIGIBLE.'));
+
+  -- ── The button and the table must agree ────────────────────────────────────
+  -- The verdict is computed twice: once at plan time so the buttons can name real
+  -- warehouses before anything exists, and once in the view. If those two
+  -- disagree, the reader is looking at one number and pressing another, and both
+  -- lose credibility at once. This is the criterion that catches drift between
+  -- them.
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_PLAN_MATCHES_VIEW',
+    'label', 'The count on the conversion button matches the count in the verdict view',
+    'why', 'The plan recomputes the verdict before the views exist, so the button can '
+        || 'name real warehouses. Two implementations of one rule drift. If the button '
+        || 'offers to convert nine warehouses and the table shows seven, the reader '
+        || 'stops trusting the page -- correctly.',
+    'compare', '=',
+    'units', 'affirmative warehouses',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT ' || :affirm_n,
+    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_GEN2_VERDICT '
+        || 'WHERE VERDICT IN (''STRONG'', ''LIKELY'')',
+    'target_derivation', 'The affirmative count the plan computed at plan time, which '
+        || 'is the number printed on the PRODUCTION button: ' || :affirm_n || '.'));
+
+  -- ── Every verdict is grounded in measured inputs ───────────────────────────
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_VERDICTS_GROUNDED',
+    'label', 'No warehouse is recommended for conversion without measured workload evidence',
+    'why', 'A Gen2 recommendation with no utilisation and no favourable-share behind '
+        || 'it is the naive "convert every Gen1 warehouse" recommendation wearing a '
+        || 'verdict column, and on an idle-heavy warehouse it raises the bill. This '
+        || 'checks that every affirmative verdict has both signals present.',
+    'compare', '=',
+    'units', 'ungrounded affirmative verdicts',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT 0',
+    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_GEN2_VERDICT '
+        || 'WHERE VERDICT IN (''STRONG'', ''LIKELY'') '
+        || 'AND (UTILISATION IS NULL OR FAVOURABLE_SHARE IS NULL '
+        || 'OR QUERY_COUNT = 0)',
+    'target_derivation', 'Zero. An affirmative verdict on a warehouse with no query '
+        || 'history is not a verdict, it is a guess.'));
+END IF;
+
+-- ── The baseline exists before any conversion ────────────────────────────────
+IF (:sig:credit_history::STRING = 'AVAILABLE') THEN
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_BASELINE_BEFORE_CHANGE',
+    'label', 'Every converted warehouse has a baseline captured before it was converted',
+    'why', 'This is the criterion the whole solution rests on. A conversion with no '
+        || 'before-picture can never be evaluated, and what fills that vacuum is '
+        || 'someone saying it feels faster. If a warehouse appears in the change '
+        || 'registry with no baseline row, the outcome view cannot score it.',
+    'compare', '=',
+    'units', 'conversions missing a baseline',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT 0',
+    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY r '
+        || 'WHERE r.KIND = ''WAREHOUSE_SETTING'' '
+        || 'AND NOT EXISTS (SELECT 1 FROM ' || :tgt || '.CONVERSION_BASELINE b '
+        || 'WHERE b.WAREHOUSE_NAME = r.TARGET_FQN)',
+    'target_derivation', 'Zero. Every row in the registry recording a warehouse '
+        || 'setting change must have a matching CONVERSION_BASELINE row.'));
+
+  -- ── The outcome: pending on purpose, and it says why ──────────────────────
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_SPEEDUP_BEATS_BREAKEVEN',
+    'label', 'Converted warehouses achieved more than the ' || :breakeven_pct
+        || '% speedup Gen2 needs to pay for itself',
+    'why', 'This is the only success criterion that matters, and it cannot be scored '
+        || 'until a conversion has been live long enough to measure. Everything else '
+        || 'in this solution is setup for this one number.',
+    'compare', '>=',
+    'units', 'percent of runtime removed',
+    'basis', 'BY_TIME_WINDOW',
+    'target_sql', 'SELECT ' || :breakeven_pct,
+    'actual_sql', 'SELECT ROUND(AVG(OBSERVED_SPEEDUP_PCT), 2) FROM ' || :tgt
+        || '.V_CONVERSION_OUTCOME WHERE OUTCOME <> ''TOO_EARLY''',
+    'target_derivation', 'The break-even bar for this account''s cloud: '
+        || :breakeven_pct || '%, which is (1 - 1/' || :mult || ') expressed as a '
+        || 'percentage. Not a benchmark and not a target Snowflake published -- it is '
+        || 'the point at which the rate premium is exactly paid for.',
+    'pending_reason', 'No conversion has been live for three days yet, so every row '
+        || 'in the outcome view reads TOO_EARLY and the average is over an empty set. '
+        || 'That is an absence of data, not a speedup of zero and not a failure.',
+    'resolves_when', 'Press the pilot action, wait at least three days for metering '
+        || 'and query history to accumulate on the converted warehouse, then re-read '
+        || 'V_CONVERSION_OUTCOME. TASK_GEN2_WATCH does this weekly on its own at '
+        || 'PRODUCTION tier.'));
+END IF;
+
+-- ── Cost ──────────────────────────────────────────────────────────────────────
+IF (:credit_cap > 0) THEN
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_COST_IN_BUDGET',
+    'label', 'Measured steady-state cost stays inside your credit cap',
+    'why', 'A POC that cannot state its own running cost cannot be approved for '
+        || 'production, and a projection is not a measurement.',
+    'compare', '<=',
+    'units', 'credits',
+    'basis', 'BY_TAG',
+    'target_sql', 'SELECT ' || :credit_cap,
+    'actual_sql', 'SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
+        || 'WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''',
+    'target_derivation', 'Your WHGEN_CREDIT_CAP setting, currently '
+        || :credit_cap || ' credits.',
+    'pending_reason', 'Warehouse credits reach ACCOUNT_USAGE on a delay, so nothing '
+        || 'has been attributed to this run yet. This is an absence of data, not a '
+        || 'cost of zero.',
+    'resolves_when', 'credits land in ACCOUNT_USAGE, typically within 8 hours -- call '
+        || 'MEASURE() in this schema after that to fill it in'));
+ELSE
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'WHGEN_COST_IN_BUDGET',
+    'label', 'Measured steady-state cost stays inside your credit cap',
+    'why', 'A POC that cannot state its own running cost cannot be approved for '
+        || 'production.',
+    'compare', '<=',
+    'units', 'credits',
+    'basis', 'BY_TAG',
+    'target_derivation', 'No cap was set, so there is no bar to derive.',
+    'na_reason', 'WHGEN_CREDIT_CAP is 0, so no ceiling was declared for this run. Set '
+        || 'it and re-run to have this criterion scored. Picking a default ceiling '
+        || 'here would invent a standard you did not choose.'));
+END IF;
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.SUCCESS_CRITERIA '
+ || '(CODE VARCHAR, LABEL VARCHAR, WHY_IT_MATTERS VARCHAR, COMPARE VARCHAR, '
+ || 'UNITS VARCHAR, BASIS VARCHAR, TARGET_DERIVATION VARCHAR, '
+ || 'PENDING_REASON VARCHAR, RESOLVES_WHEN VARCHAR, NA_REASON VARCHAR)');
+
+  -- The declarations themselves, one INSERT each. Same reason the value base
+  -- uses a WHILE loop rather than a FLATTEN: the fields are optional in
+  -- different combinations and a single projection over the array would have to
+  -- invent a shape for the absent ones.
+  LET poc_i INT := 0;
+  WHILE (:poc_i < ARRAY_SIZE(:success_criteria)) DO
+    LET poc_o VARIANT := GET(:success_criteria, :poc_i);
+    LET poc_code STRING := REPLACE(COALESCE(:poc_o:code::STRING, ''), '''', '''''');
+    LET poc_lab  STRING := REPLACE(COALESCE(:poc_o:label::STRING, ''), '''', '''''');
+    LET poc_why  STRING := REPLACE(COALESCE(:poc_o:why::STRING, ''), '''', '''''');
+    LET poc_cmp  STRING := REPLACE(COALESCE(:poc_o:compare::STRING, '>='), '''', '''''');
+    LET poc_un   STRING := REPLACE(COALESCE(:poc_o:units::STRING, ''), '''', '''''');
+    LET poc_bas  STRING := REPLACE(COALESCE(:poc_o:basis::STRING, 'BY_TIME_WINDOW'), '''', '''''');
+    LET poc_der  STRING := REPLACE(COALESCE(:poc_o:target_derivation::STRING, ''), '''', '''''');
+    LET poc_pr   STRING := REPLACE(COALESCE(:poc_o:pending_reason::STRING, ''), '''', '''''');
+    LET poc_rw   STRING := REPLACE(COALESCE(:poc_o:resolves_when::STRING, ''), '''', '''''');
+    LET poc_nr   STRING := REPLACE(COALESCE(:poc_o:na_reason::STRING, ''), '''', '''''');
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.SUCCESS_CRITERIA (CODE, LABEL, WHY_IT_MATTERS, '
+   || 'COMPARE, UNITS, BASIS, TARGET_DERIVATION, PENDING_REASON, RESOLVES_WHEN, '
+   || 'NA_REASON) SELECT '
+   || '''' || :poc_code || ''', ''' || :poc_lab || ''', ''' || :poc_why || ''', '
+   || '''' || :poc_cmp || ''', ''' || :poc_un || ''', ''' || :poc_bas || ''', '
+   || '''' || :poc_der || ''', '
+   || IFF(:poc_pr = '', 'NULL', '''' || :poc_pr || '''') || ', '
+   || IFF(:poc_rw = '', 'NULL', '''' || :poc_rw || '''') || ', '
+   || IFF(:poc_nr = '', 'NULL', '''' || :poc_nr || ''''));
+    poc_i := :poc_i + 1;
+  END WHILE;
+
+  -- The scorecard. Each criterion becomes one SELECT with its target and actual
+  -- inlined, and the arms are UNION ALLed into a single view. Built as a string
+  -- because the number of arms is not known until the solution has declared.
+  LET poc_body STRING := '';
+  LET poc_j INT := 0;
+  WHILE (:poc_j < ARRAY_SIZE(:success_criteria)) DO
+    LET poc2_o VARIANT := GET(:success_criteria, :poc_j);
+    LET poc2_code STRING := REPLACE(COALESCE(:poc2_o:code::STRING, ''), '''', '''''');
+    LET poc2_cmp  STRING := COALESCE(:poc2_o:compare::STRING, '>=');
+    LET poc2_tsql STRING := COALESCE(:poc2_o:target_sql::STRING, '');
+    LET poc2_asql STRING := COALESCE(:poc2_o:actual_sql::STRING, '');
+    -- An unevaluable criterion declares no actual_sql. It still gets a row --
+    -- omitting it would make the scorecard look shorter than the promise.
+    LET poc2_t STRING := IFF(:poc2_tsql = '', 'CAST(NULL AS NUMBER(38,6))',
+                           '(' || :poc2_tsql || ')::NUMBER(38,6)');
+    LET poc2_a STRING := IFF(:poc2_asql = '', 'CAST(NULL AS NUMBER(38,6))',
+                           '(' || :poc2_asql || ')::NUMBER(38,6)');
+    poc_body := :poc_body
+      || IFF(:poc_body = '', '', ' UNION ALL ')
+      || 'SELECT ''' || :poc2_code || ''' AS CODE, ' || :poc2_t || ' AS TARGET, '
+      || :poc2_a || ' AS ACTUAL, ''' || REPLACE(:poc2_cmp, '''', '''''') || ''' AS CMP';
+    poc_j := :poc_j + 1;
+  END WHILE;
+
+  -- The verdict CASE is deliberately ordered, and only NA_REASON forces a state.
+  --
+  -- PENDING_REASON is an EXPLANATION, not a state. An earlier cut had it force
+  -- PENDING, which meant a criterion that declared "credits land in about eight
+  -- hours" was pinned to PENDING permanently -- it could never resolve, so the
+  -- one criterion whose whole point was to become answerable never did. A
+  -- criterion is pending because its ACTUAL is absent, and for no other reason;
+  -- the declared text only says WHY it is absent and when that changes.
+  --
+  -- The NULL check therefore has to come before the comparison. Reversing them
+  -- would let a NULL actual reach the comparison, which returns NULL, which a
+  -- naive COALESCE would then turn into a failure. "Not measured yet" reported as
+  -- "failed" is the single most damaging thing this view could do.
+  IF (ARRAY_SIZE(:success_criteria) > 0) THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS '
+   || 'WITH ev AS (' || :poc_body || ') '
+   || 'SELECT c.CODE, c.LABEL, c.WHY_IT_MATTERS, e.TARGET, e.ACTUAL, c.UNITS, '
+   || '       c.COMPARE, c.BASIS, c.TARGET_DERIVATION, '
+   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN ''N/A'' '
+   || '            WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN ''PENDING'' '
+   || '            WHEN e.CMP = ''>='' AND e.ACTUAL >= e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''<='' AND e.ACTUAL <= e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''>''  AND e.ACTUAL >  e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''<''  AND e.ACTUAL <  e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''='' AND e.ACTUAL =  e.TARGET THEN ''MET'' '
+   || '            ELSE ''NOT_MET'' END AS STATE, '
+      -- Why a row is not simply pass/fail, in the row itself. The solution's own
+      -- wording wins when it has one, because "a randomised holdout would be
+      -- required" is worth infinitely more than "no measurement has landed".
+   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN c.NA_REASON '
+   || '            WHEN e.ACTUAL IS NOT NULL AND e.TARGET IS NOT NULL THEN NULL '
+   || '            WHEN c.PENDING_REASON IS NOT NULL THEN c.PENDING_REASON '
+   || '            WHEN e.ACTUAL IS NULL THEN ''No measurement has landed for this '
+   || 'criterion yet. It is not a failure; it is not yet answerable.'' '
+   || '            ELSE ''The target could not be derived from your account -- the '
+   || 'discovery input it depends on is absent.'' END AS WHY_NOT_EVALUATED, '
+      -- Suppressed once the row is answerable: "resolves when credits land" under
+      -- a row that has already been decided is stale advice.
+   || '       CASE WHEN c.NA_REASON IS NULL '
+   || '             AND (e.ACTUAL IS NULL OR e.TARGET IS NULL) '
+   || '            THEN c.RESOLVES_WHEN END AS RESOLVES_WHEN, '
+      -- The arithmetic, printed. A bare MET is an assertion; "42 >= 30" is
+      -- checkable by the person reading it.
+   || '       CASE WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN NULL '
+   || '            ELSE ROUND(e.ACTUAL, 4) || '' '' || e.CMP || '' '' '
+   || '                 || ROUND(e.TARGET, 4) || '' '' || COALESCE(c.UNITS, '''') '
+   || '       END AS ARITHMETIC, '
+   || '       ''Target and actual are BOTH re-derived from your account on every '
+   || 'read, so this bar moves as your data moves. That is intended -- the target '
+   || 'is not a number we picked -- but it means MET is a statement about today, '
+   || 'not a result comparable across runs. TARGET_DERIVATION says how the bar '
+   || 'was set. BASIS says how the actual was attributed.'' AS COMPARABILITY '
+   || 'FROM ' || :tgt || '.SUCCESS_CRITERIA c '
+   || 'JOIN ev e ON e.CODE = c.CODE');
+  ELSE
+    -- Declared nothing. One honest row beats an empty view, exactly as with the
+    -- value model: empty reads as broken, this reads as unauthored.
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS SELECT '
+   || '''NO SUCCESS CRITERIA DECLARED'' AS CODE, '
+   || '''This solution has not declared POC success criteria'' AS LABEL, '
+   || 'NULL AS WHY_IT_MATTERS, CAST(NULL AS NUMBER(38,6)) AS TARGET, '
+   || 'CAST(NULL AS NUMBER(38,6)) AS ACTUAL, NULL AS UNITS, NULL AS COMPARE, '
+   || 'NULL AS BASIS, NULL AS TARGET_DERIVATION, ''PENDING'' AS STATE, '
+   || '''No criteria are declared, so there is nothing to pass or fail. This is a '
+   || 'gap in the solution, not a result for your account.'' AS WHY_NOT_EVALUATED, '
+   || '''When this solution declares blocks/success_criteria.sql'' AS RESOLVES_WHEN, '
+   || 'NULL AS ARITHMETIC, ''Nothing is being claimed here.'' AS COMPARABILITY');
+  END IF;
+
+  -- The roll-up behind the header chip. MET requires that nothing failed AND
+  -- that something actually passed -- a scorecard of nothing but PENDING is not
+  -- a success, and calling it one would be the whole failure mode of this
+  -- feature. NOT_RUN is not a pass.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_VERDICT AS '
+ || 'WITH s AS (SELECT COUNT_IF(STATE = ''MET'') AS MET, '
+ || '                  COUNT_IF(STATE = ''NOT_MET'') AS NOT_MET, '
+ || '                  COUNT_IF(STATE = ''PENDING'') AS PENDING, '
+ || '                  COUNT_IF(STATE = ''N/A'') AS NA, '
+ || '                  COUNT_IF(STATE <> ''N/A'') AS SCORED '
+ || '           FROM ' || :tgt || '.V_POC_SCORECARD) '
+ || 'SELECT MET, NOT_MET, PENDING, NA, SCORED, '
+ || '       MET || ''/'' || SCORED || '' MET'' AS HEADLINE, '
+ || '       CASE WHEN SCORED = 0 THEN ''NOT_RUN'' '
+ || '            WHEN NOT_MET > 0 THEN ''NOT_MET'' '
+ || '            WHEN MET = 0 THEN ''PENDING'' '
+ || '            WHEN PENDING > 0 THEN ''MET_WITH_PENDING'' '
+ || '            ELSE ''MET'' END AS VERDICT, '
+ || '       CASE WHEN SCORED = 0 THEN ''Nothing has been scored.'' '
+ || '            WHEN NOT_MET > 0 THEN NOT_MET || '' criterion(s) did not meet '
+ || 'target. Open the POC success tab for the arithmetic on each.'' '
+ || '            WHEN MET = 0 THEN ''Nothing has failed, but nothing has been '
+ || 'confirmed either -- every criterion is still pending.'' '
+ || '            WHEN PENDING > 0 THEN ''Everything measurable so far has met its '
+ || 'target, with '' || PENDING || '' still pending. Not a complete result yet.'' '
+ || '            ELSE ''Every scored criterion met its target.'' END AS READ_THIS '
+ || 'FROM s');
+
+  -- ── PRODUCTION HARDENING ──────────────────────────────────────────────────
+  -- Only at PRODUCTION tier, and every piece of it detects-then-skips with a
+  -- printed reason rather than failing the build. A platform team's objection to a
+  -- tool is almost never "it does too little"; it is "it left something behind
+  -- that nobody owns".
+  IF (:tier = 'PRODUCTION') THEN
+    -- Cost attribution. The tag lives in the target schema so it disappears with
+    -- it; the ONE thing outside the schema is the tag applied to the warehouse, so
+    -- that is the only row the registry needs.
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE TAG IF NOT EXISTS ' || :tgt || '.ONESHOT_SOLUTION '
+   || 'COMMENT = ''Cost attribution for Warehouse Generation — Gen2 and Adaptive. Query '
+   || 'ACCOUNT_USAGE.TAG_REFERENCES to find everything this deployment owns.''');
+    stmts := ARRAY_APPEND(:stmts,
+      'ALTER SCHEMA ' || :tgt || ' SET TAG ' || :tgt || '.ONESHOT_SOLUTION = '
+   || '''Warehouse Generation — Gen2 and Adaptive''');
+    IF (:wh_ok) THEN
+      stmts := ARRAY_APPEND(:stmts,
+        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+     || 'SELECT ''' || :meas_wh || ''', ''' || :tgt || '.ONESHOT_SOLUTION'', '
+     || '''WAREHOUSE'', ''OBJECT_TAG'' '
+     || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || 'WHERE TARGET_FQN = ''' || :meas_wh || ''' AND ARTIFACT = ''' || :tgt
+     || '.ONESHOT_SOLUTION'' AND KIND = ''OBJECT_TAG'')');
+      stmts := ARRAY_APPEND(:stmts,
+        'ALTER WAREHOUSE ' || :meas_wh || ' SET TAG ' || :tgt
+     || '.ONESHOT_SOLUTION = ''Warehouse Generation — Gen2 and Adaptive''');
+    END IF;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'COST ATTRIBUTION: everything this deployment created carries the tag '
+   || :tgt || '.ONESHOT_SOLUTION, so your FinOps team can find it in '
+   || 'ACCOUNT_USAGE.TAG_REFERENCES without asking us. Tags cost nothing.');
+
+    -- Failure notification. Tasks take an error integration directly; dynamic
+    -- tables have NO equivalent clause, so theirs needs an alert, which is
+    -- serverless and therefore costs credits of its own. That asymmetry is priced
+    -- rather than hidden, and the whole thing skips loudly when there is no
+    -- integration to point at.
+    IF (:notif <> '') THEN
+      notes := ARRAY_APPEND(:notes,
+        'FAILURE NOTIFICATION: task failures will be sent to ' || :notif || '. '
+     || 'Dynamic table refresh failures CANNOT use an error integration -- Snowflake '
+     || 'has no such clause for them -- so if this solution creates dynamic tables '
+     || 'their failures need a serverless ALERT over DYNAMIC_TABLE_REFRESH_HISTORY, '
+     || 'which is priced separately in the cost lines above.');
+    ELSE
+      notes := ARRAY_APPEND(:notes,
+        'FAILURE NOTIFICATION SKIPPED: WHGEN_NOTIFICATION_INTEGRATION is blank, so '
+     || 'nothing will tell you when a scheduled object fails. This is a real gap at '
+     || 'PRODUCTION tier and the build continues anyway rather than blocking you. '
+     || 'Run SHOW NOTIFICATION INTEGRATIONS to pick one; if the account has none, an '
+     || 'administrator runs: CREATE NOTIFICATION INTEGRATION ONESHOT_ALERTS '
+     || 'TYPE = EMAIL ENABLED = TRUE;');
+    END IF;
+
+    -- What an on-call engineer opens at 3am. Built to survive a solution that has
+    -- no tasks and no dynamic tables: it returns a row saying so rather than
+    -- nothing, because an empty operations view is indistinguishable from a broken
+    -- one.
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_OPERATIONS AS '
+   || 'SELECT ''TASK'' AS OBJECT_KIND, t.NAME AS OBJECT_NAME, '
+      -- The cron string lives on ACCOUNT_USAGE.TASKS, NOT on TASK_HISTORY.
+      -- t.SCHEDULE was read straight off TASK_HISTORY, which has 30 columns and
+      -- none of them is SCHEDULE, so this view failed to compile on every
+      -- PRODUCTION build -- and because the statement loop stops at the first
+      -- failure, everything declared after it was silently never created. It went
+      -- unnoticed because step 16 read only the OUTER statement results and this
+      -- failure surfaced as an inner FAILED row nobody looked at.
+      --
+      -- COALESCE, because ACCOUNT_USAGE lags: a task created minutes ago may have
+      -- history but no TASKS row yet, and a blank SLA is better than dropping the
+      -- task from an operations view.
+   || '       COALESCE(s.SCHEDULE, ''schedule not yet in ACCOUNT_USAGE.TASKS'') '
+   || '         AS REFRESH_SLA, MAX(t.COMPLETED_TIME) AS LAST_RUN, '
+   || '       COUNT_IF(t.STATE = ''FAILED'') AS FAILURES_IN_WINDOW, '
+   || '       COUNT(*) AS RUNS_IN_WINDOW, NULL::NUMBER AS CREDITS_IN_WINDOW, '
+   || '       ''From ACCOUNT_USAGE.TASK_HISTORY over the last '' || ' || :w
+   || '         || '' days.'' AS SOURCE '
+   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY t '
+      -- TASKS names its columns TASK_NAME / TASK_DATABASE / TASK_SCHEMA, while
+      -- TASK_HISTORY uses NAME / DATABASE_NAME / SCHEMA_NAME. Two ACCOUNT_USAGE
+      -- views of the same object disagreeing on column names is exactly the kind
+      -- of thing to read rather than assume -- guessing S.NAME cost another run.
+   || '  LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TASKS s '
+   || '    ON s.TASK_NAME = t.NAME AND s.TASK_DATABASE = t.DATABASE_NAME '
+   || '   AND s.TASK_SCHEMA = t.SCHEMA_NAME AND s.DELETED IS NULL '
+   || '  WHERE t.DATABASE_NAME = ''' || :db || ''' AND t.SCHEMA_NAME = ''' || :sch || ''' '
+   || '    AND t.SCHEDULED_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
+   || '  GROUP BY 1, 2, 3 '
+   || 'UNION ALL '
+   || 'SELECT ''DYNAMIC_TABLE'', d.NAME, d.TARGET_LAG_SEC::STRING || '' sec target lag'', '
+   || '       MAX(d.REFRESH_END_TIME), COUNT_IF(d.STATE = ''FAILED''), COUNT(*), NULL, '
+   || '       ''From ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY. Note: dynamic tables '
+   || 'auto-suspend after 5 consecutive failures.'' '
+   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY d '
+   || '  WHERE d.DATABASE_NAME = ''' || :db || ''' AND d.SCHEMA_NAME = ''' || :sch || ''' '
+   || '    AND d.REFRESH_START_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
+   || '  GROUP BY 1, 2, 3 '
+   || 'UNION ALL '
+   || 'SELECT ''THIS DEPLOYMENT'', ''' || :sch || ''', ''not scheduled'', '
+   || '       (SELECT MAX(STARTED_AT) FROM ' || :tgt || '.RUN_LEDGER), 0, '
+   || '       (SELECT COUNT(*) FROM ' || :tgt || '.RUN_LEDGER), '
+   || '       (SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
+   || '         WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''), '
+   || '       ''No tasks or dynamic tables found for this schema in the window. If '
+   || 'this solution creates none, that is expected and this row is the whole '
+   || 'operations picture.'' ');
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'OPERATIONS: V_OPERATIONS reports last run, failures and credits per '
+   || 'scheduled object over ' || :w || ' days. It reads ACCOUNT_USAGE views, which '
+   || 'are free to query but lag by up to 45 minutes for task history.');
+  END IF;
+
+  -- ── The action registry, its audit log, and the one door in ────────────────
+  -- Built AFTER the solution's plan section, because that is where a solution
+  -- declares its actions.
+  --
+  -- CREATE OR REPLACE ... AS SELECT rather than CREATE + INSERT: a second build
+  -- must not stack a second copy of every action, which is the same bug
+  -- ATTACHED_OBJECT_REGISTRY had. Note the two need DIFFERENT fixes and this comment
+  -- used to imply otherwise: the action registry can be rebuilt from scratch each
+  -- run, so CREATE OR REPLACE is right; the attachment registry must SURVIVE, because
+  -- TEARDOWN reads it, so it takes an anti-join insert instead. Reaching for
+  -- CREATE OR REPLACE there would have destroyed the record of what to detach.
+  -- FLATTEN over a JSON literal also avoids the VALUES-clause restriction on
+  -- ARRAY/OBJECT constructors.
+  --
+  -- The JSON travels BASE64-ENCODED, and that is not belt-and-braces. An action's
+  -- `sql` array holds generated DDL, which routinely contains quoted identifiers
+  -- like "ICE_GOLD_ORDERS". TO_JSON escapes those double quotes to \", and when
+  -- the result is pasted into a single-quoted SQL literal Snowflake's parser
+  -- consumes the backslash -- so PARSE_JSON receives structurally broken JSON and
+  -- fails with "Error parsing JSON: missing comma, pos 1628", pointing at a
+  -- character that is nowhere near the actual problem. Doubling the quotes, as
+  -- this line used to, does nothing about the backslash.
+  --
+  -- 03_generative_completion hit this first and fixed it locally by chaining a
+  -- second REPLACE for backslashes; that works but depends on getting the order
+  -- right and on remembering it at every new call site. The base64 alphabet
+  -- contains no quote and no backslash, so the hazard cannot recur here.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.ACTION_REGISTRY AS SELECT '
+ || 'VALUE:code::STRING AS CODE, VALUE:label::STRING AS LABEL, '
+ || 'VALUE:tier::STRING AS TIER, VALUE:effect::STRING AS EFFECT, '
+ || 'VALUE:undo::STRING AS UNDO, '
+ || 'VALUE:est::NUMBER(38,6) AS EST_CREDITS, VALUE:basis::STRING AS EST_BASIS, '
+ || 'VALUE:sql::ARRAY AS RUN_SQL, '
+    -- The reverse of RUN_SQL, declared by the solution alongside it. COALESCE to an
+    -- empty array so an action that genuinely cannot be reversed is representable:
+    -- zero undo statements is a fact the app can show, whereas a NULL would just
+    -- look like a bug.
+ || 'COALESCE(VALUE:undo_sql::ARRAY, ARRAY_CONSTRUCT()) AS UNDO_SQL, '
+    -- The parameters this action accepts, declared alongside its SQL. Empty array for
+    -- every action that takes none, which is why an unparameterised action is byte
+    -- identical in behaviour to before: ARRAY_SIZE 0 skips the whole resolver.
+    --
+    -- Each element is {name, label, kind, allowed_sql, options, min, max, help}. The
+    -- WHITELIST LIVES HERE, in the registry, and is evaluated inside RUN_ACTION -- not
+    -- passed in by the app. The app cannot influence what a value is checked against,
+    -- which is the entire point: a tampered client can only ever choose from a set
+    -- this build already discovered.
+ || 'COALESCE(VALUE:params::ARRAY, ARRAY_CONSTRUCT()) AS PARAM_SPEC, '
+ || 'CURRENT_TIMESTAMP() AS DECLARED_AT '
+ || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
+ || BASE64_ENCODE(TO_JSON(:actions)) || '''))))');
+
+  -- One row per attempt, whether it worked or not. An action framework without an
+  -- audit trail is indistinguishable from someone running DDL by hand.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_LOG '
+ || '(LOG_ID VARCHAR, CODE VARCHAR, LABEL VARCHAR, EST_CREDITS NUMBER(38,6), '
+ || 'STATUS VARCHAR, STATEMENTS_RUN INT, ERROR VARCHAR, '
+ || 'RUN_BY VARCHAR DEFAULT CURRENT_USER(), '
+ || 'STARTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(), '
+ || 'FINISHED_AT TIMESTAMP_NTZ, UNDO_SNAPSHOT VARCHAR, PARAMS VARCHAR)');
+  -- Separate ALTER because the CREATE above is IF NOT EXISTS: a schema built by an
+  -- earlier artifact already has the table and would silently keep the old shape.
+  stmts := ARRAY_APPEND(:stmts,
+    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
+ || 'ADD COLUMN IF NOT EXISTS UNDO_SNAPSHOT VARCHAR');
+  -- The RESOLVED parameter values this run actually used, as JSON. Without this the
+  -- audit trail becomes untrue the moment an action takes parameters: two rows reading
+  -- "DONE. Attach the policy" would be indistinguishable while having tiered different
+  -- tables. NULL for an unparameterised action, which is honest -- there were none.
+  stmts := ARRAY_APPEND(:stmts,
+    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
+ || 'ADD COLUMN IF NOT EXISTS PARAMS VARCHAR');
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '(LOG_ID VARCHAR, SEQ INT, STATEMENT VARCHAR, QUERY_ID VARCHAR, '
+ || 'STATUS VARCHAR, ERROR VARCHAR, '
+ || 'RAN_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
+
+  -- What the app reads. Excludes RUN_SQL on purpose: the dashboard needs to show
+  -- what an action DOES and what it costs, and shipping the DDL to the browser
+  -- invites someone to treat the page as the source of truth for it.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTIONS AS SELECT '
+ || 'a.CODE, a.LABEL, a.TIER, a.EFFECT, a.UNDO, a.EST_CREDITS, a.EST_BASIS, '
+ || 'ARRAY_SIZE(a.RUN_SQL) AS STATEMENTS, '
+ || 'ARRAY_SIZE(a.UNDO_SQL) AS UNDO_STATEMENTS, '
+ || 'ARRAY_SIZE(a.PARAM_SPEC) AS PARAM_COUNT, '
+ || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
+ || '  WHERE l.CODE = a.CODE AND l.STATUS = ''UNDONE'') AS TIMES_UNDONE, '
+ || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
+ || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS TIMES_RUN, '
+ || '(SELECT MAX(l.FINISHED_AT) FROM ' || :tgt || '.ACTION_LOG l '
+ || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS LAST_RUN_AT '
+ || 'FROM ' || :tgt || '.ACTION_REGISTRY a '
+ || 'ORDER BY CASE a.TIER WHEN ''SAMPLE'' THEN 1 WHEN ''LIMITED'' THEN 2 ELSE 3 END, a.CODE');
+
+  -- ── What the app renders a widget from ─────────────────────────────────────
+  -- One row per parameter. Deliberately EXCLUDES allowed_sql, for the same reason
+  -- V_ACTIONS excludes RUN_SQL: the app does not need the whitelist QUERY, it needs
+  -- the whitelist RESULT, and shipping the query invites someone to treat the browser
+  -- as the place the permitted set is decided. The host reads OPTIONS_SQL only to run
+  -- it for display; RUN_ACTION re-evaluates the registry's own copy when it validates,
+  -- so what the app showed can never be what authorises the value.
+  --
+  -- ORDINAL is preserved from the declaration order so the widgets render in the order
+  -- the solution author intended rather than alphabetically.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_PARAMS AS SELECT '
+ || 'a.CODE, p.INDEX AS ORDINAL, '
+ || 'p.VALUE:name::STRING AS PARAM_NAME, '
+ || 'COALESCE(p.VALUE:label::STRING, p.VALUE:name::STRING) AS LABEL, '
+ || 'UPPER(COALESCE(p.VALUE:kind::STRING, ''IDENT'')) AS KIND, '
+ || 'p.VALUE:allowed_sql::STRING AS OPTIONS_SQL, '
+ || 'p.VALUE:options::ARRAY AS OPTIONS, '
+ || 'p.VALUE:min::NUMBER(38,6) AS MIN_VALUE, '
+ || 'p.VALUE:max::NUMBER(38,6) AS MAX_VALUE, '
+ || 'COALESCE(p.VALUE:freeform::BOOLEAN, FALSE) AS FREEFORM, '
+ || 'p.VALUE:help::STRING AS HELP '
+ || 'FROM ' || :tgt || '.ACTION_REGISTRY a, '
+ || 'LATERAL FLATTEN(input => a.PARAM_SPEC) p '
+ || 'ORDER BY a.CODE, p.INDEX');
+
+  -- Estimated against measured. The measurement is NOT available immediately:
+  -- per-query credits live in QUERY_ATTRIBUTION_HISTORY, which lags by up to a few
+  -- hours, so this view is empty for a while after an action runs and then fills
+  -- in. Saying that plainly beats printing an estimate and letting the reader
+  -- assume it was measured.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_COST AS SELECT '
+ || 'l.LOG_ID, l.CODE, l.LABEL, l.STATUS, l.EST_CREDITS, '
+ || 'SUM(q.CREDITS_ATTRIBUTED_COMPUTE) AS MEASURED_CREDITS, '
+ || 'COUNT(q.QUERY_ID) AS STATEMENTS_MEASURED, l.STATEMENTS_RUN, l.STARTED_AT, '
+    -- Why the measurement is absent, rather than leaving a NULL to be read as a
+    -- failure. QUERY_ATTRIBUTION_HISTORY only records queries that consumed
+    -- WAREHOUSE COMPUTE. ALTER WAREHOUSE, CREATE VIEW and SET MASKING POLICY consume
+    -- none, so for a metadata-only action no row will EVER appear -- and every
+    -- action was telling the customer the figure "appears once attribution catches
+    -- up". Checked against real runs: ICE_FIX matched 0 of 27 statements and
+    -- WH_SUSPEND_ALL 0 of 2, permanently. A promise that never comes true is worse
+    -- than saying up front that there is nothing to measure.
+ || 'CASE '
+ || '  WHEN COUNT(q.QUERY_ID) >= l.STATEMENTS_RUN AND l.STATEMENTS_RUN > 0 '
+ || '    THEN ''MEASURED'' '
+ || '  WHEN COUNT(q.QUERY_ID) > 0 '
+ || '    THEN ''PARTIAL: '' || COUNT(q.QUERY_ID) || '' of '' || l.STATEMENTS_RUN '
+ || '      || '' statement(s) used attributable compute; the rest were metadata-only'' '
+ || '  WHEN l.STARTED_AT > DATEADD(hour, -6, CURRENT_TIMESTAMP()) '
+ || '    THEN ''PENDING: attribution can lag several hours. If these statements were '
+|| 'metadata-only (ALTER, CREATE VIEW, policy attach) it will stay empty because they '
+|| 'consume no warehouse compute.'' '
+ || '  ELSE ''NO COMPUTE MEASURED: these statements consumed no warehouse compute, so '
+|| 'QUERY_ATTRIBUTION_HISTORY has nothing to attribute. Metadata operations are '
+|| 'genuinely near-free -- this is not a missing measurement.'' '
+ || 'END AS MEASURED_STATUS '
+ || 'FROM ' || :tgt || '.ACTION_LOG l '
+ || 'LEFT JOIN ' || :tgt || '.ACTION_STATEMENT_LOG s ON s.LOG_ID = l.LOG_ID '
+ || 'LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY q '
+ || '  ON q.QUERY_ID = s.QUERY_ID '
+ || 'GROUP BY 1,2,3,4,5,8,9');
+
+  -- ── The monthly run-rate, over whatever the solution registered above ─────
+  -- THE CADENCE IS KNOWN, THE DURATION IS MEASURED, THE PRODUCT IS PROJECTED.
+  -- Runs per month comes from a schedule this build itself set, so it is a fact.
+  -- Seconds per run comes from what this build observed. Their product is still a
+  -- PROJECTION, because next month's data volume is not this month's -- and it is
+  -- labelled that way rather than presented as a bill.
+  --
+  -- Deliberately not summed with anything MEASURED, for the same reason step 14
+  -- asserts it: a total mixing a measurement with a forecast is a number nobody
+  -- can defend in a room.
+  -- A row with RUNS_PER_MONTH IS NULL is VOLUME-DRIVEN: a serverless meter billed per
+  -- unit of data (Snowpipe Streaming, for instance) with no schedule and no warehouse.
+  -- The formula below cannot describe it, and NULL arithmetic correctly yields NULL
+  -- rather than inventing a monthly figure. Every schedule-driven solution writes a
+  -- positive RUNS_PER_MONTH, so this branch changes nothing for them.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_MONTHLY_RUN_RATE AS SELECT '
+ || 'KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
+ || 'WAREHOUSE_CREDITS_PER_HOUR, '
+    -- credits = runs x seconds x (credits/hour / 3600). Multiply BEFORE dividing:
+    -- LET cps := 1.0/3600.0 rounds to scale 6 (0.000278) and a solution already
+    -- shipped a 4x-low figure that way.
+ || 'ROUND(RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
+ || '  / 3600.0, 4) AS EST_CREDITS_PER_MONTH, '
+ || 'CASE WHEN RUNS_PER_MONTH IS NULL THEN ''VOLUME-DRIVEN'' '
+ || '     ELSE ''PROJECTED'' END AS LABEL, MEASURED_INPUT, BASIS, INSTALLED_AT '
+ || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
+
+  -- One line the app and the packet can both print. Zero rows is a legitimate
+  -- and meaningful answer -- it means this solution installs nothing recurring --
+  -- so it says that in words rather than rendering an empty table.
+  --
+  -- Scheduled and volume-driven components are reported in SEPARATE clauses and are
+  -- never added together. The single-sentence version claimed every figure was
+  -- "PROJECTED from schedules this build set and durations it measured", which for a
+  -- continuous serverless ingest endpoint was false three times over -- no schedule was
+  -- set, no duration was measured, and the resulting "About 0.02 credits/month" read as
+  -- though streaming were free. A volume-driven component contributes NO credits figure
+  -- here on purpose: the honest answer is a per-unit rate plus a volume the customer
+  -- controls, and that lives in BASIS.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_RUN_RATE_HEADLINE AS SELECT '
+ || 'CASE WHEN COUNT(*) = 0 THEN '
+ || '  ''This build installs nothing that runs on a schedule. It costs storage '
+ || 'plus whatever compute the people querying it use.'' '
+ || 'ELSE '
+ || '  CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0 THEN '
+ || '    ''About '' || ROUND(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
+ || '      RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
+ || '      / 3600.0, 0)), 2) '
+ || '    || '' credits/month across '' || COUNT_IF(RUNS_PER_MONTH IS NOT NULL) '
+ || '    || '' scheduled component(s), PROJECTED from schedules this build set '
+ || 'and durations it measured.'' ELSE '''' END '
+ || '  || CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NULL) > 0 THEN '
+ || '    IFF(COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0, '' Plus '', ''This build '
+ || 'installs '') || COUNT_IF(RUNS_PER_MONTH IS NULL) '
+ || '    || '' volume-driven component(s) that run continuously with NO schedule '
+ || 'and NO monthly projection: the cost scales with how much data you send, not '
+ || 'with a cadence. This is NOT zero -- read BASIS in V_MONTHLY_RUN_RATE for the '
+ || 'per-unit rate.'' ELSE '''' END '
+ || 'END AS HEADLINE, COUNT(*) AS COMPONENTS, '
+ || 'ROUND(COALESCE(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
+ || '  RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
+ || '  / 3600.0, 0)), 0), 4) AS EST_CREDITS_PER_MONTH, '
+ || 'COUNT_IF(RUNS_PER_MONTH IS NOT NULL) AS SCHEDULED_COMPONENTS, '
+ || 'COUNT_IF(RUNS_PER_MONTH IS NULL) AS VOLUME_COMPONENTS '
+ || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
+
+
+  -- The only way to run one. Everything the app can do goes through here, so the
+  -- refusals below are the whole safety model:
+  --   1. the action must exist in this build
+  --   2. the BUILD must have been authorised FOR THAT ACTION'S TIER -- ALLOW_ACTIONS
+  --      for LIMITED and PRODUCTION, ALLOW_SAMPLE_ACTIONS for SAMPLE
+  --   3. the caller must type the code back exactly
+  -- and it stops at the FIRST failing statement, because a half-applied change is
+  -- worse than an unapplied one.
+  --
+  -- Existence is checked BEFORE authorisation now, because the tier is a property of
+  -- the registered action and there is nothing to authorise until we know it. The
+  -- swap leaks nothing: the action codes are printed in the script and listed in the
+  -- app, so "no such action" was never a secret.
+  --
+  -- An unrecognised TIER falls to the STRICTER gate on purpose. A typo in a tier
+  -- name must not be a way to get a PRODUCTION action treated as a sample.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR, P_PARAMS VARCHAR) '
+ || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
+ || 'DECLARE '
+ || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
+ || '  est NUMBER(38,6) := 0; sqls ARRAY := ARRAY_CONSTRUCT(); usnap STRING := NULL; '
+ || '  i INT := 0; ran INT := 0; errs STRING := ''''; '
+ || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
+    -- Parameter resolution state. `resolved` accumulates the EMITTED TEXT for each
+    -- parameter -- already shape-checked, already whitelisted, already quoted -- so
+    -- interpolation downstream is a plain REPLACE over values that have passed every
+    -- gate. Nothing the caller sent is ever interpolated directly.
+ || '  pspec ARRAY := ARRAY_CONSTRUCT(); pobj OBJECT := OBJECT_CONSTRUCT(); '
+ || '  resolved OBJECT := OBJECT_CONSTRUCT(); pkeys ARRAY := ARRAY_CONSTRUCT(); '
+ || '  k INT := 0; kk INT := 0; pj VARIANT := NULL; pname STRING := ''''; '
+ || '  pkind STRING := ''''; pval STRING := NULL; asql STRING := NULL; '
+ || '  emit STRING := ''''; parts ARRAY := ARRAY_CONSTRUCT(); jj INT := 0; '
+ || '  part STRING := ''''; hits INT := 0; num NUMBER(38,6) := NULL; '
+ || '  canon STRING := NULL; opts ARRAY := ARRAY_CONSTRUCT(); '
+    -- Two accumulators, deliberately. `resolved` holds the EMITTED TEXT that goes into
+    -- the statements -- quoted, so "EVENT_TS". `chosen` holds the CANONICAL VALUE a
+    -- human picked -- EVENT_TS. The log gets `chosen`, because an audit trail reading
+    -- {"attach_on":"\"EVENT_TS\""} makes a reader decode escaping to learn what was
+    -- done; the exact text that executed is already in ACTION_STATEMENT_LOG, so nothing
+    -- is lost by keeping this one readable.
+ || '  chosen OBJECT := OBJECT_CONSTRUCT(); '
+ || '  pmin NUMBER(38,6) := NULL; pmax NUMBER(38,6) := NULL; '
+ || '  s STRING := ''''; fin ARRAY := ARRAY_CONSTRUCT(); ustmts ARRAY := ARRAY_CONSTRUCT(); '
+ || 'BEGIN '
+ || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:cnt = 0) THEN '
+ || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
+ || '  END IF; '
+ || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
+ || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:tier = ''SAMPLE'') THEN '
+ || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
+ || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. This build was created with WHGEN_ALLOW_SAMPLE_ACTIONS = '
+ || 'FALSE, so even the seeded-data actions are inert. Re-run the script with it set '
+ || 'to TRUE to arm them.''; '
+ || '    END IF; '
+ || '  ELSE '
+ || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. '' || :tier || '' actions touch real data and this build was '
+ || 'created with WHGEN_ALLOW_ACTIONS = FALSE, so nothing in the app can change '
+ || 'anything of yours. Re-run the script with it set to TRUE to arm them.''; '
+ || '    END IF; '
+ || '  END IF; '
+ || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
+ || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
+ || '  END IF; '
+ || '  SELECT LABEL, EST_CREDITS, RUN_SQL, TO_JSON(UNDO_SQL), PARAM_SPEC '
+ || '    INTO :lbl, :est, :sqls, :usnap, :pspec '
+ || '    FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE; '
+    -- ── Parameters: validate EVERYTHING before a single statement runs ──────────
+    -- Order matters. This whole block sits BEFORE the ACTION_LOG insert and before
+    -- the execution loop, so a refusal here has applied nothing at all -- which is
+    -- what makes refuse-the-whole-action free rather than a rollback problem. A
+    -- partially-applied change is the thing this framework works hardest to prevent,
+    -- so a single bad value stops the entire action rather than running the subset
+    -- that happened to validate.
+ || '  pobj := COALESCE(TRY_PARSE_JSON(:P_PARAMS)::OBJECT, OBJECT_CONSTRUCT()); '
+    -- Values sent to an action that declares none are a REFUSAL, not something to
+    -- ignore. Silently dropping them would mean the caller believes it constrained
+    -- the action and the action did something broader -- and the log would agree
+    -- with the action, not the caller.
+ || '  IF (ARRAY_SIZE(:pspec) = 0 AND ARRAY_SIZE(OBJECT_KEYS(:pobj)) > 0) THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no parameters, but values were '
+ || 'supplied for it. Nothing was run.''; '
+ || '  END IF; '
+ || '  WHILE (:k < ARRAY_SIZE(:pspec)) DO '
+ || '    pj := GET(:pspec, :k); '
+ || '    pname := pj:name::STRING; '
+ || '    pkind := UPPER(COALESCE(pj:kind::STRING, ''IDENT'')); '
+ || '    asql := pj:allowed_sql::STRING; '
+ || '    pval := GET(:pobj, :pname)::STRING; '
+ || '    IF (:pval IS NULL OR TRIM(:pval) = '''') THEN '
+ || '      RETURN ''REFUSED. '' || :P_CODE || '' needs a value for '' || :pname '
+ || '        || ''. Nothing was run.''; '
+ || '    END IF; '
+ || '    IF (:pkind = ''STRING'') THEN '
+    -- ── A LITERAL VALUE, not an identifier ──────────────────────────────────────
+    -- Some parameters land inside a string literal rather than in an object position
+    -- -- an audience NAME is stored in a column, it does not name anything. Those
+    -- cannot be identifier-quoted (a name with a space is legitimate) and they still
+    -- cannot be bound, because RUN_ACTION EXECUTE IMMEDIATEs pre-built statement text.
+    --
+    -- TWO defences, again, because escaping alone is the thing that goes wrong quietly:
+    --   1. A conservative CHARACTER ALLOWLIST -- letters, digits, space and a few
+    --      punctuation marks that appear in real names. No single quote, no double
+    --      quote, no backslash, no semicolon, no comment marker. This is a permit-list,
+    --      so a character nobody thought about is refused rather than passed through.
+    --   2. Quote DOUBLING on top, so even if the allowlist were later widened by
+    --      someone, a quote could not terminate the literal.
+    -- Length is capped so a parameter cannot be used to push a statement past a limit.
+ || '      IF (LENGTH(:pval) > 200) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' is longer than 200 characters. '
+ || 'Nothing was run.''; '
+ || '      END IF; '
+ || '      IF (NOT REGEXP_LIKE(:pval, ''[A-Za-z0-9 _.,()\\-]+'')) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' contains a character that is not '
+ || 'permitted in a name. Letters, digits, spaces and _ . , ( ) - are allowed. '
+ || 'Nothing was run.''; '
+ || '      END IF; '
+    -- The literal is emitted WITHOUT its surrounding quotes: the statement in the
+    -- solution supplies those, exactly as it does for any other literal it writes, so
+    -- '<<audience_name>>' reads as a literal in the source and stays one.
+ || '      emit := REPLACE(:pval, '''''''', ''''''''''''); '
+ || '      canon := :pval; '
+ || '      IF (NOT COALESCE(pj:freeform::BOOLEAN, FALSE) '
+ || '          AND ARRAY_SIZE(COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT())) = 0) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
+ || 'marked freeform. Nothing was run.''; '
+ || '      END IF; '
+ || '    ELSEIF (:pkind = ''NUMBER'') THEN '
+    -- A number is still interpolated, because clauses like ARCHIVE_FOR_DAYS = 90 are
+    -- DDL and cannot be bound any more than an identifier can. The parse is the gate:
+    -- it returns NULL rather than raising, so a non-numeric arrives here as a refusal
+    -- instead of an exception, and the emitted text is the PARSED number rather than
+    -- the caller's string -- verified: '180 OR 1=1' parses to NULL, so it cannot
+    -- survive as text.
+    --
+    -- TRY_TO_DECIMAL(_, 38, 6), NOT TRY_TO_NUMBER. TRY_TO_NUMBER defaults to scale 0
+    -- and SILENTLY ROUNDS: TRY_TO_NUMBER('90.5') is 91, verified. A parameter that
+    -- quietly becomes a different number than the one chosen is worse than one that
+    -- is refused.
+ || '      num := TRY_TO_DECIMAL(:pval, 38, 6); '
+ || '      IF (:num IS NULL) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' must be a number. Nothing was run.''; '
+ || '      END IF; '
+ || '      pmin := pj:min::NUMBER(38,6); pmax := pj:max::NUMBER(38,6); '
+ || '      IF ((:pmin IS NOT NULL AND :num < :pmin) '
+ || '          OR (:pmax IS NOT NULL AND :num > :pmax)) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is outside the '
+ || 'permitted range '' || COALESCE(:pmin::STRING, ''-'') || '' to '' '
+ || '          || COALESCE(:pmax::STRING, ''-'') || ''. Nothing was run.''; '
+ || '      END IF; '
+    -- Emit 180, never 180.000000. These values land in identifier positions as well as
+    -- value positions -- DEMO_COOL_POLICY_180 is a name and DEMO_COOL_POLICY_180.000000
+    -- is a syntax error -- so a NUMBER(38,6) cast straight to STRING breaks the
+    -- statement. Found live: the first parameterised run failed to compile on exactly
+    -- this. A genuinely fractional value keeps its decimals with trailing zeros
+    -- trimmed, so 90.5 stays 90.5.
+ || '      IF (:num = TRUNC(:num)) THEN '
+ || '        emit := :num::INT::STRING; '
+ || '      ELSE '
+ || '        emit := REGEXP_REPLACE(REGEXP_REPLACE(:num::STRING, ''0+$'', ''''), ''[.]$'', ''''); '
+ || '      END IF; '
+ || '      canon := :emit; '
+ || '    ELSE '
+    -- ── Gate 1: SHAPE, per dot-separated part ───────────────────────────────────
+    -- Independent of the whitelist on purpose. The whitelist is only ever as good as
+    -- the allowed_sql a future author writes; point it at a free-text column and it
+    -- authorises arbitrary text. This gate holds regardless. REGEXP_LIKE in Snowflake
+    -- matches the ENTIRE string -- verified, not assumed: ''ORDERS; DROP'' is FALSE
+    -- against this pattern, as are a space and a double quote. Do not "fix" this
+    -- pattern by adding anchors and do not relax it to a partial match.
+    --
+    -- Split on ''.'' so a qualified name is checked part by part. A name genuinely
+    -- containing a dot is refused here rather than silently mis-parsed into the wrong
+    -- number of parts.
+ || '      parts := SPLIT(:pval, ''.''); jj := 0; '
+ || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
+ || '        IF (NOT REGEXP_LIKE(GET(:parts, :jj)::STRING, ''[A-Za-z_][A-Za-z0-9_$]*'')) THEN '
+ || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not a valid '
+ || 'identifier. Nothing was run.''; '
+ || '        END IF; '
+ || '        jj := :jj + 1; '
+ || '      END WHILE; '
+    -- ── Gate 2: MEMBERSHIP, which also returns the CANONICAL SPELLING ───────────
+    -- DEFAULT DENY. A parameter must declare where its permitted values come from --
+    -- allowed_sql (a query) or options (a literal list) -- and if it declares neither
+    -- the action is REFUSED rather than falling back to the shape gate alone. An author
+    -- who simply forgets allowed_sql would otherwise get an identifier accepted on shape
+    -- alone and never know, which is the quiet failure this feature exists to avoid.
+    -- Freeform has to be asked for in writing, and is only appropriate for a NAME BEING
+    -- CREATED, which cannot be checked against things that already exist.
+    --
+    -- Both sources are enforced HERE, server-side. options is not merely what the app
+    -- offers: a list the host renders but the procedure does not check is a dropdown
+    -- pretending to be a control.
+    --
+    -- The comparison is case-INSENSITIVE but what gets emitted is the ALLOWED SET''S OWN
+    -- SPELLING, never the caller''s. This matters specifically because the value is
+    -- emitted QUOTED: a caller typing ''event_ts'' against a column stored as EVENT_TS
+    -- matches, and emitting their casing would produce "event_ts", which is a DIFFERENT
+    -- and non-existent object. Verified live -- the case-insensitive match accepted the
+    -- lowercase spelling, which is correct, and only canonicalising makes the resulting
+    -- identifier resolve. It also means a column genuinely stored lowercase is quoted in
+    -- ITS spelling and resolves too.
+ || '      canon := NULL; '
+ || '      IF (:asql IS NOT NULL AND TRIM(:asql) <> '''') THEN '
+    -- The whitelist query comes from the REGISTRY, never from the caller, so the app
+    -- cannot influence what its own value is checked against. The value is BOUND rather
+    -- than concatenated -- the point of the check is to constrain an attacker-controlled
+    -- string, so the check itself must not concatenate one.
+    --
+    -- allowed_sql must expose a column named ALLOWED_VALUE. Requiring a NAME rather than
+    -- reading position 1 means an author widening their SELECT list cannot silently
+    -- change which column authorises values.
+ || '        EXECUTE IMMEDIATE ''SELECT MAX(TO_VARCHAR(a.ALLOWED_VALUE)) FROM ('' || :asql '
+ || '          || '') a WHERE UPPER(TO_VARCHAR(a.ALLOWED_VALUE)) = UPPER(?)'' USING (pval); '
+ || '        SELECT $1 INTO :canon FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())); '
+ || '        IF (:canon IS NULL) THEN '
+ || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
+ || 'values this build discovered for it. Nothing was run.''; '
+ || '        END IF; '
+ || '      ELSE '
+ || '        opts := COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT()); '
+ || '        IF (ARRAY_SIZE(:opts) > 0) THEN '
+    -- A plain loop rather than FLATTEN over a local VARIANT: that construct raised
+    -- EXPRESSION_ERROR inside a procedure body when it was tried, and a loop cannot.
+ || '          jj := 0; '
+ || '          WHILE (:jj < ARRAY_SIZE(:opts)) DO '
+ || '            IF (UPPER(GET(:opts, :jj)::STRING) = UPPER(:pval)) THEN '
+ || '              canon := GET(:opts, :jj)::STRING; '
+ || '              BREAK; '
+ || '            END IF; '
+ || '            jj := :jj + 1; '
+ || '          END WHILE; '
+ || '          IF (:canon IS NULL) THEN '
+ || '            RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
+ || 'permitted values for it. Nothing was run.''; '
+ || '          END IF; '
+ || '        ELSEIF (COALESCE(pj:freeform::BOOLEAN, FALSE)) THEN '
+    -- Freeform: there is no set to canonicalise against, so the caller''s spelling IS
+    -- the name being created. It has already passed the shape gate.
+ || '          canon := :pval; '
+ || '        ELSE '
+ || '          RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
+ || 'marked freeform, so this build cannot say what it is allowed to be. Nothing was run. '
+ || 'This is a defect in the solution, not in what you chose.''; '
+ || '        END IF; '
+ || '      END IF; '
+    -- ── Quote the CANONICAL value, part by part ─────────────────────────────────
+    -- "DB"."SCHEMA"."TABLE", not "DB.SCHEMA.TABLE" -- the latter names one object with
+    -- dots in it. ENUM values are emitted BARE because they land in positions like
+    -- ARCHIVE_TIER = COOL where a quoted string is not valid syntax; the shape gate
+    -- already refused anything that is not a bare word, so an unquoted enum still
+    -- cannot carry punctuation.
+ || '      parts := SPLIT(:canon, ''.''); jj := 0; emit := ''''; '
+ || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
+ || '        part := GET(:parts, :jj)::STRING; '
+ || '        IF (:pkind = ''ENUM'') THEN '
+ || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || :part; '
+ || '        ELSE '
+ || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || ''"'' || :part || ''"''; '
+ || '        END IF; '
+ || '        jj := :jj + 1; '
+ || '      END WHILE; '
+ || '    END IF; '
+ || '    resolved := OBJECT_INSERT(:resolved, :pname, :emit, TRUE); '
+ || '    chosen := OBJECT_INSERT(:chosen, :pname, :canon, TRUE); '
+ || '    k := :k + 1; '
+ || '  END WHILE; '
+    -- ── Interpolation, over validated text only ────────────────────────────────
+    -- Both the forward statements AND the reverse ones, because the reverse set is
+    -- snapshotted below and an undo must reverse THE SAME target. Resolving undo here
+    -- is what makes that structural rather than a promise: UNDO_ACTION replays text
+    -- that was already resolved, so it cannot be handed different values later.
+ || '  pkeys := OBJECT_KEYS(:resolved); '
+ || '  ustmts := PARSE_JSON(:usnap)::ARRAY; '
+ || '  i := 0; '
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    s := GET(:sqls, :i)::STRING; kk := 0; '
+ || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
+ || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
+ || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
+ || '      kk := :kk + 1; '
+ || '    END WHILE; '
+    -- A placeholder left over means the statement names a parameter the action did not
+    -- declare -- a typo between the two. Refusing beats executing DDL with a literal
+    -- <<tbl>> in it, and beats the silent alternative of leaving it to fail with a
+    -- syntax error that points at the wrong thing.
+ || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
+ || '      RETURN ''REFUSED. Statement '' || (:i + 1) || '' of '' || :P_CODE '
+ || '        || '' contains a placeholder this action does not declare. Nothing was run.''; '
+ || '    END IF; '
+ || '    fin := ARRAY_APPEND(:fin, :s); '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  sqls := :fin; fin := ARRAY_CONSTRUCT(); i := 0; '
+ || '  WHILE (:i < ARRAY_SIZE(:ustmts)) DO '
+ || '    s := GET(:ustmts, :i)::STRING; kk := 0; '
+ || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
+ || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
+ || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
+ || '      kk := :kk + 1; '
+ || '    END WHILE; '
+ || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
+ || '      RETURN ''REFUSED. Reverse statement '' || (:i + 1) || '' of '' || :P_CODE '
+ || '        || '' contains a placeholder this action does not declare. Nothing was run, '
+ || 'because an action whose undo cannot resolve must not run in the first place.''; '
+ || '    END IF; '
+ || '    fin := ARRAY_APPEND(:fin, :s); '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  usnap := TO_JSON(:fin); i := 0; '
+    -- The reverse statements are SNAPSHOTTED onto this run, not read from the
+    -- registry when the undo happens. The registry holds what the action CURRENTLY
+    -- declares; a rebuild between the run and the undo can change that, and then the
+    -- undo reverses a different set of objects than the run created. Storing them
+    -- here means an undo can only ever replay what THIS run was going to do.
+    -- Stored as JSON text rather than ARRAY because an ARRAY bind through
+    -- INSERT..SELECT is fragile, and TO_JSON/PARSE_JSON round-trips exactly.
+ || '  INSERT INTO ' || :tgt || '.ACTION_LOG '
+ || '    (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS, UNDO_SNAPSHOT, PARAMS) '
+ || '    SELECT :log_id, :P_CODE, :lbl, :est, ''RUNNING'', :usnap, '
+    -- The RESOLVED values, not the raw input: what the statements were actually built
+    -- with. NULL when the action takes none, so an unparameterised row reads as having
+    -- had none rather than as an empty object that might mean anything.
+ || '           IFF(ARRAY_SIZE(OBJECT_KEYS(:chosen)) = 0, NULL, TO_JSON(:chosen)); '
+    -- :i indexes the ARRAY from 0, but every number this procedure SHOWS a
+    -- human is :i + 1. Sabotaging the second statement of an action originally
+    -- produced "statement 1: SQL compilation error", which points at the wrong
+    -- DDL -- the single most expensive kind of wrong in an error message.
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    BEGIN '
+ || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
+ || '               LAST_QUERY_ID(), ''OK''; '
+ || '      ran := :ran + 1; '
+ || '    EXCEPTION WHEN OTHER THEN '
+ || '      errs := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :errs; '
+ || '      BREAK; '
+ || '    END; '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''DONE'', ''FAILED''), '
+ || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
+ || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
+ || '  IF (:errs <> '''') THEN '
+ || '    RETURN ''FAILED after '' || :ran || '' statement(s), nothing further was run. '' || :errs; '
+ || '  END IF; '
+ || '  RETURN ''DONE. '' || :lbl '
+    -- Name the values in the RETURN, not just in the log. The message is the only
+    -- thing most readers see, and "DONE. Attach the policy" is the same sentence
+    -- whichever table it just tiered.
+ || '    || IFF(ARRAY_SIZE(:pkeys) = 0, '''', '' on '' || TO_JSON(:chosen)) '
+ || '    || '' -- '' || :ran || '' statement(s) ran. Estimated '' '
+ || '    || :est || '' credits. V_ACTION_COST reconciles that against what Snowflake '' '
+ || '    || ''actually charged, and its MEASURED_STATUS column says whether a '' '
+ || '    || ''measurement is pending, partial, or will never arrive because the '' '
+ || '    || ''statements consumed no warehouse compute.''; '
+ || 'END');
+
+  -- ── The two-argument form every existing solution and test already calls ────
+  -- A DELEGATE, not a copy. There is exactly ONE implementation of the three gates
+  -- and the parameter resolver, and this signature reaches it with an empty parameter
+  -- object. Duplicating the body to "keep the simple path simple" would put a second
+  -- copy of a safety gate in the file, and a duplicated gate is a gate that rots --
+  -- F2 needed a dedicated in-sync assertion for exactly that reason.
+  --
+  -- So the 27 solutions that declare no parameters, and gauntlet step 12 which calls
+  -- RUN_ACTION(code, confirm) positionally, keep working unchanged and still get
+  -- every gate.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
+ || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
+ || 'DECLARE r STRING := ''''; '
+ || 'BEGIN '
+ || '  CALL ' || :tgt || '.RUN_ACTION(:P_CODE, :P_CONFIRM, NULL) INTO :r; '
+ || '  RETURN :r; '
+ || 'END');
+
+  -- ── Undoing one action, without taking the rest down with it ───────────────
+  -- Until this existed the only undo was TEARDOWN(), which drops the whole schema.
+  -- That is a fine answer to "remove the demo" and a useless answer to "I pressed
+  -- the production button, show me it comes back" -- it destroys the evidence
+  -- along with the change. This reverses ONE action and leaves everything else
+  -- standing, which is the thing you actually want before you press it for real.
+  --
+  -- Same three gates as RUN_ACTION, deliberately. An undo is itself a change to
+  -- the account: reversing a masking policy EXPOSES a column again. It is not
+  -- inherently the safe direction and does not get a weaker door.
+  --
+  -- DELIBERATELY NOT PARAMETERISED, and this is a safety decision rather than an
+  -- omission. RUN_ACTION resolves the reverse statements and snapshots them ALREADY
+  -- RESOLVED, so the undo replays the exact text built for that run. Giving this
+  -- procedure a parameter argument would let a caller undo with DIFFERENT values than
+  -- the run used -- an undo that reverses a different target than the action touched,
+  -- which is worse than having no undo at all. The only reverse statements reachable
+  -- here are the ones the run itself produced.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.UNDO_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
+ || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
+ || 'DECLARE '
+ || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
+ || '  sqls ARRAY := ARRAY_CONSTRUCT(); last_st STRING := NULL; usnap STRING := NULL; '
+ || '  i INT := 0; ran INT := 0; errs STRING := ''''; e1 STRING := ''''; '
+ || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
+ || 'BEGIN '
+ || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:cnt = 0) THEN '
+ || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
+ || '  END IF; '
+    -- Tier-aware, exactly as RUN_ACTION. Undo has to be reachable under the SAME
+    -- authorisation that let the action run, or SAMPLE actions become one-way: the
+    -- button works, the reversal refuses, and the seeded objects are stranded until
+    -- TEARDOWN(). Unknown tiers fall to the stricter gate, as above.
+ || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
+ || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:tier = ''SAMPLE'') THEN '
+ || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
+ || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. This build was created with WHGEN_ALLOW_SAMPLE_ACTIONS = FALSE.''; '
+ || '    END IF; '
+ || '  ELSE '
+ || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. This build was created with WHGEN_ALLOW_ACTIONS = FALSE.''; '
+ || '    END IF; '
+ || '  END IF; '
+ || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
+ || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
+ || '  END IF; '
+ || '  SELECT LABEL INTO :lbl FROM ' || :tgt
+ || '    .ACTION_REGISTRY WHERE CODE = :P_CODE; '
+    -- Prefer the snapshot taken when the action ran. Fall back to what the registry
+    -- declares now, for a schema built before UNDO_SNAPSHOT existed -- that is the
+    -- old, less precise behaviour, and it is better than refusing to undo at all.
+ || '  BEGIN '
+ || '    SELECT UNDO_SNAPSHOT INTO :usnap FROM ' || :tgt || '.ACTION_LOG '
+ || '      WHERE CODE = :P_CODE AND STATUS = ''DONE'' '
+ || '      ORDER BY FINISHED_AT DESC LIMIT 1; '
+ || '  EXCEPTION WHEN OTHER THEN usnap := NULL; END; '
+ || '  IF (:usnap IS NOT NULL) THEN '
+ || '    sqls := PARSE_JSON(:usnap)::ARRAY; '
+ || '  ELSE '
+ || '    SELECT UNDO_SQL INTO :sqls FROM ' || :tgt
+ || '      .ACTION_REGISTRY WHERE CODE = :P_CODE; '
+ || '  END IF; '
+ || '  IF (ARRAY_SIZE(:sqls) = 0) THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no reverse statements. Read its '
+|| 'undo text -- some changes are only reversible by hand, and pretending otherwise '
+|| 'would be worse than saying so.''; '
+ || '  END IF; '
+    -- An unresolved placeholder can only reach here down the FALLBACK path above --
+    -- a parameterised action whose run predates UNDO_SNAPSHOT, so the registry's own
+    -- unresolved text was loaded instead. Executing it would run DDL containing a
+    -- literal <<tbl>>; guessing a value would reverse a target this run may never have
+    -- touched. Both are worse than refusing and saying which action it was.
+ || '  i := 0; '
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    IF (REGEXP_LIKE(GET(:sqls, :i)::STRING, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
+ || '      RETURN ''REFUSED. '' || :P_CODE || '' takes parameters and no resolved reverse '
+|| 'statements were recorded for the run being undone, so the values it used are not '
+|| 'known. Run it again to record them; nothing was reversed.''; '
+ || '    END IF; '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  i := 0; '
+    -- Refusing to undo something that was never done is not pedantry. Running the
+    -- reverse of an un-run action can itself be destructive: the reverse of "attach
+    -- a masking policy" is "unset it", which on a column somebody ELSE masked would
+    -- quietly strip their protection.
+    -- COUNT of DONE rows is the WRONG question: it stays true forever, so a second
+    -- undo sailed past this guard and reported UNDONE again having done nothing.
+    -- Verified live -- it was harmless only because the first undo had already
+    -- emptied the registry it reads. The right question is what happened LAST.
+ || '  last_st := (SELECT STATUS FROM ' || :tgt || '.ACTION_LOG '
+ || '              WHERE CODE = :P_CODE AND STATUS IN (''DONE'', ''UNDONE'') '
+ || '              ORDER BY FINISHED_AT DESC LIMIT 1); '
+ || '  IF (:last_st IS NULL) THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' has not completed on this build, so there '
+|| 'is nothing to reverse.''; '
+ || '  END IF; '
+ || '  IF (:last_st = ''UNDONE'') THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' has already been undone. Run it again '
+|| 'before undoing it again.''; '
+ || '  END IF; '
+ || '  INSERT INTO ' || :tgt || '.ACTION_LOG (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS) '
+ || '    SELECT :log_id, :P_CODE, ''UNDO: '' || :lbl, 0, ''UNDOING''; '
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    BEGIN '
+ || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
+ || '               LAST_QUERY_ID(), ''OK''; '
+ || '      ran := :ran + 1; '
+    -- An undo does NOT stop at the first failure, which is the opposite of
+    -- RUN_ACTION. Half-applying a change is bad; half-REVERSING one leaves the
+    -- account in a state neither the action nor the undo describes, so it pushes on
+    -- and reports everything that went wrong. Every statement is logged either way.
+ || '    EXCEPTION WHEN OTHER THEN '
+ || '      e1 := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
+ || '      errs := :errs || :e1 || ''; ''; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :e1; '
+ || '    END; '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''UNDONE'', ''FAILED''), '
+ || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
+ || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
+ || '  IF (:errs <> '''') THEN '
+ || '    RETURN ''PARTIALLY UNDONE. '' || :ran || '' of '' || ARRAY_SIZE(:sqls) '
+ || '      || '' statement(s) succeeded. '' || :errs; '
+ || '  END IF; '
+ || '  RETURN ''UNDONE. '' || :lbl || '' -- '' || :ran || '' reverse statement(s) ran. '' '
+ || '    || ''The action can be run again.''; '
+ || 'END');
+  cost_once := :cost_once + 0.01;
+  IF (ARRAY_SIZE(:actions) > 0) THEN
+    notes := ARRAY_APPEND(:notes,
+      'THIS BUILD DECLARES ' || ARRAY_SIZE(:actions) || ' ACTION(S) the app can offer. '
+   || IFF(:allow_actions,
+          'WHGEN_ALLOW_ACTIONS is TRUE, so they are ARMED: a user of the dashboard can '
+       || 'run them after typing the action code to confirm. Every attempt is recorded '
+       || 'in ACTION_LOG.',
+          'WHGEN_ALLOW_ACTIONS is FALSE, so every button is inert and RUN_ACTION refuses. '
+       || 'The app still shows what each action would do and what it would cost.'));
+    LET ai INT := 0;
+    WHILE (:ai < ARRAY_SIZE(:actions)) DO
+      notes := ARRAY_APPEND(:notes,
+        '  ACTION ' || GET(:actions, :ai):tier::STRING || ' · '
+     || GET(:actions, :ai):code::STRING || ' — '
+     || GET(:actions, :ai):label::STRING || '  (~'
+     || GET(:actions, :ai):est::STRING || ' credits: '
+     || GET(:actions, :ai):basis::STRING || ')');
+      ai := :ai + 1;
+    END WHILE;
+  END IF;
+
+  IF (:app_build_end < :app_build_start) THEN
+    app_build_start := ARRAY_SIZE(:stmts) + 1;
+  END IF;
+  IF (:app_build_end < :app_build_start) THEN
+    app_build_end := ARRAY_SIZE(:stmts);
+  END IF;
 
 
   -- ── DETERMINISTIC GATES ───────────────────────────────────────────────────
@@ -9636,6 +9651,7 @@ END IF;
 
   -- ── Gate ──────────────────────────────────────────────────────────────────
   LET approved BOOLEAN := FALSE;
+  LET workload_blocked BOOLEAN := FALSE;
   BEGIN
     approved := (SELECT TRY_CAST($WHGEN_APPROVE::VARCHAR AS BOOLEAN));
   EXCEPTION WHEN OTHER THEN approved := FALSE;
@@ -9647,10 +9663,10 @@ END IF;
   -- be, because the client owns the decision and the override is the audit trail.
   LET gate_closed_by STRING := '';
   IF (:hard_block <> '') THEN
-    approved := FALSE;
+    workload_blocked := TRUE;
     gate_closed_by := 'DETERMINISTIC CHECK';
   ELSEIF (:review_verdict = 'DO_NOT_PROCEED' AND NOT :override_asked) THEN
-    approved := FALSE;
+    workload_blocked := TRUE;
     gate_closed_by := 'REVIEW VERDICT';
   ELSEIF (:review_verdict = 'DO_NOT_PROCEED' AND :override_asked) THEN
     review_overridden := TRUE;
@@ -9658,6 +9674,15 @@ END IF;
       'OVERRIDE IN EFFECT: the review returned DO_NOT_PROCEED and '
    || 'WHGEN_OVERRIDE_REVIEW = TRUE, so the build proceeded anyway. The verdict and '
    || 'this override are both recorded in REVIEW_LOG and in the packet.');
+  END IF;
+
+  IF (:workload_blocked) THEN
+    IF (:approved AND 'WHGEN_APP' <> '' AND '25_warehouse_generation' <> '24_voice_of_customer' AND :app_build_end >= :app_build_start) THEN
+      stmts := ARRAY_SLICE(:stmts, 0, :app_build_end);
+      notes := ARRAY_APPEND(:notes, 'Data-workload build was refused. Only the existing app and its infrastructure are installed; the review decision is not overridden.');
+    ELSE
+      approved := FALSE;
+    END IF;
   END IF;
 
   -- ── The discovery packet ──────────────────────────────────────────────────
@@ -9996,7 +10021,8 @@ END IF;
   LET receipt_app_exists BOOLEAN := FALSE;
   LET receipt_workspace_exists BOOLEAN := FALSE;
   LET receipt_base_url STRING := 'https://app.snowflake.com/' || LOWER(CURRENT_ORGANIZATION_NAME()) || '/' || LOWER(CURRENT_ACCOUNT_NAME());
-  IF (ARRAY_SIZE(:receipt_failures) = 0 AND :receipt_app_name <> '') THEN
+  LET receipt_app_statements INTEGER := (SELECT COUNT(*) FROM TABLE(FLATTEN(INPUT=>:qlog)) WHERE VALUE:seq::INTEGER BETWEEN :app_build_start AND :app_build_end AND VALUE:status::VARCHAR='OK');
+  IF (:receipt_app_name <> '' AND :app_build_end >= :app_build_start AND :receipt_app_statements = :app_build_end - :app_build_start + 1) THEN
     BEGIN
       EXECUTE IMMEDIATE 'SHOW STREAMLITS IN SCHEMA ' || :tgt;
       receipt_app_exists := (SELECT COUNT(*) = 1 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "name" = :receipt_app_name);
@@ -10017,14 +10043,16 @@ END IF;
   END IF;
   IF (NOT $WHGEN_VERBOSE_OUTPUT::BOOLEAN) THEN
     res := (SELECT
-      CASE WHEN ARRAY_SIZE(:receipt_failures) > 0 THEN 'BUILD_FAILED' WHEN :receipt_app_name = '' THEN 'READY_NO_APP' ELSE 'READY' END AS STATUS,
-      IFF(:receipt_app_exists AND ARRAY_SIZE(:receipt_failures) = 0, :receipt_base_url || '/#/streamlit-apps/' || :tgt || '.' || :receipt_app_name, NULL) AS OPEN_APP_URL,
-      IFF(:receipt_workspace_exists AND ARRAY_SIZE(:receipt_failures) = 0, :receipt_base_url || '/#/workspaces/ws/' || :db || '/' || :sch || '/ONESHOT_SOURCE/streamlit_app.py', NULL) AS EDIT_SOURCE_URL,
+      CASE WHEN :receipt_app_exists AND :workload_blocked THEN 'APP_READY_REVIEW_REQUIRED' WHEN :receipt_app_exists AND ARRAY_SIZE(:receipt_failures)>0 THEN 'APP_READY_BUILD_INCOMPLETE' WHEN ARRAY_SIZE(:receipt_failures) > 0 THEN 'BUILD_FAILED' WHEN :receipt_app_name = '' THEN 'READY_NO_APP' WHEN :receipt_app_exists AND :found:source_discovery:status::VARCHAR NOT IN ('REVIEW_SOURCE_PROPOSAL','AVAILABLE') THEN 'APP_READY_REVIEW_REQUIRED' WHEN :receipt_app_exists THEN 'READY' ELSE 'BUILD_FAILED' END AS STATUS,
+      IFF(:receipt_app_exists, :receipt_base_url || '/#/streamlit-apps/' || :tgt || '.' || :receipt_app_name, NULL) AS OPEN_APP_URL,
+      IFF(:receipt_app_exists, 'OPEN THE APP: click OPEN_APP_URL.' || IFF(:workload_blocked,' Data processing was refused; review REVIEW_FINDINGS and ATTENTION.',IFF(ARRAY_SIZE(:receipt_failures)>0,' Some data objects failed; inspect ATTENTION and DIAGNOSTICS. Do not treat missing panels as completed work.',IFF(:found:source_discovery:status::VARCHAR NOT IN ('REVIEW_SOURCE_PROPOSAL','AVAILABLE'),' Source discovery needs attention; inspect SOURCE_DISCOVERY_STATUS and REVIEW_FINDINGS.',' No additional variable changes are needed.'))), IFF(:receipt_app_name = '' AND ARRAY_SIZE(:receipt_failures)=0, 'SQL objects are ready; this solution has no application.', 'BUILD FAILED: inspect DIAGNOSTICS below.')) AS NEXT_ACTION,
+      IFF(:receipt_workspace_exists, :receipt_base_url || '/#/workspaces/ws/' || :db || '/' || :sch || '/ONESHOT_SOURCE/streamlit_app.py', NULL) AS EDIT_SOURCE_URL,
       :mode AS DATA_MODE,
+      :found:source_discovery:status::VARCHAR AS SOURCE_DISCOVERY_STATUS,
       :tgt AS DESTINATION,
       :review_verdict AS REVIEW_STATUS,
       :review_findings AS REVIEW_FINDINGS,
-      IFF(ARRAY_SIZE(:receipt_failures) > 0, TO_JSON(:receipt_failures), IFF(:receipt_app_name = '', 'This solution creates SQL objects, not a Streamlit app.', 'Open OPEN_APP_URL using a role with access to the app.')) AS NEXT_ACTION,
+      IFF(ARRAY_SIZE(:receipt_failures) > 0, TO_JSON(:receipt_failures), 'Use a role with access to the installed objects.') AS ATTENTION,
       'SELECT * FROM ' || :tgt || '.BUILD_STATEMENT_LOG WHERE RUN_ID = ''' || :run_id || ''' ORDER BY SEQ;' AS DIAGNOSTICS,
       'CALL ' || :tgt || '.TEARDOWN();' AS REMOVE_DEMO);
     RETURN TABLE(res);

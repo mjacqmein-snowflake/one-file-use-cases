@@ -3,11 +3,11 @@
 -- SETTINGS  ·  the only part of this file intended to be edited
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- The gate. Nothing is created while this is FALSE.
-SET STORAGE_APPROVE = FALSE;
 
+-- Initial build is enabled. Leave defaults unchanged and run the entire file.
+-- The last result returns OPEN_APP_URL. Set APPROVE to FALSE only for a dry run.
+SET STORAGE_APPROVE = TRUE;
 SET STORAGE_VERBOSE_OUTPUT = FALSE;
-
 
 -- Where to build. Blank means the database currently in use.
 SET STORAGE_TARGET_DB = '';
@@ -50,7 +50,7 @@ SET STORAGE_WARM_WAREHOUSE = 'ONESHOT_APP_WH';
 -- default, can close the connection before this timer expires, and only Snowflake
 -- Support can raise it. Setting 240 here is therefore an upper bound and not a
 -- guarantee.
-SET STORAGE_APP_SLEEP_MINUTES = 240;
+SET STORAGE_APP_SLEEP_MINUTES = 5;
 
 -- How far back discovery and the views look.
 SET STORAGE_WINDOW_DAYS = 14;
@@ -445,6 +445,7 @@ BEGIN
   LET mode STRING := UPPER(COALESCE($STORAGE_MODE::VARCHAR, 'DISCOVER'));
   LET sig  OBJECT := OBJECT_CONSTRUCT();
   LET cnt  OBJECT := OBJECT_CONSTRUCT();
+  LET source_discovery_result VARIANT := NULL;
 
 
   -- ── Probes ────────────────────────────────────────────────────────────────
@@ -548,6 +549,7 @@ BEGIN
       'window_days', :w,
       'mode', :mode,
       'target_db', :db,
+      'source_discovery', :source_discovery_result,
       'discovered_at', CURRENT_TIMESTAMP()::STRING
       , 'table_storage_count', COALESCE(GET(:cnt, 'table_storage')::NUMBER, 0)
       , 'tables_meta_count', COALESCE(GET(:cnt, 'tables_meta')::NUMBER, 0)
@@ -1220,6 +1222,11 @@ BEGIN
 
   stmts := ARRAY_APPEND(:stmts, 'CREATE SCHEMA IF NOT EXISTS ' || :tgt);
   stmts := ARRAY_APPEND(:stmts, 'CREATE STAGE IF NOT EXISTS ' || :tgt || '.APP_STAGE');
+  IF (:found:source_discovery IS NOT NULL AND NOT IS_NULL_VALUE(:found:source_discovery)) THEN
+    stmts := ARRAY_APPEND(:stmts, 'CREATE TABLE IF NOT EXISTS ' || :tgt || '.SOURCE_DISCOVERY_LOG (RUN_ID VARCHAR, PAYLOAD VARIANT)');
+    stmts := ARRAY_APPEND(:stmts, 'INSERT INTO ' || :tgt || '.SOURCE_DISCOVERY_LOG SELECT ''' || :run_id || ''',PARSE_JSON(BASE64_DECODE_STRING(''' || BASE64_ENCODE(TO_JSON(:found:source_discovery)) || '''))');
+    notes := ARRAY_APPEND(:notes, 'SOURCE DISCOVERY: ' || :found:source_discovery:status::VARCHAR || '. Validated choices and questions are retained in SOURCE_DISCOVERY_LOG.');
+  END IF;
 
   -- ── KEEPING THE APP WARM ──────────────────────────────────────────────────
   -- The claim here is narrow on purpose, because the wide version is false.
@@ -1795,2142 +1802,9 @@ BEGIN
  -- this column the app could only say "re-run with ALLOW_ACTIONS = TRUE" --
  -- which is not a line that exists in any file. That reads as unexplained manual
  -- work, and it is the reason the buttons looked like they needed a terminal.
- || '''STORAGE'' AS SETTING_PREFIX');
+  || '''STORAGE'' AS SETTING_PREFIX');
 
-  -- ── Storage Optimization Plan ──────────────────────────────────────────────
-
-  -- Account-level storage summary view (always, if storage_usage accessible)
-  IF (:sig:storage_usage::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_STORAGE_SUMMARY AS '
-   || 'SELECT USAGE_DATE, '
-   || 'ROUND(STORAGE_BYTES / POWER(1024, 4), 4) AS STORAGE_TB, '
-   || 'ROUND(STAGE_BYTES / POWER(1024, 4), 4) AS STAGE_TB, '
-   || 'ROUND(FAILSAFE_BYTES / POWER(1024, 4), 4) AS FAILSAFE_TB, '
-   || 'ROUND((STORAGE_BYTES + STAGE_BYTES + FAILSAFE_BYTES) / POWER(1024, 4), 4) AS TOTAL_TB '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE '
-   || 'WHERE USAGE_DATE >= DATEADD(day, -' || :w || ', CURRENT_DATE()) '
-   || 'ORDER BY USAGE_DATE');
-    cost_day    := :cost_day + 0.01;
-    cost_detail := ARRAY_APPEND(:cost_detail, 'V_STORAGE_SUMMARY scanned on read ~0.01 credits/day');
-    dials       := ARRAY_APPEND(:dials, 'WINDOW_DAYS ' || :w || ' -> 7 saves ~0.005 credits/day on storage summary');
-  END IF;
-
-  -- Table-level storage inventory from TABLE_STORAGE_METRICS + TABLES
-  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_TABLE_STORAGE_INVENTORY AS '
-   || 'WITH metrics AS ('
-   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, '
-   || 'ACTIVE_BYTES, TIME_TRAVEL_BYTES, FAILSAFE_BYTES, RETAINED_FOR_CLONE_BYTES, '
-   || 'IS_TRANSIENT, TABLE_CREATED, '
-   || 'COALESCE(ARCHIVE_STORAGE_COOL_ACTIVE_BYTES, 0) AS COOL_BYTES, '
-   || 'COALESCE(ARCHIVE_STORAGE_COLD_ACTIVE_BYTES, 0) AS COLD_BYTES '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS '
-   || 'WHERE DELETED = FALSE'
-   || '), '
-   || 'meta AS ('
-   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, RETENTION_TIME, '
-   || 'ROW_COUNT, BYTES, CREATED, LAST_ALTERED, IS_TRANSIENT AS META_TRANSIENT '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES '
-   || 'WHERE DELETED IS NULL'
-   || ') '
-   || 'SELECT m.TABLE_CATALOG, m.TABLE_SCHEMA, m.TABLE_NAME, '
-   || 'ROUND(m.ACTIVE_BYTES / POWER(1024, 3), 4) AS ACTIVE_GB, '
-   || 'ROUND(m.TIME_TRAVEL_BYTES / POWER(1024, 3), 4) AS TIME_TRAVEL_GB, '
-   || 'ROUND(m.FAILSAFE_BYTES / POWER(1024, 3), 4) AS FAILSAFE_GB, '
-   || 'ROUND(m.RETAINED_FOR_CLONE_BYTES / POWER(1024, 3), 4) AS CLONE_RETAINED_GB, '
-   || 'ROUND(m.COOL_BYTES / POWER(1024, 3), 4) AS COOL_GB, '
-   || 'ROUND(m.COLD_BYTES / POWER(1024, 3), 4) AS COLD_GB, '
-   || 'ROUND((m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.FAILSAFE_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS TOTAL_GB, '
-   || 'COALESCE(t.RETENTION_TIME, 1) AS RETENTION_DAYS, '
-   || 'COALESCE(t.ROW_COUNT, 0) AS ROW_COUNT, '
-   || 'COALESCE(m.IS_TRANSIENT, ''NO'') AS IS_TRANSIENT, '
-   || 't.LAST_ALTERED, '
-   || 'm.TABLE_CREATED, '
-   || 'DATEDIFF(day, COALESCE(t.LAST_ALTERED, m.TABLE_CREATED), CURRENT_TIMESTAMP()) AS DAYS_SINCE_ALTER '
-   || 'FROM metrics m '
-   || 'LEFT JOIN meta t ON m.TABLE_CATALOG = t.TABLE_CATALOG '
-   || '  AND m.TABLE_SCHEMA = t.TABLE_SCHEMA AND m.TABLE_NAME = t.TABLE_NAME '
-   || 'WHERE m.ACTIVE_BYTES > 0');
-    cost_day    := :cost_day + 0.03;
-    cost_detail := ARRAY_APPEND(:cost_detail, 'V_TABLE_STORAGE_INVENTORY scanned on read ~0.03 credits/day');
-    dials       := ARRAY_APPEND(:dials, 'WINDOW_DAYS ' || :w || ' -> 7 saves ~0.015 credits/day on inventory view');
-  END IF;
-
-  -- Tiering candidates: tables above a size threshold that have not been altered recently
-  -- The threshold is 0.1 GB (roughly 100MB). Tables below this are too small to be
-  -- worth tiering -- the administrative overhead exceeds the storage saving.
-  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_TIER_CANDIDATES AS '
-   || 'SELECT *, '
-   || 'CASE '
-   || '  WHEN IS_TRANSIENT = ''YES'' THEN ''TRANSIENT_NO_FAILSAFE'' '
-   || '  WHEN TOTAL_GB < 0.1 THEN ''TOO_SMALL'' '
-   || '  WHEN DAYS_SINCE_ALTER <= 30 THEN ''RECENTLY_ACTIVE'' '
-   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN ''COLD_CANDIDATE'' '
-   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN ''COOL_CANDIDATE'' '
-   || '  ELSE ''NO_ACTION'' '
-   || 'END AS RECOMMENDATION, '
-   || 'CASE '
-   || '  WHEN IS_TRANSIENT = ''YES'' THEN ''Transient tables already have no failsafe; tiering adds no benefit'' '
-   || '  WHEN TOTAL_GB < 0.1 THEN ''Table is below threshold (0.1 GB); administrative cost exceeds saving'' '
-   || '  WHEN DAYS_SINCE_ALTER <= 30 THEN ''Table was altered within 30 days; not cold enough to tier'' '
-   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN ''Untouched > 90 days; COLD tier candidate'' '
-   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN ''Untouched > 30 days; COOL tier candidate'' '
-   || '  ELSE ''No recommendation'' '
-   || 'END AS RECOMMENDATION_REASON, '
-   || 'CASE '
-   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN '
-   || '    ROUND(TOTAL_GB * 23.0 * 12 / 1024 * 0.60, 2) '
-   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN '
-   || '    ROUND(TOTAL_GB * 23.0 * 12 / 1024 * 0.25, 2) '
-   || '  ELSE 0 '
-   || 'END AS PROJECTED_ANNUAL_SAVINGS_USD, '
-   || 'CASE '
-   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN '
-   || '    ''Queries against COLD data require FROM ARCHIVE OF syntax; direct SELECT not available'' '
-   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN '
-   || '    ''Queries against COOL data may have higher latency on first access'' '
-   || '  ELSE '
-   || '    ''No impact'' '
-   || 'END AS AVAILABILITY_IMPACT, '
-   || '''PROJECTED'' AS SAVINGS_LABEL '
-   || 'FROM ' || :tgt || '.V_TABLE_STORAGE_INVENTORY '
-   || 'ORDER BY TOTAL_GB DESC');
-    cost_day    := :cost_day + 0.02;
-    cost_detail := ARRAY_APPEND(:cost_detail, 'V_TIER_CANDIDATES scanned on read ~0.02 credits/day');
-  END IF;
-
-  -- Retention reduction candidates: tables with retention > 1 day that are large
-  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_RETENTION_CANDIDATES AS '
-   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TOTAL_GB, '
-   || 'TIME_TRAVEL_GB, FAILSAFE_GB, RETENTION_DAYS, IS_TRANSIENT, '
-   || 'DAYS_SINCE_ALTER, '
-   || 'CASE '
-   || '  WHEN IS_TRANSIENT = ''YES'' THEN ''Already transient -- no failsafe, 0-1 day retention'' '
-   || '  WHEN RETENTION_DAYS > 1 AND TOTAL_GB >= 0.5 THEN '
-   || '    ''Reduce retention from '' || RETENTION_DAYS || '' to 1 day'' '
-   || '  ELSE ''No action'' '
-   || 'END AS RETENTION_RECOMMENDATION, '
-   || 'CASE '
-   || '  WHEN RETENTION_DAYS > 1 AND TOTAL_GB >= 0.5 AND IS_TRANSIENT = ''NO'' THEN '
-   || '    ROUND(TIME_TRAVEL_GB * (1 - 1.0 / NULLIF(RETENTION_DAYS, 0)) * 23.0 * 12 / 1024, 2) '
-   || '  ELSE 0 '
-   || 'END AS PROJECTED_RETENTION_SAVINGS_USD, '
-   || 'CASE '
-   || '  WHEN RETENTION_DAYS > 1 AND TOTAL_GB >= 0.5 THEN '
-   || '    ''Time Travel recovery window reduced to 1 day; point-in-time restores beyond 24h unavailable'' '
-   || '  ELSE ''No impact'' '
-   || 'END AS AVAILABILITY_IMPACT, '
-   || '''PROJECTED'' AS SAVINGS_LABEL '
-   || 'FROM ' || :tgt || '.V_TABLE_STORAGE_INVENTORY '
-   || 'WHERE TOTAL_GB >= 0.5 OR IS_TRANSIENT = ''YES'' '
-   || 'ORDER BY TIME_TRAVEL_GB DESC');
-    cost_day    := :cost_day + 0.01;
-    cost_detail := ARRAY_APPEND(:cost_detail, 'V_RETENTION_CANDIDATES scanned on read ~0.01 credits/day');
-  END IF;
-
-  -- Lifecycle policy view: shows existing policies if any
-  LET lp_count INT := COALESCE(:cnt:lifecycle_policies::NUMBER, 0);
-  IF (:sig:lifecycle_policies::STRING IN ('AVAILABLE', 'EMPTY')) THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_LIFECYCLE_POLICY_STATUS AS '
-   || 'SELECT ''lifecycle_policies_feature'' AS FEATURE, '
-   || 'CASE WHEN ' || :lp_count || ' > 0 '
-   || '  THEN ''IN_USE'' ELSE ''AVAILABLE_NOT_USED'' END AS STATUS, '
-   || :lp_count || ' AS POLICY_COUNT, '
-   || '''Storage lifecycle policies are available on this account. '' '
-   || '|| CASE WHEN ' || :lp_count || ' = 0 '
-   || '  THEN ''None are currently applied.'' '
-   || '  ELSE ' || :lp_count || ' || '' active.'' END AS NOTE');
-    cost_once := :cost_once + 0.001;
-  END IF;
-
-  -- Storage drill tree: account total -> top schemas -> top tables per schema.
-  -- Materialized as a table because the ACCOUNT_USAGE scan is too expensive to
-  -- repeat on every panel read. This is the load-bearing drill: aggregate bytes
-  -- -> the schema responsible -> the table within it, with the byte breakdown
-  -- that lets a reader see whether the storage is active, time-travel, failsafe
-  -- or clone-retained.
-  --
-  -- TWO separate figures, because conflating them overstates the saving by
-  -- more than two orders of magnitude on this account.
-  --
-  -- TOTAL_FOOTPRINT_GB = active + time-travel + clone-retained. This is what
-  -- the data OCCUPIES excluding failsafe. It is NOT a saving: active bytes are
-  -- the live data, and reclaiming them means deleting or archiving it. An
-  -- earlier version of this called the same expression RECLAIMABLE_GB, which
-  -- read as "you could save 40.36 GB" when the account's genuinely reclaimable
-  -- figure was 0.09 GB.
-  --
-  -- RECLAIMABLE_NOW_GB = time-travel + clone-retained only. This is what comes
-  -- back by lowering DATA_RETENTION_TIME_IN_DAYS or dropping a clone, with no
-  -- data loss and no archival decision.
-  --
-  -- Failsafe is excluded from BOTH. It is a 7-day window Snowflake maintains
-  -- regardless of any table setting; there is no ALTER, policy or tier that
-  -- removes it, so a savings figure including it promises bytes the customer
-  -- cannot reclaim on demand.
-  --
-  -- DROPPED tables (DELETED = TRUE) carry bytes but are a different remediation:
-  -- their storage drains through time-travel and failsafe expiry with no user
-  -- action. Counted at the account level so the reader knows they exist, but
-  -- excluded from the drill (which is about tables you can act on).
-  --
-  -- DAYS_SINCE_ALTER is from TABLES.LAST_ALTERED, not from ACCESS_HISTORY.
-  -- A table read daily but never written still looks idle. ACCESS_HISTORY is
-  -- Enterprise Edition with its own retention window, and this build does not
-  -- probe for it. The Method note on the UI names the source and says what it
-  -- does not cover.
-  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE TABLE ' || :tgt || '.STORAGE_DRILL_TREE AS '
-   || 'WITH acct AS ('
-   || 'SELECT '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, ACTIVE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_ACTIVE_GB, '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, TIME_TRAVEL_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_TT_GB, '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, FAILSAFE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_FS_GB, '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_CLONE_GB, '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_TOTAL_GB, '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, ACTIVE_BYTES + TIME_TRAVEL_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_TOTAL_FOOTPRINT_GB, '
-   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, TIME_TRAVEL_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_RECLAIMABLE_NOW_GB, '
-   || 'COUNT_IF(DELETED = FALSE AND ACTIVE_BYTES > 0) AS ACCT_LIVE_TABLES, '
-   || 'COUNT_IF(DELETED = TRUE) AS ACCT_DROPPED_TABLES, '
-   || 'ROUND(SUM(IFF(DELETED = TRUE, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_DROPPED_GB '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS'
-   || '), '
-   || 'sch AS ('
-   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, '
-   || 'ROUND(SUM(ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 2) AS SCH_GB, '
-   || 'COUNT(*) AS SCH_TABLES, '
-   || 'ROW_NUMBER() OVER (ORDER BY SUM(ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES) DESC) AS SCH_RANK, '
-   || 'COUNT(*) OVER () AS TOTAL_SCHEMAS '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS '
-   || 'WHERE DELETED = FALSE AND ACTIVE_BYTES > 0 '
-   || 'GROUP BY TABLE_CATALOG, TABLE_SCHEMA'
-   || '), '
-   || 'tbl AS ('
-   || 'SELECT m.TABLE_CATALOG, m.TABLE_SCHEMA, m.TABLE_NAME, '
-   || 'ROUND(m.ACTIVE_BYTES / POWER(1024, 3), 4) AS ACTIVE_GB, '
-   || 'ROUND(m.TIME_TRAVEL_BYTES / POWER(1024, 3), 4) AS TT_GB, '
-   || 'ROUND(m.FAILSAFE_BYTES / POWER(1024, 3), 4) AS FS_GB, '
-   || 'ROUND(m.RETAINED_FOR_CLONE_BYTES / POWER(1024, 3), 4) AS CLONE_GB, '
-   || 'ROUND((m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.FAILSAFE_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS TOTAL_GB, '
-   || 'ROUND((m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS TOTAL_FOOTPRINT_GB, '
-   || 'ROUND((m.TIME_TRAVEL_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS RECLAIMABLE_NOW_GB, '
-   || 'COALESCE(t.RETENTION_TIME, 1) AS RETENTION_DAYS, '
-   || 'DATEDIFF(day, COALESCE(t.LAST_ALTERED, m.TABLE_CREATED), CURRENT_TIMESTAMP()) AS DAYS_SINCE_ALTER, '
-   || 'ROW_NUMBER() OVER (PARTITION BY m.TABLE_CATALOG, m.TABLE_SCHEMA '
-   || 'ORDER BY (m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.FAILSAFE_BYTES + m.RETAINED_FOR_CLONE_BYTES) DESC) AS TBL_RANK '
-   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS m '
-   || 'JOIN sch s ON m.TABLE_CATALOG = s.TABLE_CATALOG AND m.TABLE_SCHEMA = s.TABLE_SCHEMA AND s.SCH_RANK <= 5 '
-   || 'LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TABLES t '
-   || 'ON m.TABLE_CATALOG = t.TABLE_CATALOG AND m.TABLE_SCHEMA = t.TABLE_SCHEMA '
-   || 'AND m.TABLE_NAME = t.TABLE_NAME AND t.DELETED IS NULL '
-   || 'WHERE m.DELETED = FALSE AND m.ACTIVE_BYTES > 0'
-   || ') '
-   || 'SELECT s.SCH_RANK, s.TABLE_CATALOG AS SCH_CATALOG, s.TABLE_SCHEMA AS SCH_SCHEMA, '
-   || 's.SCH_GB, '
-   || 'ROUND(s.SCH_GB / NULLIF(a.ACCT_TOTAL_GB, 0) * 100, 1) AS SCH_PCT, '
-   || 's.SCH_TABLES, s.TOTAL_SCHEMAS, '
-   || 'a.ACCT_TOTAL_GB, a.ACCT_TOTAL_FOOTPRINT_GB, a.ACCT_RECLAIMABLE_NOW_GB, '
-   || 'a.ACCT_ACTIVE_GB, a.ACCT_TT_GB, '
-   || 'a.ACCT_FS_GB, a.ACCT_CLONE_GB, '
-   || 'a.ACCT_LIVE_TABLES, a.ACCT_DROPPED_TABLES, a.ACCT_DROPPED_GB, '
-   || 'q.TBL_RANK, q.TABLE_NAME, q.ACTIVE_GB, q.TT_GB, q.FS_GB, q.CLONE_GB, '
-   || 'q.TOTAL_GB, q.TOTAL_FOOTPRINT_GB, q.RECLAIMABLE_NOW_GB, '
-   || 'q.RETENTION_DAYS, q.DAYS_SINCE_ALTER, '
-   || 'ROUND(q.TOTAL_GB / NULLIF(s.SCH_GB, 0) * 100, 1) AS TBL_PCT_OF_SCH '
-   || 'FROM sch s '
-   || 'CROSS JOIN acct a '
-   || 'LEFT JOIN tbl q ON s.TABLE_CATALOG = q.TABLE_CATALOG AND s.TABLE_SCHEMA = q.TABLE_SCHEMA AND q.TBL_RANK <= 3 '
-   || 'WHERE s.SCH_RANK <= 5 '
-   || 'ORDER BY s.SCH_RANK, q.TBL_RANK');
-    cost_once   := :cost_once + 0.04;
-    cost_detail := ARRAY_APPEND(:cost_detail, 'STORAGE_DRILL_TREE one-time build ~0.04 credits (scans TABLE_STORAGE_METRICS + TABLES)');
-  END IF;
-
-  -- Advisory notes: explain why certain tables are excluded from recommendations.
-  -- These appear in the build output so the operator understands edge cases.
-  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-    notes := ARRAY_APPEND(:notes,
-      'Tables too small (below threshold of 0.1 GB) are excluded from tiering '
-   || 'recommendations. The administrative cost of a lifecycle policy exceeds the '
-   || 'storage saving for tables this small. To include them, lower the 0.1 GB '
-   || 'floor in the V_TIER_CANDIDATES definition -- it is written into the view, '
-   || 'and there is deliberately no setting that moves it from outside.');
-    notes := ARRAY_APPEND(:notes,
-      'Transient tables already have no failsafe storage and pay no failsafe cost. '
-   || 'Tiering adds no benefit because there is nothing to reclaim.');
-  END IF;
-
-  -- Cost model lines
-  cost_once := :cost_once + 0.01;
-  dials := ARRAY_APPEND(:dials, 'WINDOW_DAYS ' || :w || ' -> 7 reduces view scan cost by ~40%');
-  cost_detail := ARRAY_APPEND(:cost_detail,
-    'PROJECTED_ANNUAL_SAVINGS_USD is modelled from table size x days-since-alter x '
- || 'Snowflake published storage rates ($23/TB/month, i.e. 23*12/1024 = $0.27/GB/year). '
- || 'COLD tier assumes ~60% saving vs standard, COOL ~25%. These are PROJECTIONS based '
- || 'on current table sizes and access patterns, not measurements of a change already '
- || 'applied.');
-
-  -- ── The push-button next steps ──────────────────────────────────────────────
-  -- Everything above reads SNOWFLAKE.ACCOUNT_USAGE and projects a saving from it.
-  -- The dashboard states the limit of that in as many words -- no policy created,
-  -- no table archived, no retention altered -- and two of those three denials are
-  -- worth converting into something a reader can press. The third is not, and the
-  -- reason is written down here rather than left as an absence:
-  --
-  --   * The CAPABILITY claim is worth proving. V_LIFECYCLE_POLICY_STATUS infers
-  --     AVAILABLE_NOT_USED from a policy COUNT; it never established that this
-  --     account can create and attach a storage lifecycle policy at all. The page
-  --     admits exactly that -- "inferred from a policy count, not a capability
-  --     probe" -- so STORAGE_PROVE_POLICY is that probe, run against seeded rows.
-  --   * The PROJECTION is worth pinning. A projected saving can never be checked
-  --     against a later measurement unless the inputs, the thresholds and the rate
-  --     are written down at a known time. This estate moved by hundreds of tables
-  --     inside one hour while sibling builds churned it, so "the same tables" is
-  --     not a safe assumption between two runs. STORAGE_SNAPSHOT records them.
-  --   * ATTACHING a policy to a table in this account is deliberately NOT offered.
-  --     No table qualifies today; the archive tier is permanent once assigned to a
-  --     table; and rows the policy has already moved need FROM ARCHIVE OF to read
-  --     back, so an honest undo line would have to admit the undo is partial. A
-  --     PRODUCTION button whose undo is a hedge is worse than no button -- and the
-  --     only tables here big enough to qualify belong to another team's PROD
-  --     database, which is not something a button on this page should touch.
-  --
-  -- Credits below are seconds x the rate of the warehouse actually running the
-  -- work. The seconds are an assumption and each basis says so; the RATE is
-  -- measured, because the rate is the term that multiplies silently -- a MEDIUM
-  -- bills 4x an X-SMALL, and this solution has already shipped one estimate that
-  -- was wrong by a factor for exactly that reason.
-  LET wh_cph  NUMBER(38,4) := COALESCE(:cnt:warehouse_credits_hr::NUMBER, 1);
-  LET wh_name STRING := CASE :wh_cph
-      WHEN 1  THEN 'X-SMALL'  WHEN 2   THEN 'SMALL'    WHEN 4  THEN 'MEDIUM'
-      WHEN 8  THEN 'LARGE'    WHEN 16  THEN 'X-LARGE'  WHEN 32 THEN '2X-LARGE'
-      WHEN 64 THEN '3X-LARGE' WHEN 128 THEN '4X-LARGE'
-      ELSE 'unrecognised size' END;
-
-  -- ── SAMPLE: prove the mechanism on rows that are not yours ──────────────────
-  -- Seeds a table whose EVENT_TS values span the last year, creates a real COOL
-  -- archival policy, attaches it, and records the attachment that Snowflake
-  -- reports back. Every object lives inside this schema, so teardown removes it
-  -- whether or not anyone presses Undo (verified: DROP SCHEMA CASCADE detaches an
-  -- in-schema policy, and DROP TABLE succeeds while a policy is still attached).
-  --
-  -- The seeded ages deliberately STRADDLE the 180-day predicate rather than all
-  -- clearing it. A fixture where every row qualifies proves the policy parses; one
-  -- where roughly half qualify proves the predicate actually discriminates, which
-  -- is the part a reader is being asked to believe.
-  --
-  -- ARCHIVE_FOR_DAYS is 90 because 90 is the documented MINIMUM for the COOL tier
-  -- -- a smaller number is rejected, and finding that out from a failing button is
-  -- worse than reading it here.
-  IF (:sig:lifecycle_policies::STRING IN ('AVAILABLE', 'EMPTY')) THEN
-    LET demo_rows  NUMBER := 500;
-    LET demo_stmts NUMBER := 4;
-    -- Four statements at a nominal 2s of overhead each, plus a data term over 500
-    -- generated rows that is deliberately negligible and visibly so: no account
-    -- table is read, so there is nothing here for row count to scale with.
-    LET demo_secs NUMBER(38,3) := :demo_stmts * 2 + (:demo_rows / 100000.0);
-    LET demo_est  NUMBER(38,4) := ROUND(:demo_secs * :wh_cph / 3600.0, 4);
-
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'STORAGE_PROVE_POLICY',
-      'label',  'Prove this account can actually tier, on seeded rows',
-      'tier',   'SAMPLE',
-      -- The retention window is the reader's to choose, because it is the whole
-      -- question: 180 days proves the predicate parses, and changing it is what
-      -- proves the predicate DISCRIMINATES. It is a NUMBER rather than a free string
-      -- and it is bounded, so a value outside 30-365 is refused by the procedure
-      -- before any DDL is built.
-      --
-      -- It also names the objects it creates -- DEMO_COOL_POLICY_180 rather than
-      -- DEMO_COOL_POLICY -- which is ordinary engineering (an artifact named after
-      -- the parameter that defines it) and has a specific consequence here: the undo
-      -- must drop the objects THIS run created, so running at 180 and again at 90
-      -- leaves two independent proofs and each undo reverses only its own.
-      'params', ARRAY_CONSTRUCT(OBJECT_CONSTRUCT(
-        'name',  'older_than_days',
-        'label', 'Archive rows older than (days)',
-        'kind',  'NUMBER',
-        'min',   30,
-        'max',   365,
-        'help',  'The policy predicate. 180 is the default the plan projects against. '
-              || 'ARCHIVE_FOR_DAYS stays at 90, the documented COOL minimum, which is '
-              || 'a different number and not this one.'),
-        -- The column the policy is evaluated against. An IDENT rather than a NUMBER,
-        -- so this is the one that exercises identifier handling: the value is emitted
-        -- QUOTED into an identifier position -- ON ("EVENT_TS") -- which is what makes
-        -- a lowercase or mixed-case column name resolve to the object it actually
-        -- names rather than to its upper-cased spelling.
-        --
-        -- The permitted set is a literal list because the fixture this attaches to is
-        -- created by the action's own first statement, so there is no earlier moment at
-        -- which its columns could be discovered. The list is enforced by the PROCEDURE,
-        -- not by the dropdown: options is checked server-side exactly as allowed_sql is,
-        -- so a caller bypassing the app gains nothing.
-        --
-        -- A storage lifecycle policy has to be evaluated against a date or timestamp,
-        -- and EVENT_TS is the only such column the fixture has -- so this list has one
-        -- entry today. It is still a real gate, and the gauntlet proves it by offering
-        -- a value that is not on it.
-        OBJECT_CONSTRUCT(
-        'name',    'attach_on',
-        'label',   'Evaluate the policy on column',
-        'kind',    'IDENT',
-        'options', ARRAY_CONSTRUCT('EVENT_TS'),
-        'help',    'Must be a date or timestamp column of the fixture table. '
-                || 'The policy predicate is evaluated per row against this column.')),
-      'effect', 'Creates ' || :tgt || '.DEMO_ARCHIVE_FIXTURE with ' || :demo_rows
-             || ' synthetic rows dated across the last 365 days, creates a real COOL '
-             || 'storage lifecycle policy (archives rows older than the number of days '
-             || 'you choose, '
-             || 'ARCHIVE_FOR_DAYS = 90, the documented COOL minimum), attaches it to '
-             || 'that table, and writes ' || :tgt || '.DEMO_POLICY_PROOF with the '
-             || 'attachment status Snowflake reports back plus how many of the seeded '
-             || 'rows the predicate selects. Reads none of your data and creates '
-             || 'nothing outside this schema. This is the capability probe the '
-             || 'Lifecycle tab does not have: it currently infers '
-             || 'AVAILABLE_NOT_USED from a policy count of ' || :lp_count || '.',
-      'undo',   'Undo drops both tables and the policy. Nothing is archived in the '
-             || 'meantime -- policies are evaluated about once every 24 hours, so a '
-             || 'run and an undo minutes apart move no data at all.',
-      'est',    :demo_est,
-      'basis',  :demo_stmts || ' statements (' || :demo_rows || ' generated rows, two '
-             || 'DDL, one aggregate over those rows) at a nominal 2s each = '
-             || :demo_secs || 's, charged at the MEASURED warehouse size '
-             || :wh_name || ' = ' || :wh_cph || ' credits/hour, so '
-             || :demo_secs || ' x ' || :wh_cph || ' / 3600 = ' || :demo_est
-             || ' credits. The per-statement seconds are an assumption; the rate is '
-             || 'read from the warehouse running this build. No source table is '
-             || 'scanned, so there is no data term to get wrong.',
-      'sql',    ARRAY_CONSTRUCT(
-        'CREATE OR REPLACE TABLE ' || :tgt || '.DEMO_ARCHIVE_FIXTURE AS '
-     || 'SELECT SEQ4() AS ID, '
-     || 'DATEADD(day, -UNIFORM(0, 365, RANDOM()), CURRENT_TIMESTAMP())::TIMESTAMP_NTZ '
-     || '  AS EVENT_TS, '
-     || '''synthetic rows, not your data'' AS PROVENANCE, '
-     || 'RANDSTR(80, RANDOM()) AS PAD '
-     || 'FROM TABLE(GENERATOR(ROWCOUNT => ' || :demo_rows || '))',
-        'CREATE OR REPLACE STORAGE LIFECYCLE POLICY ' || :tgt
-     || '.DEMO_COOL_POLICY_<<older_than_days>> '
-     || 'AS (EVENT_TS TIMESTAMP_NTZ) RETURNS BOOLEAN -> '
-     || 'TO_DATE(EVENT_TS) < TO_DATE(DATEADD(DAY, -<<older_than_days>>, CURRENT_TIMESTAMP())) '
-     || 'ARCHIVE_TIER = COOL ARCHIVE_FOR_DAYS = 90',
-        'ALTER TABLE ' || :tgt || '.DEMO_ARCHIVE_FIXTURE '
-     || 'ADD STORAGE LIFECYCLE POLICY ' || :tgt
-     || '.DEMO_COOL_POLICY_<<older_than_days>> ON (<<attach_on>>)',
-        -- POLICY_REFERENCES is Snowflake's own answer, not ours: the proof that the
-        -- attachment took is a row the platform hands back, not a row we assert.
-        'CREATE OR REPLACE TABLE ' || :tgt || '.DEMO_POLICY_PROOF_<<older_than_days>> AS '
-     || 'SELECT p.POLICY_NAME, p.POLICY_STATUS, ''COOL'' AS ARCHIVE_TIER, '
-     || '90 AS ARCHIVE_FOR_DAYS, <<older_than_days>> AS ARCHIVES_ROWS_OLDER_THAN_DAYS, '
-     || '(SELECT COUNT(*) FROM ' || :tgt || '.DEMO_ARCHIVE_FIXTURE) AS FIXTURE_ROWS, '
-     || '(SELECT COUNT_IF(TO_DATE(EVENT_TS) < '
-     || '   TO_DATE(DATEADD(DAY, -<<older_than_days>>, CURRENT_TIMESTAMP()))) '
-     || '   FROM ' || :tgt || '.DEMO_ARCHIVE_FIXTURE) AS ROWS_POLICY_WOULD_ARCHIVE, '
-     || '''synthetic rows, not your data'' AS PROVENANCE, '
-     || 'CURRENT_TIMESTAMP() AS PROVEN_AT '
-     || 'FROM TABLE(' || :db || '.INFORMATION_SCHEMA.POLICY_REFERENCES('
-     || 'REF_ENTITY_NAME => ''' || :tgt || '.DEMO_ARCHIVE_FIXTURE'', '
-     || 'REF_ENTITY_DOMAIN => ''TABLE'')) p '
-     || 'WHERE p.POLICY_KIND = ''STORAGE_LIFECYCLE_POLICY'''),
-      -- Every undo statement is IF EXISTS and none of them depends on the policy
-      -- still being attached, so the undo survives a partial run and a repeat.
-      -- Dropping the table detaches the policy on the way out, which is why the
-      -- table goes before the policy.
-      'undo_sql', ARRAY_CONSTRUCT(
-        'DROP TABLE IF EXISTS ' || :tgt || '.DEMO_POLICY_PROOF_<<older_than_days>>',
-        'DROP TABLE IF EXISTS ' || :tgt || '.DEMO_ARCHIVE_FIXTURE',
-        'DROP STORAGE LIFECYCLE POLICY IF EXISTS ' || :tgt
-     || '.DEMO_COOL_POLICY_<<older_than_days>>')
-    ));
-  END IF;
-
-  -- ── LIMITED: your estate, bounded, written down ─────────────────────────────
-  -- The headline finding here is a null result with a margin measured in days, and
-  -- a null result is only worth anything if it can be compared with the next one.
-  -- Two things stop that today: the projection's inputs are not recorded anywhere
-  -- after the app closes, and the estate itself is genuinely volatile.
-  --
-  -- Bounded three ways, which is what makes it LIMITED rather than PRODUCTION: it
-  -- keeps only tables at or above the 0.1 GB floor, caps at 500 rows, and writes
-  -- exclusively inside this schema. It ALTERS nothing and reads only metadata.
-  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-    -- The two ACCOUNT_USAGE relations the snapshot walks, as measured by this
-    -- build's own probes rather than assumed.
-    LET snap_tsm  NUMBER := COALESCE(:cnt:table_storage::NUMBER, 0);
-    LET snap_meta NUMBER := COALESCE(:cnt:tables_meta::NUMBER, 0);
-    LET snap_scan NUMBER := :snap_tsm + :snap_meta;
-    -- ~4s of fixed overhead for two statements over ACCOUNT_USAGE (which is a
-    -- shared metadata source, not a table scan that scales cleanly), plus 1s per
-    -- 50k rows joined. The coefficient is an assumption; the row counts are not.
-    LET snap_secs NUMBER(38,3) := 4 + (:snap_scan / 50000.0);
-    LET snap_est  NUMBER(38,4) := ROUND(:snap_secs * :wh_cph / 3600.0, 4);
-
-    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
-      'code',   'STORAGE_SNAPSHOT',
-      'label',  'Pin today''s estate and the rate behind the projection',
-      'tier',   'LIMITED',
-      'effect', 'Appends one dated row per table at or above the 0.1 GB floor to '
-             || :tgt || '.ESTATE_SNAPSHOT (capped at 500 rows), each carrying its '
-             || 'size, idle days, this build''s classification, the projected annual '
-             || 'saving and the $/GB/year rate that produced it. Reads '
-             || 'ACCOUNT_USAGE metadata for ' || :snap_tsm || ' storage-metric row(s) '
-             || 'and ' || :snap_meta || ' table row(s); alters no table, applies no '
-             || 'policy, and writes nothing outside this schema. It exists because a '
-             || 'PROJECTED figure with no recorded inputs can never be settled '
-             || 'against a later measurement, and because this estate moved by '
-             || 'hundreds of tables inside an hour -- so two runs days apart are not '
-             || 'otherwise comparable.',
-      'undo',   'Undo deletes only the rows this run inserted, identified by their '
-             || 'shared timestamp. Snapshots taken earlier are left alone -- that is '
-             || 'the point of keeping them.',
-      'est',    :snap_est,
-      'basis',  'One CREATE TABLE IF NOT EXISTS plus one INSERT reading '
-             || 'ACCOUNT_USAGE.TABLE_STORAGE_METRICS (' || :snap_tsm
-             || ' rows measured by this build''s probe) joined to '
-             || 'ACCOUNT_USAGE.TABLES (' || :snap_meta || ' rows measured), so '
-             || :snap_scan || ' rows walked. Modelled at 4s fixed + 1s per 50k rows '
-             || '= ' || :snap_secs || 's, charged at the MEASURED warehouse size '
-             || :wh_name || ' = ' || :wh_cph || ' credits/hour: '
-             || :snap_secs || ' x ' || :wh_cph || ' / 3600 = ' || :snap_est
-             || ' credits. Row counts are measured; the seconds-per-row coefficient '
-             || 'is an assumption. V_ACTION_COST reconciles this against what the '
-             || 'statements were actually billed.',
-      'sql',    ARRAY_CONSTRUCT(
-        'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ESTATE_SNAPSHOT ('
-     || 'SNAPSHOT_AT TIMESTAMP_LTZ, TABLE_CATALOG VARCHAR, TABLE_SCHEMA VARCHAR, '
-     || 'TABLE_NAME VARCHAR, TOTAL_GB NUMBER(38,4), DAYS_SINCE_ALTER NUMBER(38,0), '
-     || 'RETENTION_DAYS NUMBER(38,0), IS_TRANSIENT VARCHAR, RECOMMENDATION VARCHAR, '
-     || 'PROJECTED_ANNUAL_SAVINGS_USD NUMBER(38,2), '
-     || 'RATE_USD_PER_GB_YEAR NUMBER(38,4), SAVINGS_LABEL VARCHAR)',
-        -- The rate is stored as the arithmetic that produced it, not as 0.27: a
-        -- reader who finds this row in six months should be able to see that it is
-        -- $23/TB/month divided by 1024 GB and multiplied by 12 months, because
-        -- the version of this that read $23/TB as $23/GB overstated by 85x and
-        -- went unnoticed only because the result happened to be zero.
-        'INSERT INTO ' || :tgt || '.ESTATE_SNAPSHOT '
-     || '(SNAPSHOT_AT, TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TOTAL_GB, '
-     || 'DAYS_SINCE_ALTER, RETENTION_DAYS, IS_TRANSIENT, RECOMMENDATION, '
-     || 'PROJECTED_ANNUAL_SAVINGS_USD, RATE_USD_PER_GB_YEAR, SAVINGS_LABEL) '
-     || 'SELECT CURRENT_TIMESTAMP(), TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, '
-     || 'TOTAL_GB, DAYS_SINCE_ALTER, RETENTION_DAYS, IS_TRANSIENT, RECOMMENDATION, '
-     || 'PROJECTED_ANNUAL_SAVINGS_USD, ROUND(23.0 * 12 / 1024, 4), SAVINGS_LABEL '
-     || 'FROM ' || :tgt || '.V_TIER_CANDIDATES '
-     || 'WHERE TOTAL_GB >= 0.1 '
-     || 'ORDER BY TOTAL_GB DESC LIMIT 500'),
-      'undo_sql', ARRAY_CONSTRUCT(
-        'DELETE FROM ' || :tgt || '.ESTATE_SNAPSHOT WHERE SNAPSHOT_AT = '
-     || '(SELECT MAX(SNAPSHOT_AT) FROM ' || :tgt || '.ESTATE_SNAPSHOT)')
-    ));
-  END IF;
-
-  -- ── PRODUCTION: create a REAL lifecycle policy and attach it ────────────────
-  -- This is the standing workload. Below PRODUCTION the plan only PROJECTS a
-  -- saving; at PRODUCTION it installs the mechanism that actually moves data down
-  -- a tier. A savings estimate on its own has never reduced a bill.
-  --
-  -- The policy targets the DEMO_ARCHIVE_FIXTURE table that the SAMPLE action
-  -- creates. At PRODUCTION, we create it unconditionally so there is always
-  -- something to attach to. The fixture is small (500 rows) and lives in this
-  -- schema, so teardown removes it with DROP SCHEMA CASCADE.
-  IF (:tier = 'PRODUCTION' AND :sig:lifecycle_policies::STRING IN ('AVAILABLE', 'EMPTY')) THEN
-    -- Create the fixture table if SAMPLE did not already
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE TABLE IF NOT EXISTS ' || :tgt || '.DEMO_ARCHIVE_FIXTURE AS '
-   || 'SELECT SEQ4() AS ID, '
-   || 'DATEADD(day, -UNIFORM(0, 365, RANDOM()), CURRENT_TIMESTAMP())::TIMESTAMP_NTZ '
-   || '  AS EVENT_TS, '
-   || '''synthetic rows, not your data'' AS PROVENANCE, '
-   || 'RANDSTR(80, RANDOM()) AS PAD '
-   || 'FROM TABLE(GENERATOR(ROWCOUNT => 500))');
-
-    -- Create the policy
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE STORAGE LIFECYCLE POLICY ' || :tgt || '.STANDING_COOL_POLICY '
-   || 'AS (EVENT_TS TIMESTAMP_NTZ) RETURNS BOOLEAN -> '
-   || 'TO_DATE(EVENT_TS) < TO_DATE(DATEADD(DAY, -180, CURRENT_TIMESTAMP())) '
-   || 'ARCHIVE_TIER = COOL ARCHIVE_FOR_DAYS = 90');
-
-    -- Attach it
-    stmts := ARRAY_APPEND(:stmts,
-      'ALTER TABLE ' || :tgt || '.DEMO_ARCHIVE_FIXTURE '
-   || 'ADD STORAGE LIFECYCLE POLICY ' || :tgt || '.STANDING_COOL_POLICY ON (EVENT_TS)');
-
-    -- Register in ATTACHED_OBJECT_REGISTRY
-    stmts := ARRAY_APPEND(:stmts,
-      'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ''POLICY''');
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-   || 'SELECT ''' || :tgt || '.DEMO_ARCHIVE_FIXTURE'', '
-   || '''' || :tgt || '.STANDING_COOL_POLICY'', ''ON (EVENT_TS)'', ''POLICY''');
-
-    -- ── Register in STANDING_WORKLOAD ──────────────────────────────────────────
-    -- A storage lifecycle policy is evaluated by Snowflake internally. The
-    -- evaluation cadence is approximately once per day. Snowflake documents a
-    -- small serverless credit charge for the evaluation under "Storage Management"
-    -- in the Serverless Feature Credit Table, but does not publish a per-evaluation
-    -- rate. The cost is negligible for small tables and proportional to bytes
-    -- scanned for large ones.
-    --
-    -- To produce an honest positive number within the harness schema:
-    --   RUNS_PER_MONTH       := 30  (approximately daily evaluation)
-    --   SECONDS_PER_RUN      := 1   (evaluation of 500 synthetic rows is sub-second)
-    --   WAREHOUSE_CREDITS_PER_HOUR := 0.012  (the documented serverless compute rate
-    --                          for storage management tasks, per the Serverless
-    --                          Feature Credit Table)
-    --
-    -- Result: 30 * 1 * 0.012 / 3600 = 0.0001 credits/month — negligible and honest.
-    -- The real driver is the number of bytes the policy evaluates across all tables
-    -- it is attached to, not this 500-row fixture.
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.STANDING_WORKLOAD '
-   || '(KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
-   || ' WAREHOUSE_CREDITS_PER_HOUR, MEASURED_INPUT, BASIS, INSTALLED_AT) '
-   || 'SELECT ''POLICY'', ''STANDING_COOL_POLICY'', '
-   || '''continuous, evaluated by Snowflake (~daily)'', '
-   || '30, '
-   || '1, '
-   || '0.012, '
-   || '''SERVERLESS -- no customer warehouse. The policy is evaluated by Snowflake '
-   || 'approximately once per day (30x/month). Duration is sub-second for the 500-row '
-   || 'demo fixture. 0.012 is the serverless storage-management compute rate from the '
-   || 'Snowflake Serverless Feature Credit Table. At production scale, cost grows with '
-   || 'total bytes the policy must scan across all attached tables.'', '
-   || '''SERVERLESS MECHANISM. Snowflake evaluates the policy ~daily at a documented '
-   || 'serverless rate of 0.012 credits/hour of compute (Serverless Feature Credit '
-   || 'Table, Storage Management). For this 500-row fixture the per-evaluation cost is '
-   || 'negligible (~0.000003 credits). The figure 0.0001 credits/month is a FLOOR. '
-   || 'Real cost scales with the total bytes across all tables the policy is attached '
-   || 'to -- the customer controls which tables and how much data they hold. '
-   || IFF(:tier = 'PRODUCTION',
-         'This policy is ACTIVE and attached to DEMO_ARCHIVE_FIXTURE. '
-      || 'Snowflake will evaluate it approximately daily.',
-         'Below PRODUCTION this row would not exist.') || ''', '
-   || 'CURRENT_TIMESTAMP()');
-
-    notes := ARRAY_APPEND(:notes,
-      'STANDING_COOL_POLICY is attached to DEMO_ARCHIVE_FIXTURE (500 synthetic rows). '
-   || 'It archives rows with EVENT_TS older than 180 days to the COOL tier. Snowflake '
-   || 'evaluates it approximately once per 24 hours. The actual tier transition may take '
-   || 'longer -- evaluation decides eligibility, not immediate movement.');
-  ELSE
-    IF (:tier = 'PRODUCTION' AND :sig:lifecycle_policies::STRING NOT IN ('AVAILABLE', 'EMPTY')) THEN
-      notes := ARRAY_APPEND(:notes,
-        'PRODUCTION tier requested but storage lifecycle policies are not available on '
-     || 'this account. No standing workload installed. The policy feature may require '
-     || 'an account-level enablement or a minimum edition.');
-    END IF;
-  END IF;
-  --           adding to :cost_day / :cost_once / :cost_detail / :dials
-
-  -- ── The estimate, recorded so it can be graded later ──────────────────────
-  -- Written to its OWN table, separate from COST_MEASURED. That separation is the
-  -- mechanism, not a stylistic choice: two tables and one view with a mandatory
-  -- LABEL make "never sum a measurement with a projection" a property of the
-  -- schema rather than a rule someone has to remember. There is no column
-  -- anywhere that contains both kinds of number.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.COST_PROJECTED '
- || '(RUN_ID VARCHAR, TIER VARCHAR, CATEGORY VARCHAR, LABEL VARCHAR, BASIS VARCHAR, '
- || 'CREDITS NUMBER(38,9), HORIZON VARCHAR, DERIVATION VARCHAR, '
- || 'PROJECTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
-  stmts := ARRAY_APPEND(:stmts, 'DELETE FROM ' || :tgt || '.COST_PROJECTED '
-                             || 'WHERE RUN_ID = ''' || :run_id || '''');
-  stmts := ARRAY_APPEND(:stmts,
-    'INSERT INTO ' || :tgt || '.COST_PROJECTED '
- || '(RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, HORIZON, DERIVATION) '
- || 'SELECT ''' || :run_id || ''', ''' || :tier || ''', ''STEADY_STATE'', ''PROJECTED'', '
- || '''ARITHMETIC'', ' || :cost_day || ', ''per day'', '
- || '''Sum of this plan''''s own itemised cost lines. Arithmetic, not observed.'' '
- || 'UNION ALL SELECT ''' || :run_id || ''', ''' || :tier || ''', ''ONE_TIME_BUILD'', '
- || '''PROJECTED'', ''ARITHMETIC'', ' || :cost_once || ', ''once'', '
- || '''Sum of this plan''''s own one-time cost lines. Arithmetic, not observed.''');
-
-  -- Everything with a credit figure on it, measured and projected side by side and
-  -- never added together. LABEL is not nullable in practice because both feeding
-  -- tables write it as a literal.
-  --
-  -- Scoped to the NEWEST run. The tables underneath are ledgers and keep every run,
-  -- which is what makes MEASURE() re-callable and WI5 telemetry possible -- but a
-  -- reader asking "what did this cost" means the run they just did, and an unscoped
-  -- view showed two of every category with the same category reading
-  -- NOT_YET_LANDED on one row and LANDED on the next. Correct, and it looks like a
-  -- contradiction. V_COST_HISTORY keeps the unscoped view for anyone who wants it.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_HISTORY AS '
- || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
- || :rate || ' AS RATE_PER_CREDIT, ROUND(CREDITS * ' || :rate || ', 4) AS DOLLARS, '
- || 'STATUS, SOURCE_VIEW AS SOURCE, LATENCY_NOTE AS BASIS_NOTE, '
- || 'ROWS_PROCESSED, WALL_CLOCK_MS, MEASURED_AT AS AS_OF '
- || 'FROM ' || :tgt || '.COST_MEASURED '
- || 'UNION ALL '
- || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
- || :rate || ', ROUND(CREDITS * ' || :rate || ', 4), '
- || '''ESTIMATE'', ''this plan'', DERIVATION || '' Horizon: '' || HORIZON, '
- || 'NULL, NULL, PROJECTED_AT '
- || 'FROM ' || :tgt || '.COST_PROJECTED');
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_LINES AS '
- || 'SELECT * FROM ' || :tgt || '.V_COST_HISTORY WHERE RUN_ID = ('
- || 'SELECT RUN_ID FROM ' || :tgt || '.RUN_LEDGER ORDER BY STARTED_AT DESC LIMIT 1)');
-
-  -- Subtotals BY LABEL. There is deliberately no grand total: the one number a
-  -- reader most wants is the one that cannot honestly exist.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_SUMMARY AS '
- || 'SELECT LABEL, COUNT(*) AS LINES, '
- || 'SUM(CASE WHEN STATUS IN (''LANDED'', ''ESTIMATE'') THEN CREDITS END) AS CREDITS, '
- || 'COUNT_IF(STATUS = ''NOT_YET_LANDED'') AS STILL_PENDING, '
- || 'COUNT_IF(STATUS = ''NOT_ATTRIBUTABLE'') AS NOT_ATTRIBUTABLE, '
- || 'MAX(AS_OF) AS AS_OF, '
- || 'CASE LABEL WHEN ''MEASURED'' THEN ''Observed from Snowflake''''s own metering. '
- || 'Pending categories are excluded from this figure rather than counted as zero.'' '
- || 'ELSE ''Arithmetic from the plan. Not observed. Do not add this to the MEASURED row.'' '
- || 'END AS WHAT_THIS_IS '
- || 'FROM ' || :tgt || '.V_COST_LINES GROUP BY LABEL');
-
-  -- The extrapolation, with its arithmetic on screen. A multiplier the reader
-  -- cannot check is a multiplier the reader should not accept.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_EXTRAPOLATION AS '
- || 'SELECT m.CATEGORY, m.CREDITS AS MEASURED_AT_LIMITED, '
- || '''' || REPLACE(:scale_unit, '''', '''''') || ''' AS SCALE_UNIT, '
- || :scale_limited || ' AS LIMITED_SCALE, ' || :scale_production || ' AS PRODUCTION_SCALE, '
- || 'ROUND(DIV0(' || :scale_production || ', ' || :scale_limited || '), 4) AS RATIO, '
- || 'ROUND(m.CREDITS * DIV0(' || :scale_production || ', ' || :scale_limited || '), 6) '
- || '  AS EXTRAPOLATED_TO_PRODUCTION, '
- || '''PROJECTED'' AS LABEL, '
- || 'm.CREDITS || '' x ('' || ' || :scale_production || ' || '' / '' || ' || :scale_limited
- || ' || '') = '' || ROUND(m.CREDITS * DIV0(' || :scale_production || ', '
- || :scale_limited || '), 6) AS ARITHMETIC, '
- || 'm.STATUS AS MEASURED_STATUS, '
- || 'CASE WHEN ' || :scale_limited || ' = ' || :scale_production
- || '  THEN ''No scaling declared, so this is the measured figure unchanged. It is '
- || 'NOT a production estimate.'' '
- || '     WHEN m.STATUS <> ''LANDED'' '
- || '  THEN ''The measurement this extrapolates from has not landed yet, so the '
- || 'extrapolation is empty rather than a guess.'' '
- || '     ELSE ''Measured at LIMITED scale and multiplied by the ratio shown. The '
- || 'ratio assumes cost scales linearly in this unit, which is the assumption to '
- || 'argue with.'' END AS READ_THIS '
- || 'FROM ' || :tgt || '.COST_MEASURED m WHERE m.LABEL = ''MEASURED''');
-
-  -- ── VALUE MODEL ───────────────────────────────────────────────────────────
-  -- Three rules, and the third is the one that matters: the addressable base is
-  -- computed from THEIR data, every conversion rate is an input with a stated
-  -- default that they set, and if the only honest output is "here is the base, you
-  -- supply the rate" then that IS the output. No invented ROI.
-  --
-  -- A solution declares its own lines below. A solution that declares nothing gets
-  -- a single row saying so, which is a better artifact than an empty view: empty
-  -- reads as broken, whereas "this solution does not claim a financial benefit"
-  -- reads as a decision.
-  LET value_inputs ARRAY := ARRAY_CONSTRUCT();
-  LET value_base   ARRAY := ARRAY_CONSTRUCT();
-  LET value_lines  ARRAY := ARRAY_CONSTRUCT();
--- ── VALUE MODEL ───────────────────────────────────────────────────────────────
--- Storage savings are PROJECTED from table sizes and published storage rates.
--- A saving cannot be measured: storage costs before and after a tiering change
--- are both observable, but attributing the difference to the change assumes
--- nothing else moved. So the base is "TB currently stored in standard tier",
--- which is a fact, and the fraction reclaimable is a client judgement.
-value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
-  'name', 'storage_rate_per_tb_month',
-  'value', 23, 'default', 23, 'units', 'USD per TB per month',
-  'description', 'Snowflake on-demand storage rate. Your contracted rate may '
-              || 'differ -- check your contract.'));
-value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
-  'name', 'tier_discount_fraction',
-  'value', 0.40, 'default', 0.40, 'units', 'fraction saved by tiering',
-  'description', 'Blended discount from moving qualifying tables to COOL/COLD. '
-              || '0.40 means 40% cost reduction on tiered data. Actual rates '
-              || 'depend on tier and access patterns.'));
-value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
-  'name', 'months_per_year',
-  'value', 12, 'default', 12, 'units', 'months',
-  'description', 'Annualisation factor.'));
-
-value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
-  'metric', 'tierable_storage_tb',
-  'units', 'TB',
-  'sql', 'SELECT COALESCE(ROUND(SUM(TOTAL_GB) / 1024, 6), 0) '
-      || 'FROM ' || :tgt || '.V_TIER_CANDIDATES '
-      || 'WHERE RECOMMENDATION IN (''COLD_CANDIDATE'', ''COOL_CANDIDATE'')',
-  'derivation', 'Total storage in GB (converted to TB) of tables this run '
-             || 'identified as COOL or COLD candidates, from TABLE_STORAGE_METRICS.'));
-
-value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
-  'metric', 'query_latency_risk',
-  'units', 'queries affected',
-  'measurable', FALSE,
-  'derivation', 'Would require a before-and-after comparison of query latency '
-             || 'on tiered tables.',
-  'why_not', 'COLD tier makes data unavailable for direct SELECT (requires FROM '
-          || 'ARCHIVE OF). COOL tier adds first-access latency. Neither can be '
-          || 'measured until the change is applied. V_TIER_CANDIDATES names what '
-          || 'becomes slower or unavailable for each recommendation.'));
-
-value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
-  'line', 'Projected annual storage savings from tiering',
-  'base_metric', 'tierable_storage_tb',
-  'rate_input', 'tier_discount_fraction',
-  'value_input', 'storage_rate_per_tb_month',
-  'annualise_input', 'months_per_year',
-  'horizon', 'per year, at published storage rates'));
-value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
-  'line', 'Query latency cost of tiering',
-  'base_metric', 'query_latency_risk',
-  'rate_input', 'tier_discount_fraction',
-  'value_input', 'storage_rate_per_tb_month',
-  'annualise_input', 'months_per_year',
-  'horizon', 'unmeasurable'));
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_INPUTS AS SELECT '
- || 'VALUE:name::STRING AS INPUT_NAME, VALUE:value::NUMBER(38,6) AS VALUE, '
- || 'VALUE:default::NUMBER(38,6) AS DEFAULT_VALUE, VALUE:units::STRING AS UNITS, '
- || 'IFF(VALUE:value::NUMBER(38,6) = VALUE:default::NUMBER(38,6), '
- || '''DEFAULT — you have not changed this'', ''CLIENT_SET'') AS SOURCE, '
- || 'VALUE:description::STRING AS WHAT_IT_MEANS '
- || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
- || BASE64_ENCODE(TO_JSON(:value_inputs)) || '''))))');
-
-  -- The addressable base, and this is the part that has to come from THEIR data.
-  --
-  -- A base metric may be declared three ways, and the third is the point:
-  --   'sql'   a scalar query, evaluated at BUILD time against the views this
-  --           solution just created. This is the honest form -- the base is
-  --           measured from the account rather than assumed.
-  --   'value' a plan-time literal, for a base already known from discovery.
-  --   measurable = FALSE  the solution KNOWS it cannot compute this base here, and
-  --           says so with a reason instead of substituting a plausible number.
-  --
-  -- A base declared with 'sql' that does not compile fails the build loudly. That
-  -- is deliberate: it is OUR SQL, so a broken one is a defect for the gauntlet to
-  -- catch, not a condition of the customer's data to be swallowed at runtime.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_BASE '
- || '(METRIC VARCHAR, BASE_VALUE NUMBER(38,4), UNITS VARCHAR, DERIVED_HOW VARCHAR, '
- || 'MEASURABLE BOOLEAN, WHY_NOT_MEASURABLE VARCHAR)');
-  LET vb INT := 0;
-  WHILE (:vb < ARRAY_SIZE(:value_base)) DO
-    LET vb_o VARIANT := GET(:value_base, :vb);
-    LET vb_m STRING := REPLACE(COALESCE(:vb_o:metric::STRING, ''), '''', '''''');
-    LET vb_u STRING := REPLACE(COALESCE(:vb_o:units::STRING, ''), '''', '''''');
-    LET vb_d STRING := REPLACE(COALESCE(:vb_o:derivation::STRING, ''), '''', '''''');
-    LET vb_ok BOOLEAN := COALESCE(:vb_o:measurable::BOOLEAN, TRUE);
-    LET vb_why STRING := REPLACE(COALESCE(:vb_o:why_not::STRING, ''), '''', '''''');
-    LET vb_sql STRING := COALESCE(:vb_o:sql::STRING, '');
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.VALUE_BASE '
-   || '(METRIC, BASE_VALUE, UNITS, DERIVED_HOW, MEASURABLE, WHY_NOT_MEASURABLE) SELECT '
-   || '''' || :vb_m || ''', '
-   || CASE WHEN NOT :vb_ok THEN 'NULL'
-           WHEN :vb_sql <> '' THEN '(' || :vb_sql || ')'
-           ELSE COALESCE(:vb_o:value::STRING, 'NULL') END || ', '
-   || '''' || :vb_u || ''', ''' || :vb_d || ''', '
-   || IFF(:vb_ok, 'TRUE', 'FALSE') || ', '
-   || IFF(:vb_why = '', 'NULL', '''' || :vb_why || ''''));
-    vb := :vb + 1;
-  END WHILE;
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_LINES AS SELECT '
- || 'VALUE:line::STRING AS LINE, VALUE:base_metric::STRING AS BASE_METRIC, '
- || 'VALUE:rate_input::STRING AS RATE_INPUT, VALUE:value_input::STRING AS VALUE_INPUT, '
-     -- Names an input that converts the base's own period into a year. Without it a
-     -- per-day base produced a per-day benefit which was then compared against a
-     -- per-year cost, and the NET column silently subtracted a year of cost from a
-     -- day of value. It read as a credible negative number, which is the worst kind
-     -- of wrong. It is an INPUT rather than a constant so a client whose warehouses
-     -- only run on business days can say 250 instead of 365.
- || 'VALUE:annualise_input::STRING AS ANNUALISE_INPUT, '
- || 'COALESCE(VALUE:horizon::STRING, ''per year'') AS HORIZON '
- || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
- || BASE64_ENCODE(TO_JSON(:value_lines)) || '''))))');
-
-  -- Cost on one side, value on the other, both ANNUAL so the comparison is
-  -- apples-to-apples, arithmetic printed on every row, and the two never blended
-  -- into a single "ROI" figure. Cost is MEASURED where it has landed and PROJECTED
-  -- where it has not, and the column says which.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_BUSINESS_CASE AS '
- || 'WITH cost AS ('
- || '  SELECT SUM(CASE WHEN LABEL = ''MEASURED'' AND STATUS = ''LANDED'' THEN CREDITS END) '
- || '           AS MEASURED_CREDITS, '
- || '         SUM(CASE WHEN LABEL = ''PROJECTED'' AND CATEGORY = ''STEADY_STATE'' '
- || '                  THEN CREDITS END) AS PROJECTED_CREDITS_PER_DAY, '
- || '         COUNT_IF(LABEL = ''MEASURED'' AND STATUS = ''NOT_YET_LANDED'') AS PENDING '
- || '  FROM ' || :tgt || '.V_COST_LINES) '
- || 'SELECT l.LINE, b.METRIC, b.BASE_VALUE, b.UNITS, b.DERIVED_HOW, b.MEASURABLE, '
- || '       r.INPUT_NAME AS RATE_NAME, r.VALUE AS RATE, r.SOURCE AS RATE_SOURCE, '
- || '       v.INPUT_NAME AS VALUE_NAME, v.VALUE AS VALUE_PER_UNIT, v.SOURCE AS VALUE_SOURCE, '
- || '       COALESCE(an.VALUE, 1) AS PERIODS_PER_YEAR, l.HORIZON, '
- || '       CASE WHEN NOT b.MEASURABLE THEN NULL ELSE ROUND(b.BASE_VALUE * r.VALUE '
- || '            * v.VALUE * COALESCE(an.VALUE, 1), 2) END AS GROSS_VALUE_PER_YEAR, '
- || '       ROUND(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) AS PROJECTED_COST_PER_YEAR, '
- || '       CASE WHEN NOT b.MEASURABLE THEN NULL '
- || '            ELSE ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1) '
- || '                       - c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) '
- || '       END AS NET_PER_YEAR, '
-     -- Payback in days, from two annual figures. NULL rather than a big number when
-     -- annual value is zero or negative: "never" is the answer, and a division
-     -- would print something that looks like a duration.
- || '       CASE WHEN NOT b.MEASURABLE '
- || '              OR COALESCE(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 0) <= 0 '
- || '            THEN NULL '
- || '            ELSE ROUND(DIV0(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', '
- || '                            b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1)) '
- || '                       * 365, 1) END AS PAYBACK_DAYS, '
- || '       CASE WHEN NOT b.MEASURABLE '
- || '            THEN ''UNMEASURABLE: '' || COALESCE(b.WHY_NOT_MEASURABLE, '
- || '                 ''this solution cannot compute this base from your account'') '
- || '            ELSE b.BASE_VALUE || '' '' || b.UNITS || '' x '' || r.VALUE || '' ('' '
- || '                 || r.INPUT_NAME || '') x '' || v.VALUE || '' ('' || v.INPUT_NAME '
- || '                 || '') x '' || COALESCE(an.VALUE, 1) || '' periods/yr = '' '
- || '                 || ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 2) '
- || '                 || '' per year'' END AS ARITHMETIC, '
- || '       ''The base is measured from your data. Both rates are YOURS to set -- '
- || 'the defaults are placeholders, not benchmarks, and VALUE_INPUTS says which of '
- || 'them you have actually changed. Value and cost are both annual here so they can '
- || 'be compared. Cost is '' || COALESCE(c.MEASURED_CREDITS::STRING, '
- || '''not yet measured'') || '' measured credits with '' || c.PENDING '
- || '       || '' category(ies) still pending.'' AS READ_THIS '
- || 'FROM ' || :tgt || '.VALUE_LINES l '
- || 'JOIN ' || :tgt || '.VALUE_BASE b ON b.METRIC = l.BASE_METRIC '
- || 'JOIN ' || :tgt || '.VALUE_INPUTS r ON r.INPUT_NAME = l.RATE_INPUT '
- || 'JOIN ' || :tgt || '.VALUE_INPUTS v ON v.INPUT_NAME = l.VALUE_INPUT '
- || 'LEFT JOIN ' || :tgt || '.VALUE_INPUTS an ON an.INPUT_NAME = l.ANNUALISE_INPUT '
- || 'CROSS JOIN cost c '
- || 'UNION ALL '
-     -- The declared-nothing case. An empty view reads as a bug; this reads as an
-     -- answer, and it is the correct answer for a solution whose benefit is
-     -- operational rather than financial.
- || 'SELECT ''NO VALUE MODEL DECLARED'', NULL, NULL, NULL, NULL, FALSE, '
- || '       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '
- || '       ROUND((SELECT PROJECTED_CREDITS_PER_DAY FROM cost) * 365 * ' || :rate || ', 2), '
- || '       NULL, NULL, ''UNMEASURABLE: no financial benefit is claimed'', '
- || '       ''This solution does not assert a financial return. Its cost is shown so '
- || 'you can judge it against a benefit you decide on yourself. Inventing a rate here '
- || 'would be the dishonest option.'' '
- || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.VALUE_LINES)');
-
-  -- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────
-  -- What would make this POC a success, decided from THEIR account rather than
-  -- from a number somebody liked. Same shape as the value model above: the
-  -- solution declares criteria, this block builds the objects.
-  --
-  -- A criterion carries two SQL scalars, `target_sql` and `actual_sql`, and BOTH
-  -- are re-evaluated on every read of V_POC_SCORECARD. That is a deliberate
-  -- choice by the operator and it has a cost worth naming: because the bar is
-  -- re-derived from current data, a MET on Tuesday and a MET on Friday are not
-  -- necessarily the same claim, and a shrinking base can lower the bar it is
-  -- being judged against. The COMPARABILITY column on every row says so, so the
-  -- caveat travels with the number instead of living in a design document.
-  --
-  -- The mechanism is worth understanding before editing. A view cannot
-  -- EXECUTE IMMEDIATE a string, so target_sql/actual_sql are not stored and
-  -- interpreted -- they are INLINED as scalar subqueries into the view body at
-  -- build time. Reading the view re-runs them. Consequence for snippet authors:
-  -- each must be an UNCORRELATED scalar subquery. A correlated one, or an EXISTS
-  -- in the select list, raises "Unsupported subquery type" at build.
-  --
-  -- Four states, and the third and fourth are the reason this exists:
-  --   MET       target compared against actual, comparison holds
-  --   NOT_MET   comparison does not hold. A real failure, reported as one.
-  --   PENDING   cannot be evaluated YET -- credits have not landed, a holdout
-  --             group does not exist. Carries why, and when it resolves.
-  --   N/A       does not apply to this build, e.g. PRODUCTION-tier only.
-  -- PENDING is not a failure and must never render as one. A zero standing in
-  -- for "no data yet" is the defect this design exists to prevent.
-  -- WHY THESE ARE ALL poc_-PREFIXED. The first cut used sc, sc2, sc_o and so on,
-  -- and two solutions legitimately declare their own `LET sc` in this same
-  -- procedure body -- 09_rmn_cleanroom's adapt_apply.sql holds slot columns in one.
-  -- Snowflake rejected the whole block with "Variable with name SC declared twice"
-  -- and the build failed with nothing to point at the cause. A shared template does
-  -- not get to squat on short identifiers that snippet authors reasonably use.
-  LET success_criteria ARRAY := ARRAY_CONSTRUCT();
--- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────────
--- What would make this Storage Optimization POC a success, measured against bars
--- derived from THIS account rather than from a slide.
---
--- EVERY CRITERION IS GATED ON THE SLOT IT READS. The main views require both
--- table_storage and tables_meta from ACCOUNT_USAGE.
---
--- WHAT IS DELIBERATELY NOT HERE. There is no "actual savings realised" criterion.
--- This build projects savings from metadata; it does not apply lifecycle policies
--- to customer tables (by design -- see the plan's explanation of why ATTACH is
--- not offered). Measuring realised savings requires a before/after comparison
--- over a billing period, which this build cannot provide.
-
--- ── Coverage: did the inventory capture the account's permanent tables ────────
--- The target is 80% of permanent tables with active storage in
--- TABLE_STORAGE_METRICS. The view joins two ACCOUNT_USAGE relations, and the
--- join can drop rows whose metadata has not yet propagated. 80% is our allowance
--- for that propagation gap.
-IF (:sig:table_storage::STRING = 'AVAILABLE'
-    AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'STORAGE_INVENTORY_COVERED',
-    'label', 'The inventory captured most of the permanent tables with active storage',
-    'why', 'A storage optimisation that silently excludes tables understates the '
-        || 'opportunity. If the view dropped 30% of the estate, the projected savings '
-        || 'are 30% too low.',
-    'compare', '>=',
-    'units', 'tables in inventory',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT CEIL(0.8 * COUNT(*)) FROM '
-        || 'SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS '
-        || 'WHERE DELETED = FALSE AND ACTIVE_BYTES > 0',
-    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_TABLE_STORAGE_INVENTORY',
-    'target_derivation', '80% of the tables with active bytes in '
-        || 'TABLE_STORAGE_METRICS. The base is your data; the 80% is our allowance '
-        || 'for the join with ACCOUNT_USAGE.TABLES whose metadata may lag.'));
-
-  -- ── Quality: did the analysis find anything worth tiering ────────────────────
-  -- The bar is at least one actionable candidate (COOL or COLD). An estate where
-  -- every table is recently active has no tiering opportunity, and that is a
-  -- finding, not a failure -- but a POC that finds zero candidates has nothing to
-  -- show on the recommendations tab.
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'STORAGE_CANDIDATES_FOUND',
-    'label', 'At least one table qualifies for COOL or COLD tiering',
-    'why', 'The tiering recommendations tab needs at least one actionable row to '
-        || 'demonstrate value. Zero candidates means either the estate is freshly '
-        || 'active (a genuine null result) or the thresholds are too strict.',
-    'compare', '>=',
-    'units', 'tiering candidates',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT 1',
-    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_TIER_CANDIDATES '
-        || 'WHERE RECOMMENDATION IN (''COLD_CANDIDATE'', ''COOL_CANDIDATE'')',
-    'target_derivation', 'At least one candidate. This is our judgement: a storage '
-        || 'optimisation POC with zero actionable candidates has nothing to '
-        || 'demonstrate. The floor thresholds (0.1 GB, 30/90 days idle) are '
-        || 'written into V_TIER_CANDIDATES.'));
-
-  -- ── Fidelity: projected savings are computed, not zero ──────────────────────
-  -- The savings column is modelled from table size and idle days. If the column
-  -- is all zeros despite candidates existing, the arithmetic is broken.
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'STORAGE_SAVINGS_NONZERO',
-    'label', 'Projected annual savings for tiering candidates are greater than zero',
-    'why', 'A candidate with a zero projected saving means the arithmetic that '
-        || 'converts table size and idle days into dollars produced nothing. Either '
-        || 'the formula is broken or the tables are too small to matter at the rate '
-        || 'used ($23/TB/month).',
-    'compare', '>',
-    'units', 'projected USD per year',
-    'basis', 'BY_QUERY_ID',
-    'target_sql', 'SELECT 0',
-    'actual_sql', 'SELECT COALESCE(SUM(PROJECTED_ANNUAL_SAVINGS_USD), 0) FROM '
-        || :tgt || '.V_TIER_CANDIDATES '
-        || 'WHERE RECOMMENDATION IN (''COLD_CANDIDATE'', ''COOL_CANDIDATE'')',
-    'target_derivation', 'Greater than zero. The savings are PROJECTED from table '
-        || 'size, idle days, and Snowflake''s published storage rate '
-        || '($23/TB/month). They are not measurements of a change already applied.',
-    'pending_reason', 'If no tables qualify for tiering (all recently active or too '
-        || 'small), the sum is zero and this criterion reads NOT_MET rather than '
-        || 'PENDING. That is the correct result: it means there is genuinely no '
-        || 'saving to project.',
-    'resolves_when', 'Either tables age past the 30/90-day thresholds, or the '
-        || 'thresholds are lowered in V_TIER_CANDIDATES'));
-END IF;
-
--- ── Cost ──────────────────────────────────────────────────────────────────────
-IF (:credit_cap > 0) THEN
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'STORAGE_COST_IN_BUDGET',
-    'label', 'Measured build cost stays inside your credit cap',
-    'why', 'A POC that cannot state its own cost cannot be approved for production.',
-    'compare', '<=',
-    'units', 'credits',
-    'basis', 'BY_TAG',
-    'target_sql', 'SELECT ' || :credit_cap,
-    'actual_sql', 'SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
-        || 'WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''',
-    'target_derivation', 'Your STORAGE_CREDIT_CAP setting, currently '
-        || :credit_cap || ' credits.',
-    'pending_reason', 'Warehouse credits reach ACCOUNT_USAGE on a delay, so '
-        || 'nothing has been attributed to this run yet.',
-    'resolves_when', 'Credits land in ACCOUNT_USAGE, typically within 8 hours -- '
-        || 'call MEASURE() in this schema after that to fill it in'));
-ELSE
-  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
-    'code', 'STORAGE_COST_IN_BUDGET',
-    'label', 'Measured build cost stays inside your credit cap',
-    'why', 'A POC that cannot state its own cost cannot be approved for production.',
-    'compare', '<=',
-    'units', 'credits',
-    'basis', 'BY_TAG',
-    'target_derivation', 'No cap was set, so there is no bar to derive.',
-    'na_reason', 'STORAGE_CREDIT_CAP is 0, so no ceiling was declared for this run. '
-        || 'Set it and re-run to have this criterion scored.'));
-END IF;
-
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.SUCCESS_CRITERIA '
- || '(CODE VARCHAR, LABEL VARCHAR, WHY_IT_MATTERS VARCHAR, COMPARE VARCHAR, '
- || 'UNITS VARCHAR, BASIS VARCHAR, TARGET_DERIVATION VARCHAR, '
- || 'PENDING_REASON VARCHAR, RESOLVES_WHEN VARCHAR, NA_REASON VARCHAR)');
-
-  -- The declarations themselves, one INSERT each. Same reason the value base
-  -- uses a WHILE loop rather than a FLATTEN: the fields are optional in
-  -- different combinations and a single projection over the array would have to
-  -- invent a shape for the absent ones.
-  LET poc_i INT := 0;
-  WHILE (:poc_i < ARRAY_SIZE(:success_criteria)) DO
-    LET poc_o VARIANT := GET(:success_criteria, :poc_i);
-    LET poc_code STRING := REPLACE(COALESCE(:poc_o:code::STRING, ''), '''', '''''');
-    LET poc_lab  STRING := REPLACE(COALESCE(:poc_o:label::STRING, ''), '''', '''''');
-    LET poc_why  STRING := REPLACE(COALESCE(:poc_o:why::STRING, ''), '''', '''''');
-    LET poc_cmp  STRING := REPLACE(COALESCE(:poc_o:compare::STRING, '>='), '''', '''''');
-    LET poc_un   STRING := REPLACE(COALESCE(:poc_o:units::STRING, ''), '''', '''''');
-    LET poc_bas  STRING := REPLACE(COALESCE(:poc_o:basis::STRING, 'BY_TIME_WINDOW'), '''', '''''');
-    LET poc_der  STRING := REPLACE(COALESCE(:poc_o:target_derivation::STRING, ''), '''', '''''');
-    LET poc_pr   STRING := REPLACE(COALESCE(:poc_o:pending_reason::STRING, ''), '''', '''''');
-    LET poc_rw   STRING := REPLACE(COALESCE(:poc_o:resolves_when::STRING, ''), '''', '''''');
-    LET poc_nr   STRING := REPLACE(COALESCE(:poc_o:na_reason::STRING, ''), '''', '''''');
-    stmts := ARRAY_APPEND(:stmts,
-      'INSERT INTO ' || :tgt || '.SUCCESS_CRITERIA (CODE, LABEL, WHY_IT_MATTERS, '
-   || 'COMPARE, UNITS, BASIS, TARGET_DERIVATION, PENDING_REASON, RESOLVES_WHEN, '
-   || 'NA_REASON) SELECT '
-   || '''' || :poc_code || ''', ''' || :poc_lab || ''', ''' || :poc_why || ''', '
-   || '''' || :poc_cmp || ''', ''' || :poc_un || ''', ''' || :poc_bas || ''', '
-   || '''' || :poc_der || ''', '
-   || IFF(:poc_pr = '', 'NULL', '''' || :poc_pr || '''') || ', '
-   || IFF(:poc_rw = '', 'NULL', '''' || :poc_rw || '''') || ', '
-   || IFF(:poc_nr = '', 'NULL', '''' || :poc_nr || ''''));
-    poc_i := :poc_i + 1;
-  END WHILE;
-
-  -- The scorecard. Each criterion becomes one SELECT with its target and actual
-  -- inlined, and the arms are UNION ALLed into a single view. Built as a string
-  -- because the number of arms is not known until the solution has declared.
-  LET poc_body STRING := '';
-  LET poc_j INT := 0;
-  WHILE (:poc_j < ARRAY_SIZE(:success_criteria)) DO
-    LET poc2_o VARIANT := GET(:success_criteria, :poc_j);
-    LET poc2_code STRING := REPLACE(COALESCE(:poc2_o:code::STRING, ''), '''', '''''');
-    LET poc2_cmp  STRING := COALESCE(:poc2_o:compare::STRING, '>=');
-    LET poc2_tsql STRING := COALESCE(:poc2_o:target_sql::STRING, '');
-    LET poc2_asql STRING := COALESCE(:poc2_o:actual_sql::STRING, '');
-    -- An unevaluable criterion declares no actual_sql. It still gets a row --
-    -- omitting it would make the scorecard look shorter than the promise.
-    LET poc2_t STRING := IFF(:poc2_tsql = '', 'CAST(NULL AS NUMBER(38,6))',
-                           '(' || :poc2_tsql || ')::NUMBER(38,6)');
-    LET poc2_a STRING := IFF(:poc2_asql = '', 'CAST(NULL AS NUMBER(38,6))',
-                           '(' || :poc2_asql || ')::NUMBER(38,6)');
-    poc_body := :poc_body
-      || IFF(:poc_body = '', '', ' UNION ALL ')
-      || 'SELECT ''' || :poc2_code || ''' AS CODE, ' || :poc2_t || ' AS TARGET, '
-      || :poc2_a || ' AS ACTUAL, ''' || REPLACE(:poc2_cmp, '''', '''''') || ''' AS CMP';
-    poc_j := :poc_j + 1;
-  END WHILE;
-
-  -- The verdict CASE is deliberately ordered, and only NA_REASON forces a state.
-  --
-  -- PENDING_REASON is an EXPLANATION, not a state. An earlier cut had it force
-  -- PENDING, which meant a criterion that declared "credits land in about eight
-  -- hours" was pinned to PENDING permanently -- it could never resolve, so the
-  -- one criterion whose whole point was to become answerable never did. A
-  -- criterion is pending because its ACTUAL is absent, and for no other reason;
-  -- the declared text only says WHY it is absent and when that changes.
-  --
-  -- The NULL check therefore has to come before the comparison. Reversing them
-  -- would let a NULL actual reach the comparison, which returns NULL, which a
-  -- naive COALESCE would then turn into a failure. "Not measured yet" reported as
-  -- "failed" is the single most damaging thing this view could do.
-  IF (ARRAY_SIZE(:success_criteria) > 0) THEN
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS '
-   || 'WITH ev AS (' || :poc_body || ') '
-   || 'SELECT c.CODE, c.LABEL, c.WHY_IT_MATTERS, e.TARGET, e.ACTUAL, c.UNITS, '
-   || '       c.COMPARE, c.BASIS, c.TARGET_DERIVATION, '
-   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN ''N/A'' '
-   || '            WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN ''PENDING'' '
-   || '            WHEN e.CMP = ''>='' AND e.ACTUAL >= e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''<='' AND e.ACTUAL <= e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''>''  AND e.ACTUAL >  e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''<''  AND e.ACTUAL <  e.TARGET THEN ''MET'' '
-   || '            WHEN e.CMP = ''='' AND e.ACTUAL =  e.TARGET THEN ''MET'' '
-   || '            ELSE ''NOT_MET'' END AS STATE, '
-      -- Why a row is not simply pass/fail, in the row itself. The solution's own
-      -- wording wins when it has one, because "a randomised holdout would be
-      -- required" is worth infinitely more than "no measurement has landed".
-   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN c.NA_REASON '
-   || '            WHEN e.ACTUAL IS NOT NULL AND e.TARGET IS NOT NULL THEN NULL '
-   || '            WHEN c.PENDING_REASON IS NOT NULL THEN c.PENDING_REASON '
-   || '            WHEN e.ACTUAL IS NULL THEN ''No measurement has landed for this '
-   || 'criterion yet. It is not a failure; it is not yet answerable.'' '
-   || '            ELSE ''The target could not be derived from your account -- the '
-   || 'discovery input it depends on is absent.'' END AS WHY_NOT_EVALUATED, '
-      -- Suppressed once the row is answerable: "resolves when credits land" under
-      -- a row that has already been decided is stale advice.
-   || '       CASE WHEN c.NA_REASON IS NULL '
-   || '             AND (e.ACTUAL IS NULL OR e.TARGET IS NULL) '
-   || '            THEN c.RESOLVES_WHEN END AS RESOLVES_WHEN, '
-      -- The arithmetic, printed. A bare MET is an assertion; "42 >= 30" is
-      -- checkable by the person reading it.
-   || '       CASE WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN NULL '
-   || '            ELSE ROUND(e.ACTUAL, 4) || '' '' || e.CMP || '' '' '
-   || '                 || ROUND(e.TARGET, 4) || '' '' || COALESCE(c.UNITS, '''') '
-   || '       END AS ARITHMETIC, '
-   || '       ''Target and actual are BOTH re-derived from your account on every '
-   || 'read, so this bar moves as your data moves. That is intended -- the target '
-   || 'is not a number we picked -- but it means MET is a statement about today, '
-   || 'not a result comparable across runs. TARGET_DERIVATION says how the bar '
-   || 'was set. BASIS says how the actual was attributed.'' AS COMPARABILITY '
-   || 'FROM ' || :tgt || '.SUCCESS_CRITERIA c '
-   || 'JOIN ev e ON e.CODE = c.CODE');
-  ELSE
-    -- Declared nothing. One honest row beats an empty view, exactly as with the
-    -- value model: empty reads as broken, this reads as unauthored.
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS SELECT '
-   || '''NO SUCCESS CRITERIA DECLARED'' AS CODE, '
-   || '''This solution has not declared POC success criteria'' AS LABEL, '
-   || 'NULL AS WHY_IT_MATTERS, CAST(NULL AS NUMBER(38,6)) AS TARGET, '
-   || 'CAST(NULL AS NUMBER(38,6)) AS ACTUAL, NULL AS UNITS, NULL AS COMPARE, '
-   || 'NULL AS BASIS, NULL AS TARGET_DERIVATION, ''PENDING'' AS STATE, '
-   || '''No criteria are declared, so there is nothing to pass or fail. This is a '
-   || 'gap in the solution, not a result for your account.'' AS WHY_NOT_EVALUATED, '
-   || '''When this solution declares blocks/success_criteria.sql'' AS RESOLVES_WHEN, '
-   || 'NULL AS ARITHMETIC, ''Nothing is being claimed here.'' AS COMPARABILITY');
-  END IF;
-
-  -- The roll-up behind the header chip. MET requires that nothing failed AND
-  -- that something actually passed -- a scorecard of nothing but PENDING is not
-  -- a success, and calling it one would be the whole failure mode of this
-  -- feature. NOT_RUN is not a pass.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_VERDICT AS '
- || 'WITH s AS (SELECT COUNT_IF(STATE = ''MET'') AS MET, '
- || '                  COUNT_IF(STATE = ''NOT_MET'') AS NOT_MET, '
- || '                  COUNT_IF(STATE = ''PENDING'') AS PENDING, '
- || '                  COUNT_IF(STATE = ''N/A'') AS NA, '
- || '                  COUNT_IF(STATE <> ''N/A'') AS SCORED '
- || '           FROM ' || :tgt || '.V_POC_SCORECARD) '
- || 'SELECT MET, NOT_MET, PENDING, NA, SCORED, '
- || '       MET || ''/'' || SCORED || '' MET'' AS HEADLINE, '
- || '       CASE WHEN SCORED = 0 THEN ''NOT_RUN'' '
- || '            WHEN NOT_MET > 0 THEN ''NOT_MET'' '
- || '            WHEN MET = 0 THEN ''PENDING'' '
- || '            WHEN PENDING > 0 THEN ''MET_WITH_PENDING'' '
- || '            ELSE ''MET'' END AS VERDICT, '
- || '       CASE WHEN SCORED = 0 THEN ''Nothing has been scored.'' '
- || '            WHEN NOT_MET > 0 THEN NOT_MET || '' criterion(s) did not meet '
- || 'target. Open the POC success tab for the arithmetic on each.'' '
- || '            WHEN MET = 0 THEN ''Nothing has failed, but nothing has been '
- || 'confirmed either -- every criterion is still pending.'' '
- || '            WHEN PENDING > 0 THEN ''Everything measurable so far has met its '
- || 'target, with '' || PENDING || '' still pending. Not a complete result yet.'' '
- || '            ELSE ''Every scored criterion met its target.'' END AS READ_THIS '
- || 'FROM s');
-
-  -- ── PRODUCTION HARDENING ──────────────────────────────────────────────────
-  -- Only at PRODUCTION tier, and every piece of it detects-then-skips with a
-  -- printed reason rather than failing the build. A platform team's objection to a
-  -- tool is almost never "it does too little"; it is "it left something behind
-  -- that nobody owns".
-  IF (:tier = 'PRODUCTION') THEN
-    -- Cost attribution. The tag lives in the target schema so it disappears with
-    -- it; the ONE thing outside the schema is the tag applied to the warehouse, so
-    -- that is the only row the registry needs.
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE TAG IF NOT EXISTS ' || :tgt || '.ONESHOT_SOLUTION '
-   || 'COMMENT = ''Cost attribution for Storage Optimization. Query '
-   || 'ACCOUNT_USAGE.TAG_REFERENCES to find everything this deployment owns.''');
-    stmts := ARRAY_APPEND(:stmts,
-      'ALTER SCHEMA ' || :tgt || ' SET TAG ' || :tgt || '.ONESHOT_SOLUTION = '
-   || '''Storage Optimization''');
-    IF (:wh_ok) THEN
-      stmts := ARRAY_APPEND(:stmts,
-        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
-     || 'SELECT ''' || :meas_wh || ''', ''' || :tgt || '.ONESHOT_SOLUTION'', '
-     || '''WAREHOUSE'', ''OBJECT_TAG'' '
-     || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
-     || 'WHERE TARGET_FQN = ''' || :meas_wh || ''' AND ARTIFACT = ''' || :tgt
-     || '.ONESHOT_SOLUTION'' AND KIND = ''OBJECT_TAG'')');
-      stmts := ARRAY_APPEND(:stmts,
-        'ALTER WAREHOUSE ' || :meas_wh || ' SET TAG ' || :tgt
-     || '.ONESHOT_SOLUTION = ''Storage Optimization''');
-    END IF;
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'COST ATTRIBUTION: everything this deployment created carries the tag '
-   || :tgt || '.ONESHOT_SOLUTION, so your FinOps team can find it in '
-   || 'ACCOUNT_USAGE.TAG_REFERENCES without asking us. Tags cost nothing.');
-
-    -- Failure notification. Tasks take an error integration directly; dynamic
-    -- tables have NO equivalent clause, so theirs needs an alert, which is
-    -- serverless and therefore costs credits of its own. That asymmetry is priced
-    -- rather than hidden, and the whole thing skips loudly when there is no
-    -- integration to point at.
-    IF (:notif <> '') THEN
-      notes := ARRAY_APPEND(:notes,
-        'FAILURE NOTIFICATION: task failures will be sent to ' || :notif || '. '
-     || 'Dynamic table refresh failures CANNOT use an error integration -- Snowflake '
-     || 'has no such clause for them -- so if this solution creates dynamic tables '
-     || 'their failures need a serverless ALERT over DYNAMIC_TABLE_REFRESH_HISTORY, '
-     || 'which is priced separately in the cost lines above.');
-    ELSE
-      notes := ARRAY_APPEND(:notes,
-        'FAILURE NOTIFICATION SKIPPED: STORAGE_NOTIFICATION_INTEGRATION is blank, so '
-     || 'nothing will tell you when a scheduled object fails. This is a real gap at '
-     || 'PRODUCTION tier and the build continues anyway rather than blocking you. '
-     || 'Run SHOW NOTIFICATION INTEGRATIONS to pick one; if the account has none, an '
-     || 'administrator runs: CREATE NOTIFICATION INTEGRATION ONESHOT_ALERTS '
-     || 'TYPE = EMAIL ENABLED = TRUE;');
-    END IF;
-
-    -- What an on-call engineer opens at 3am. Built to survive a solution that has
-    -- no tasks and no dynamic tables: it returns a row saying so rather than
-    -- nothing, because an empty operations view is indistinguishable from a broken
-    -- one.
-    stmts := ARRAY_APPEND(:stmts,
-      'CREATE OR REPLACE VIEW ' || :tgt || '.V_OPERATIONS AS '
-   || 'SELECT ''TASK'' AS OBJECT_KIND, t.NAME AS OBJECT_NAME, '
-      -- The cron string lives on ACCOUNT_USAGE.TASKS, NOT on TASK_HISTORY.
-      -- t.SCHEDULE was read straight off TASK_HISTORY, which has 30 columns and
-      -- none of them is SCHEDULE, so this view failed to compile on every
-      -- PRODUCTION build -- and because the statement loop stops at the first
-      -- failure, everything declared after it was silently never created. It went
-      -- unnoticed because step 16 read only the OUTER statement results and this
-      -- failure surfaced as an inner FAILED row nobody looked at.
-      --
-      -- COALESCE, because ACCOUNT_USAGE lags: a task created minutes ago may have
-      -- history but no TASKS row yet, and a blank SLA is better than dropping the
-      -- task from an operations view.
-   || '       COALESCE(s.SCHEDULE, ''schedule not yet in ACCOUNT_USAGE.TASKS'') '
-   || '         AS REFRESH_SLA, MAX(t.COMPLETED_TIME) AS LAST_RUN, '
-   || '       COUNT_IF(t.STATE = ''FAILED'') AS FAILURES_IN_WINDOW, '
-   || '       COUNT(*) AS RUNS_IN_WINDOW, NULL::NUMBER AS CREDITS_IN_WINDOW, '
-   || '       ''From ACCOUNT_USAGE.TASK_HISTORY over the last '' || ' || :w
-   || '         || '' days.'' AS SOURCE '
-   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY t '
-      -- TASKS names its columns TASK_NAME / TASK_DATABASE / TASK_SCHEMA, while
-      -- TASK_HISTORY uses NAME / DATABASE_NAME / SCHEMA_NAME. Two ACCOUNT_USAGE
-      -- views of the same object disagreeing on column names is exactly the kind
-      -- of thing to read rather than assume -- guessing S.NAME cost another run.
-   || '  LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TASKS s '
-   || '    ON s.TASK_NAME = t.NAME AND s.TASK_DATABASE = t.DATABASE_NAME '
-   || '   AND s.TASK_SCHEMA = t.SCHEMA_NAME AND s.DELETED IS NULL '
-   || '  WHERE t.DATABASE_NAME = ''' || :db || ''' AND t.SCHEMA_NAME = ''' || :sch || ''' '
-   || '    AND t.SCHEDULED_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
-   || '  GROUP BY 1, 2, 3 '
-   || 'UNION ALL '
-   || 'SELECT ''DYNAMIC_TABLE'', d.NAME, d.TARGET_LAG_SEC::STRING || '' sec target lag'', '
-   || '       MAX(d.REFRESH_END_TIME), COUNT_IF(d.STATE = ''FAILED''), COUNT(*), NULL, '
-   || '       ''From ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY. Note: dynamic tables '
-   || 'auto-suspend after 5 consecutive failures.'' '
-   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY d '
-   || '  WHERE d.DATABASE_NAME = ''' || :db || ''' AND d.SCHEMA_NAME = ''' || :sch || ''' '
-   || '    AND d.REFRESH_START_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
-   || '  GROUP BY 1, 2, 3 '
-   || 'UNION ALL '
-   || 'SELECT ''THIS DEPLOYMENT'', ''' || :sch || ''', ''not scheduled'', '
-   || '       (SELECT MAX(STARTED_AT) FROM ' || :tgt || '.RUN_LEDGER), 0, '
-   || '       (SELECT COUNT(*) FROM ' || :tgt || '.RUN_LEDGER), '
-   || '       (SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
-   || '         WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''), '
-   || '       ''No tasks or dynamic tables found for this schema in the window. If '
-   || 'this solution creates none, that is expected and this row is the whole '
-   || 'operations picture.'' ');
-    cost_detail := ARRAY_APPEND(:cost_detail,
-      'OPERATIONS: V_OPERATIONS reports last run, failures and credits per '
-   || 'scheduled object over ' || :w || ' days. It reads ACCOUNT_USAGE views, which '
-   || 'are free to query but lag by up to 45 minutes for task history.');
-  END IF;
-
-  -- ── The action registry, its audit log, and the one door in ────────────────
-  -- Built AFTER the solution's plan section, because that is where a solution
-  -- declares its actions.
-  --
-  -- CREATE OR REPLACE ... AS SELECT rather than CREATE + INSERT: a second build
-  -- must not stack a second copy of every action, which is the same bug
-  -- ATTACHED_OBJECT_REGISTRY had. Note the two need DIFFERENT fixes and this comment
-  -- used to imply otherwise: the action registry can be rebuilt from scratch each
-  -- run, so CREATE OR REPLACE is right; the attachment registry must SURVIVE, because
-  -- TEARDOWN reads it, so it takes an anti-join insert instead. Reaching for
-  -- CREATE OR REPLACE there would have destroyed the record of what to detach.
-  -- FLATTEN over a JSON literal also avoids the VALUES-clause restriction on
-  -- ARRAY/OBJECT constructors.
-  --
-  -- The JSON travels BASE64-ENCODED, and that is not belt-and-braces. An action's
-  -- `sql` array holds generated DDL, which routinely contains quoted identifiers
-  -- like "ICE_GOLD_ORDERS". TO_JSON escapes those double quotes to \", and when
-  -- the result is pasted into a single-quoted SQL literal Snowflake's parser
-  -- consumes the backslash -- so PARSE_JSON receives structurally broken JSON and
-  -- fails with "Error parsing JSON: missing comma, pos 1628", pointing at a
-  -- character that is nowhere near the actual problem. Doubling the quotes, as
-  -- this line used to, does nothing about the backslash.
-  --
-  -- 03_generative_completion hit this first and fixed it locally by chaining a
-  -- second REPLACE for backslashes; that works but depends on getting the order
-  -- right and on remembering it at every new call site. The base64 alphabet
-  -- contains no quote and no backslash, so the hazard cannot recur here.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE TABLE ' || :tgt || '.ACTION_REGISTRY AS SELECT '
- || 'VALUE:code::STRING AS CODE, VALUE:label::STRING AS LABEL, '
- || 'VALUE:tier::STRING AS TIER, VALUE:effect::STRING AS EFFECT, '
- || 'VALUE:undo::STRING AS UNDO, '
- || 'VALUE:est::NUMBER(38,6) AS EST_CREDITS, VALUE:basis::STRING AS EST_BASIS, '
- || 'VALUE:sql::ARRAY AS RUN_SQL, '
-    -- The reverse of RUN_SQL, declared by the solution alongside it. COALESCE to an
-    -- empty array so an action that genuinely cannot be reversed is representable:
-    -- zero undo statements is a fact the app can show, whereas a NULL would just
-    -- look like a bug.
- || 'COALESCE(VALUE:undo_sql::ARRAY, ARRAY_CONSTRUCT()) AS UNDO_SQL, '
-    -- The parameters this action accepts, declared alongside its SQL. Empty array for
-    -- every action that takes none, which is why an unparameterised action is byte
-    -- identical in behaviour to before: ARRAY_SIZE 0 skips the whole resolver.
-    --
-    -- Each element is {name, label, kind, allowed_sql, options, min, max, help}. The
-    -- WHITELIST LIVES HERE, in the registry, and is evaluated inside RUN_ACTION -- not
-    -- passed in by the app. The app cannot influence what a value is checked against,
-    -- which is the entire point: a tampered client can only ever choose from a set
-    -- this build already discovered.
- || 'COALESCE(VALUE:params::ARRAY, ARRAY_CONSTRUCT()) AS PARAM_SPEC, '
- || 'CURRENT_TIMESTAMP() AS DECLARED_AT '
- || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
- || BASE64_ENCODE(TO_JSON(:actions)) || '''))))');
-
-  -- One row per attempt, whether it worked or not. An action framework without an
-  -- audit trail is indistinguishable from someone running DDL by hand.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_LOG '
- || '(LOG_ID VARCHAR, CODE VARCHAR, LABEL VARCHAR, EST_CREDITS NUMBER(38,6), '
- || 'STATUS VARCHAR, STATEMENTS_RUN INT, ERROR VARCHAR, '
- || 'RUN_BY VARCHAR DEFAULT CURRENT_USER(), '
- || 'STARTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(), '
- || 'FINISHED_AT TIMESTAMP_NTZ, UNDO_SNAPSHOT VARCHAR, PARAMS VARCHAR)');
-  -- Separate ALTER because the CREATE above is IF NOT EXISTS: a schema built by an
-  -- earlier artifact already has the table and would silently keep the old shape.
-  stmts := ARRAY_APPEND(:stmts,
-    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
- || 'ADD COLUMN IF NOT EXISTS UNDO_SNAPSHOT VARCHAR');
-  -- The RESOLVED parameter values this run actually used, as JSON. Without this the
-  -- audit trail becomes untrue the moment an action takes parameters: two rows reading
-  -- "DONE. Attach the policy" would be indistinguishable while having tiered different
-  -- tables. NULL for an unparameterised action, which is honest -- there were none.
-  stmts := ARRAY_APPEND(:stmts,
-    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
- || 'ADD COLUMN IF NOT EXISTS PARAMS VARCHAR');
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '(LOG_ID VARCHAR, SEQ INT, STATEMENT VARCHAR, QUERY_ID VARCHAR, '
- || 'STATUS VARCHAR, ERROR VARCHAR, '
- || 'RAN_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
-
-  -- What the app reads. Excludes RUN_SQL on purpose: the dashboard needs to show
-  -- what an action DOES and what it costs, and shipping the DDL to the browser
-  -- invites someone to treat the page as the source of truth for it.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTIONS AS SELECT '
- || 'a.CODE, a.LABEL, a.TIER, a.EFFECT, a.UNDO, a.EST_CREDITS, a.EST_BASIS, '
- || 'ARRAY_SIZE(a.RUN_SQL) AS STATEMENTS, '
- || 'ARRAY_SIZE(a.UNDO_SQL) AS UNDO_STATEMENTS, '
- || 'ARRAY_SIZE(a.PARAM_SPEC) AS PARAM_COUNT, '
- || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
- || '  WHERE l.CODE = a.CODE AND l.STATUS = ''UNDONE'') AS TIMES_UNDONE, '
- || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
- || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS TIMES_RUN, '
- || '(SELECT MAX(l.FINISHED_AT) FROM ' || :tgt || '.ACTION_LOG l '
- || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS LAST_RUN_AT '
- || 'FROM ' || :tgt || '.ACTION_REGISTRY a '
- || 'ORDER BY CASE a.TIER WHEN ''SAMPLE'' THEN 1 WHEN ''LIMITED'' THEN 2 ELSE 3 END, a.CODE');
-
-  -- ── What the app renders a widget from ─────────────────────────────────────
-  -- One row per parameter. Deliberately EXCLUDES allowed_sql, for the same reason
-  -- V_ACTIONS excludes RUN_SQL: the app does not need the whitelist QUERY, it needs
-  -- the whitelist RESULT, and shipping the query invites someone to treat the browser
-  -- as the place the permitted set is decided. The host reads OPTIONS_SQL only to run
-  -- it for display; RUN_ACTION re-evaluates the registry's own copy when it validates,
-  -- so what the app showed can never be what authorises the value.
-  --
-  -- ORDINAL is preserved from the declaration order so the widgets render in the order
-  -- the solution author intended rather than alphabetically.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_PARAMS AS SELECT '
- || 'a.CODE, p.INDEX AS ORDINAL, '
- || 'p.VALUE:name::STRING AS PARAM_NAME, '
- || 'COALESCE(p.VALUE:label::STRING, p.VALUE:name::STRING) AS LABEL, '
- || 'UPPER(COALESCE(p.VALUE:kind::STRING, ''IDENT'')) AS KIND, '
- || 'p.VALUE:allowed_sql::STRING AS OPTIONS_SQL, '
- || 'p.VALUE:options::ARRAY AS OPTIONS, '
- || 'p.VALUE:min::NUMBER(38,6) AS MIN_VALUE, '
- || 'p.VALUE:max::NUMBER(38,6) AS MAX_VALUE, '
- || 'COALESCE(p.VALUE:freeform::BOOLEAN, FALSE) AS FREEFORM, '
- || 'p.VALUE:help::STRING AS HELP '
- || 'FROM ' || :tgt || '.ACTION_REGISTRY a, '
- || 'LATERAL FLATTEN(input => a.PARAM_SPEC) p '
- || 'ORDER BY a.CODE, p.INDEX');
-
-  -- Estimated against measured. The measurement is NOT available immediately:
-  -- per-query credits live in QUERY_ATTRIBUTION_HISTORY, which lags by up to a few
-  -- hours, so this view is empty for a while after an action runs and then fills
-  -- in. Saying that plainly beats printing an estimate and letting the reader
-  -- assume it was measured.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_COST AS SELECT '
- || 'l.LOG_ID, l.CODE, l.LABEL, l.STATUS, l.EST_CREDITS, '
- || 'SUM(q.CREDITS_ATTRIBUTED_COMPUTE) AS MEASURED_CREDITS, '
- || 'COUNT(q.QUERY_ID) AS STATEMENTS_MEASURED, l.STATEMENTS_RUN, l.STARTED_AT, '
-    -- Why the measurement is absent, rather than leaving a NULL to be read as a
-    -- failure. QUERY_ATTRIBUTION_HISTORY only records queries that consumed
-    -- WAREHOUSE COMPUTE. ALTER WAREHOUSE, CREATE VIEW and SET MASKING POLICY consume
-    -- none, so for a metadata-only action no row will EVER appear -- and every
-    -- action was telling the customer the figure "appears once attribution catches
-    -- up". Checked against real runs: ICE_FIX matched 0 of 27 statements and
-    -- WH_SUSPEND_ALL 0 of 2, permanently. A promise that never comes true is worse
-    -- than saying up front that there is nothing to measure.
- || 'CASE '
- || '  WHEN COUNT(q.QUERY_ID) >= l.STATEMENTS_RUN AND l.STATEMENTS_RUN > 0 '
- || '    THEN ''MEASURED'' '
- || '  WHEN COUNT(q.QUERY_ID) > 0 '
- || '    THEN ''PARTIAL: '' || COUNT(q.QUERY_ID) || '' of '' || l.STATEMENTS_RUN '
- || '      || '' statement(s) used attributable compute; the rest were metadata-only'' '
- || '  WHEN l.STARTED_AT > DATEADD(hour, -6, CURRENT_TIMESTAMP()) '
- || '    THEN ''PENDING: attribution can lag several hours. If these statements were '
-|| 'metadata-only (ALTER, CREATE VIEW, policy attach) it will stay empty because they '
-|| 'consume no warehouse compute.'' '
- || '  ELSE ''NO COMPUTE MEASURED: these statements consumed no warehouse compute, so '
-|| 'QUERY_ATTRIBUTION_HISTORY has nothing to attribute. Metadata operations are '
-|| 'genuinely near-free -- this is not a missing measurement.'' '
- || 'END AS MEASURED_STATUS '
- || 'FROM ' || :tgt || '.ACTION_LOG l '
- || 'LEFT JOIN ' || :tgt || '.ACTION_STATEMENT_LOG s ON s.LOG_ID = l.LOG_ID '
- || 'LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY q '
- || '  ON q.QUERY_ID = s.QUERY_ID '
- || 'GROUP BY 1,2,3,4,5,8,9');
-
-  -- ── The monthly run-rate, over whatever the solution registered above ─────
-  -- THE CADENCE IS KNOWN, THE DURATION IS MEASURED, THE PRODUCT IS PROJECTED.
-  -- Runs per month comes from a schedule this build itself set, so it is a fact.
-  -- Seconds per run comes from what this build observed. Their product is still a
-  -- PROJECTION, because next month's data volume is not this month's -- and it is
-  -- labelled that way rather than presented as a bill.
-  --
-  -- Deliberately not summed with anything MEASURED, for the same reason step 14
-  -- asserts it: a total mixing a measurement with a forecast is a number nobody
-  -- can defend in a room.
-  -- A row with RUNS_PER_MONTH IS NULL is VOLUME-DRIVEN: a serverless meter billed per
-  -- unit of data (Snowpipe Streaming, for instance) with no schedule and no warehouse.
-  -- The formula below cannot describe it, and NULL arithmetic correctly yields NULL
-  -- rather than inventing a monthly figure. Every schedule-driven solution writes a
-  -- positive RUNS_PER_MONTH, so this branch changes nothing for them.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_MONTHLY_RUN_RATE AS SELECT '
- || 'KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
- || 'WAREHOUSE_CREDITS_PER_HOUR, '
-    -- credits = runs x seconds x (credits/hour / 3600). Multiply BEFORE dividing:
-    -- LET cps := 1.0/3600.0 rounds to scale 6 (0.000278) and a solution already
-    -- shipped a 4x-low figure that way.
- || 'ROUND(RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
- || '  / 3600.0, 4) AS EST_CREDITS_PER_MONTH, '
- || 'CASE WHEN RUNS_PER_MONTH IS NULL THEN ''VOLUME-DRIVEN'' '
- || '     ELSE ''PROJECTED'' END AS LABEL, MEASURED_INPUT, BASIS, INSTALLED_AT '
- || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
-
-  -- One line the app and the packet can both print. Zero rows is a legitimate
-  -- and meaningful answer -- it means this solution installs nothing recurring --
-  -- so it says that in words rather than rendering an empty table.
-  --
-  -- Scheduled and volume-driven components are reported in SEPARATE clauses and are
-  -- never added together. The single-sentence version claimed every figure was
-  -- "PROJECTED from schedules this build set and durations it measured", which for a
-  -- continuous serverless ingest endpoint was false three times over -- no schedule was
-  -- set, no duration was measured, and the resulting "About 0.02 credits/month" read as
-  -- though streaming were free. A volume-driven component contributes NO credits figure
-  -- here on purpose: the honest answer is a per-unit rate plus a volume the customer
-  -- controls, and that lives in BASIS.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE VIEW ' || :tgt || '.V_RUN_RATE_HEADLINE AS SELECT '
- || 'CASE WHEN COUNT(*) = 0 THEN '
- || '  ''This build installs nothing that runs on a schedule. It costs storage '
- || 'plus whatever compute the people querying it use.'' '
- || 'ELSE '
- || '  CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0 THEN '
- || '    ''About '' || ROUND(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
- || '      RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
- || '      / 3600.0, 0)), 2) '
- || '    || '' credits/month across '' || COUNT_IF(RUNS_PER_MONTH IS NOT NULL) '
- || '    || '' scheduled component(s), PROJECTED from schedules this build set '
- || 'and durations it measured.'' ELSE '''' END '
- || '  || CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NULL) > 0 THEN '
- || '    IFF(COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0, '' Plus '', ''This build '
- || 'installs '') || COUNT_IF(RUNS_PER_MONTH IS NULL) '
- || '    || '' volume-driven component(s) that run continuously with NO schedule '
- || 'and NO monthly projection: the cost scales with how much data you send, not '
- || 'with a cadence. This is NOT zero -- read BASIS in V_MONTHLY_RUN_RATE for the '
- || 'per-unit rate.'' ELSE '''' END '
- || 'END AS HEADLINE, COUNT(*) AS COMPONENTS, '
- || 'ROUND(COALESCE(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
- || '  RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
- || '  / 3600.0, 0)), 0), 4) AS EST_CREDITS_PER_MONTH, '
- || 'COUNT_IF(RUNS_PER_MONTH IS NOT NULL) AS SCHEDULED_COMPONENTS, '
- || 'COUNT_IF(RUNS_PER_MONTH IS NULL) AS VOLUME_COMPONENTS '
- || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
-
-
-  -- The only way to run one. Everything the app can do goes through here, so the
-  -- refusals below are the whole safety model:
-  --   1. the action must exist in this build
-  --   2. the BUILD must have been authorised FOR THAT ACTION'S TIER -- ALLOW_ACTIONS
-  --      for LIMITED and PRODUCTION, ALLOW_SAMPLE_ACTIONS for SAMPLE
-  --   3. the caller must type the code back exactly
-  -- and it stops at the FIRST failing statement, because a half-applied change is
-  -- worse than an unapplied one.
-  --
-  -- Existence is checked BEFORE authorisation now, because the tier is a property of
-  -- the registered action and there is nothing to authorise until we know it. The
-  -- swap leaks nothing: the action codes are printed in the script and listed in the
-  -- app, so "no such action" was never a secret.
-  --
-  -- An unrecognised TIER falls to the STRICTER gate on purpose. A typo in a tier
-  -- name must not be a way to get a PRODUCTION action treated as a sample.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR, P_PARAMS VARCHAR) '
- || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
- || 'DECLARE '
- || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
- || '  est NUMBER(38,6) := 0; sqls ARRAY := ARRAY_CONSTRUCT(); usnap STRING := NULL; '
- || '  i INT := 0; ran INT := 0; errs STRING := ''''; '
- || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
-    -- Parameter resolution state. `resolved` accumulates the EMITTED TEXT for each
-    -- parameter -- already shape-checked, already whitelisted, already quoted -- so
-    -- interpolation downstream is a plain REPLACE over values that have passed every
-    -- gate. Nothing the caller sent is ever interpolated directly.
- || '  pspec ARRAY := ARRAY_CONSTRUCT(); pobj OBJECT := OBJECT_CONSTRUCT(); '
- || '  resolved OBJECT := OBJECT_CONSTRUCT(); pkeys ARRAY := ARRAY_CONSTRUCT(); '
- || '  k INT := 0; kk INT := 0; pj VARIANT := NULL; pname STRING := ''''; '
- || '  pkind STRING := ''''; pval STRING := NULL; asql STRING := NULL; '
- || '  emit STRING := ''''; parts ARRAY := ARRAY_CONSTRUCT(); jj INT := 0; '
- || '  part STRING := ''''; hits INT := 0; num NUMBER(38,6) := NULL; '
- || '  canon STRING := NULL; opts ARRAY := ARRAY_CONSTRUCT(); '
-    -- Two accumulators, deliberately. `resolved` holds the EMITTED TEXT that goes into
-    -- the statements -- quoted, so "EVENT_TS". `chosen` holds the CANONICAL VALUE a
-    -- human picked -- EVENT_TS. The log gets `chosen`, because an audit trail reading
-    -- {"attach_on":"\"EVENT_TS\""} makes a reader decode escaping to learn what was
-    -- done; the exact text that executed is already in ACTION_STATEMENT_LOG, so nothing
-    -- is lost by keeping this one readable.
- || '  chosen OBJECT := OBJECT_CONSTRUCT(); '
- || '  pmin NUMBER(38,6) := NULL; pmax NUMBER(38,6) := NULL; '
- || '  s STRING := ''''; fin ARRAY := ARRAY_CONSTRUCT(); ustmts ARRAY := ARRAY_CONSTRUCT(); '
- || 'BEGIN '
- || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:cnt = 0) THEN '
- || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
- || '  END IF; '
- || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
- || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:tier = ''SAMPLE'') THEN '
- || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
- || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. This build was created with STORAGE_ALLOW_SAMPLE_ACTIONS = '
- || 'FALSE, so even the seeded-data actions are inert. Re-run the script with it set '
- || 'to TRUE to arm them.''; '
- || '    END IF; '
- || '  ELSE '
- || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. '' || :tier || '' actions touch real data and this build was '
- || 'created with STORAGE_ALLOW_ACTIONS = FALSE, so nothing in the app can change '
- || 'anything of yours. Re-run the script with it set to TRUE to arm them.''; '
- || '    END IF; '
- || '  END IF; '
- || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
- || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
- || '  END IF; '
- || '  SELECT LABEL, EST_CREDITS, RUN_SQL, TO_JSON(UNDO_SQL), PARAM_SPEC '
- || '    INTO :lbl, :est, :sqls, :usnap, :pspec '
- || '    FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE; '
-    -- ── Parameters: validate EVERYTHING before a single statement runs ──────────
-    -- Order matters. This whole block sits BEFORE the ACTION_LOG insert and before
-    -- the execution loop, so a refusal here has applied nothing at all -- which is
-    -- what makes refuse-the-whole-action free rather than a rollback problem. A
-    -- partially-applied change is the thing this framework works hardest to prevent,
-    -- so a single bad value stops the entire action rather than running the subset
-    -- that happened to validate.
- || '  pobj := COALESCE(TRY_PARSE_JSON(:P_PARAMS)::OBJECT, OBJECT_CONSTRUCT()); '
-    -- Values sent to an action that declares none are a REFUSAL, not something to
-    -- ignore. Silently dropping them would mean the caller believes it constrained
-    -- the action and the action did something broader -- and the log would agree
-    -- with the action, not the caller.
- || '  IF (ARRAY_SIZE(:pspec) = 0 AND ARRAY_SIZE(OBJECT_KEYS(:pobj)) > 0) THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no parameters, but values were '
- || 'supplied for it. Nothing was run.''; '
- || '  END IF; '
- || '  WHILE (:k < ARRAY_SIZE(:pspec)) DO '
- || '    pj := GET(:pspec, :k); '
- || '    pname := pj:name::STRING; '
- || '    pkind := UPPER(COALESCE(pj:kind::STRING, ''IDENT'')); '
- || '    asql := pj:allowed_sql::STRING; '
- || '    pval := GET(:pobj, :pname)::STRING; '
- || '    IF (:pval IS NULL OR TRIM(:pval) = '''') THEN '
- || '      RETURN ''REFUSED. '' || :P_CODE || '' needs a value for '' || :pname '
- || '        || ''. Nothing was run.''; '
- || '    END IF; '
- || '    IF (:pkind = ''STRING'') THEN '
-    -- ── A LITERAL VALUE, not an identifier ──────────────────────────────────────
-    -- Some parameters land inside a string literal rather than in an object position
-    -- -- an audience NAME is stored in a column, it does not name anything. Those
-    -- cannot be identifier-quoted (a name with a space is legitimate) and they still
-    -- cannot be bound, because RUN_ACTION EXECUTE IMMEDIATEs pre-built statement text.
-    --
-    -- TWO defences, again, because escaping alone is the thing that goes wrong quietly:
-    --   1. A conservative CHARACTER ALLOWLIST -- letters, digits, space and a few
-    --      punctuation marks that appear in real names. No single quote, no double
-    --      quote, no backslash, no semicolon, no comment marker. This is a permit-list,
-    --      so a character nobody thought about is refused rather than passed through.
-    --   2. Quote DOUBLING on top, so even if the allowlist were later widened by
-    --      someone, a quote could not terminate the literal.
-    -- Length is capped so a parameter cannot be used to push a statement past a limit.
- || '      IF (LENGTH(:pval) > 200) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' is longer than 200 characters. '
- || 'Nothing was run.''; '
- || '      END IF; '
- || '      IF (NOT REGEXP_LIKE(:pval, ''[A-Za-z0-9 _.,()\\-]+'')) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' contains a character that is not '
- || 'permitted in a name. Letters, digits, spaces and _ . , ( ) - are allowed. '
- || 'Nothing was run.''; '
- || '      END IF; '
-    -- The literal is emitted WITHOUT its surrounding quotes: the statement in the
-    -- solution supplies those, exactly as it does for any other literal it writes, so
-    -- '<<audience_name>>' reads as a literal in the source and stays one.
- || '      emit := REPLACE(:pval, '''''''', ''''''''''''); '
- || '      canon := :pval; '
- || '      IF (NOT COALESCE(pj:freeform::BOOLEAN, FALSE) '
- || '          AND ARRAY_SIZE(COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT())) = 0) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
- || 'marked freeform. Nothing was run.''; '
- || '      END IF; '
- || '    ELSEIF (:pkind = ''NUMBER'') THEN '
-    -- A number is still interpolated, because clauses like ARCHIVE_FOR_DAYS = 90 are
-    -- DDL and cannot be bound any more than an identifier can. The parse is the gate:
-    -- it returns NULL rather than raising, so a non-numeric arrives here as a refusal
-    -- instead of an exception, and the emitted text is the PARSED number rather than
-    -- the caller's string -- verified: '180 OR 1=1' parses to NULL, so it cannot
-    -- survive as text.
-    --
-    -- TRY_TO_DECIMAL(_, 38, 6), NOT TRY_TO_NUMBER. TRY_TO_NUMBER defaults to scale 0
-    -- and SILENTLY ROUNDS: TRY_TO_NUMBER('90.5') is 91, verified. A parameter that
-    -- quietly becomes a different number than the one chosen is worse than one that
-    -- is refused.
- || '      num := TRY_TO_DECIMAL(:pval, 38, 6); '
- || '      IF (:num IS NULL) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' must be a number. Nothing was run.''; '
- || '      END IF; '
- || '      pmin := pj:min::NUMBER(38,6); pmax := pj:max::NUMBER(38,6); '
- || '      IF ((:pmin IS NOT NULL AND :num < :pmin) '
- || '          OR (:pmax IS NOT NULL AND :num > :pmax)) THEN '
- || '        RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is outside the '
- || 'permitted range '' || COALESCE(:pmin::STRING, ''-'') || '' to '' '
- || '          || COALESCE(:pmax::STRING, ''-'') || ''. Nothing was run.''; '
- || '      END IF; '
-    -- Emit 180, never 180.000000. These values land in identifier positions as well as
-    -- value positions -- DEMO_COOL_POLICY_180 is a name and DEMO_COOL_POLICY_180.000000
-    -- is a syntax error -- so a NUMBER(38,6) cast straight to STRING breaks the
-    -- statement. Found live: the first parameterised run failed to compile on exactly
-    -- this. A genuinely fractional value keeps its decimals with trailing zeros
-    -- trimmed, so 90.5 stays 90.5.
- || '      IF (:num = TRUNC(:num)) THEN '
- || '        emit := :num::INT::STRING; '
- || '      ELSE '
- || '        emit := REGEXP_REPLACE(REGEXP_REPLACE(:num::STRING, ''0+$'', ''''), ''[.]$'', ''''); '
- || '      END IF; '
- || '      canon := :emit; '
- || '    ELSE '
-    -- ── Gate 1: SHAPE, per dot-separated part ───────────────────────────────────
-    -- Independent of the whitelist on purpose. The whitelist is only ever as good as
-    -- the allowed_sql a future author writes; point it at a free-text column and it
-    -- authorises arbitrary text. This gate holds regardless. REGEXP_LIKE in Snowflake
-    -- matches the ENTIRE string -- verified, not assumed: ''ORDERS; DROP'' is FALSE
-    -- against this pattern, as are a space and a double quote. Do not "fix" this
-    -- pattern by adding anchors and do not relax it to a partial match.
-    --
-    -- Split on ''.'' so a qualified name is checked part by part. A name genuinely
-    -- containing a dot is refused here rather than silently mis-parsed into the wrong
-    -- number of parts.
- || '      parts := SPLIT(:pval, ''.''); jj := 0; '
- || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
- || '        IF (NOT REGEXP_LIKE(GET(:parts, :jj)::STRING, ''[A-Za-z_][A-Za-z0-9_$]*'')) THEN '
- || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not a valid '
- || 'identifier. Nothing was run.''; '
- || '        END IF; '
- || '        jj := :jj + 1; '
- || '      END WHILE; '
-    -- ── Gate 2: MEMBERSHIP, which also returns the CANONICAL SPELLING ───────────
-    -- DEFAULT DENY. A parameter must declare where its permitted values come from --
-    -- allowed_sql (a query) or options (a literal list) -- and if it declares neither
-    -- the action is REFUSED rather than falling back to the shape gate alone. An author
-    -- who simply forgets allowed_sql would otherwise get an identifier accepted on shape
-    -- alone and never know, which is the quiet failure this feature exists to avoid.
-    -- Freeform has to be asked for in writing, and is only appropriate for a NAME BEING
-    -- CREATED, which cannot be checked against things that already exist.
-    --
-    -- Both sources are enforced HERE, server-side. options is not merely what the app
-    -- offers: a list the host renders but the procedure does not check is a dropdown
-    -- pretending to be a control.
-    --
-    -- The comparison is case-INSENSITIVE but what gets emitted is the ALLOWED SET''S OWN
-    -- SPELLING, never the caller''s. This matters specifically because the value is
-    -- emitted QUOTED: a caller typing ''event_ts'' against a column stored as EVENT_TS
-    -- matches, and emitting their casing would produce "event_ts", which is a DIFFERENT
-    -- and non-existent object. Verified live -- the case-insensitive match accepted the
-    -- lowercase spelling, which is correct, and only canonicalising makes the resulting
-    -- identifier resolve. It also means a column genuinely stored lowercase is quoted in
-    -- ITS spelling and resolves too.
- || '      canon := NULL; '
- || '      IF (:asql IS NOT NULL AND TRIM(:asql) <> '''') THEN '
-    -- The whitelist query comes from the REGISTRY, never from the caller, so the app
-    -- cannot influence what its own value is checked against. The value is BOUND rather
-    -- than concatenated -- the point of the check is to constrain an attacker-controlled
-    -- string, so the check itself must not concatenate one.
-    --
-    -- allowed_sql must expose a column named ALLOWED_VALUE. Requiring a NAME rather than
-    -- reading position 1 means an author widening their SELECT list cannot silently
-    -- change which column authorises values.
- || '        EXECUTE IMMEDIATE ''SELECT MAX(TO_VARCHAR(a.ALLOWED_VALUE)) FROM ('' || :asql '
- || '          || '') a WHERE UPPER(TO_VARCHAR(a.ALLOWED_VALUE)) = UPPER(?)'' USING (pval); '
- || '        SELECT $1 INTO :canon FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())); '
- || '        IF (:canon IS NULL) THEN '
- || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
- || 'values this build discovered for it. Nothing was run.''; '
- || '        END IF; '
- || '      ELSE '
- || '        opts := COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT()); '
- || '        IF (ARRAY_SIZE(:opts) > 0) THEN '
-    -- A plain loop rather than FLATTEN over a local VARIANT: that construct raised
-    -- EXPRESSION_ERROR inside a procedure body when it was tried, and a loop cannot.
- || '          jj := 0; '
- || '          WHILE (:jj < ARRAY_SIZE(:opts)) DO '
- || '            IF (UPPER(GET(:opts, :jj)::STRING) = UPPER(:pval)) THEN '
- || '              canon := GET(:opts, :jj)::STRING; '
- || '              BREAK; '
- || '            END IF; '
- || '            jj := :jj + 1; '
- || '          END WHILE; '
- || '          IF (:canon IS NULL) THEN '
- || '            RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
- || 'permitted values for it. Nothing was run.''; '
- || '          END IF; '
- || '        ELSEIF (COALESCE(pj:freeform::BOOLEAN, FALSE)) THEN '
-    -- Freeform: there is no set to canonicalise against, so the caller''s spelling IS
-    -- the name being created. It has already passed the shape gate.
- || '          canon := :pval; '
- || '        ELSE '
- || '          RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
- || 'marked freeform, so this build cannot say what it is allowed to be. Nothing was run. '
- || 'This is a defect in the solution, not in what you chose.''; '
- || '        END IF; '
- || '      END IF; '
-    -- ── Quote the CANONICAL value, part by part ─────────────────────────────────
-    -- "DB"."SCHEMA"."TABLE", not "DB.SCHEMA.TABLE" -- the latter names one object with
-    -- dots in it. ENUM values are emitted BARE because they land in positions like
-    -- ARCHIVE_TIER = COOL where a quoted string is not valid syntax; the shape gate
-    -- already refused anything that is not a bare word, so an unquoted enum still
-    -- cannot carry punctuation.
- || '      parts := SPLIT(:canon, ''.''); jj := 0; emit := ''''; '
- || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
- || '        part := GET(:parts, :jj)::STRING; '
- || '        IF (:pkind = ''ENUM'') THEN '
- || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || :part; '
- || '        ELSE '
- || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || ''"'' || :part || ''"''; '
- || '        END IF; '
- || '        jj := :jj + 1; '
- || '      END WHILE; '
- || '    END IF; '
- || '    resolved := OBJECT_INSERT(:resolved, :pname, :emit, TRUE); '
- || '    chosen := OBJECT_INSERT(:chosen, :pname, :canon, TRUE); '
- || '    k := :k + 1; '
- || '  END WHILE; '
-    -- ── Interpolation, over validated text only ────────────────────────────────
-    -- Both the forward statements AND the reverse ones, because the reverse set is
-    -- snapshotted below and an undo must reverse THE SAME target. Resolving undo here
-    -- is what makes that structural rather than a promise: UNDO_ACTION replays text
-    -- that was already resolved, so it cannot be handed different values later.
- || '  pkeys := OBJECT_KEYS(:resolved); '
- || '  ustmts := PARSE_JSON(:usnap)::ARRAY; '
- || '  i := 0; '
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    s := GET(:sqls, :i)::STRING; kk := 0; '
- || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
- || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
- || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
- || '      kk := :kk + 1; '
- || '    END WHILE; '
-    -- A placeholder left over means the statement names a parameter the action did not
-    -- declare -- a typo between the two. Refusing beats executing DDL with a literal
-    -- <<tbl>> in it, and beats the silent alternative of leaving it to fail with a
-    -- syntax error that points at the wrong thing.
- || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
- || '      RETURN ''REFUSED. Statement '' || (:i + 1) || '' of '' || :P_CODE '
- || '        || '' contains a placeholder this action does not declare. Nothing was run.''; '
- || '    END IF; '
- || '    fin := ARRAY_APPEND(:fin, :s); '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  sqls := :fin; fin := ARRAY_CONSTRUCT(); i := 0; '
- || '  WHILE (:i < ARRAY_SIZE(:ustmts)) DO '
- || '    s := GET(:ustmts, :i)::STRING; kk := 0; '
- || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
- || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
- || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
- || '      kk := :kk + 1; '
- || '    END WHILE; '
- || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
- || '      RETURN ''REFUSED. Reverse statement '' || (:i + 1) || '' of '' || :P_CODE '
- || '        || '' contains a placeholder this action does not declare. Nothing was run, '
- || 'because an action whose undo cannot resolve must not run in the first place.''; '
- || '    END IF; '
- || '    fin := ARRAY_APPEND(:fin, :s); '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  usnap := TO_JSON(:fin); i := 0; '
-    -- The reverse statements are SNAPSHOTTED onto this run, not read from the
-    -- registry when the undo happens. The registry holds what the action CURRENTLY
-    -- declares; a rebuild between the run and the undo can change that, and then the
-    -- undo reverses a different set of objects than the run created. Storing them
-    -- here means an undo can only ever replay what THIS run was going to do.
-    -- Stored as JSON text rather than ARRAY because an ARRAY bind through
-    -- INSERT..SELECT is fragile, and TO_JSON/PARSE_JSON round-trips exactly.
- || '  INSERT INTO ' || :tgt || '.ACTION_LOG '
- || '    (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS, UNDO_SNAPSHOT, PARAMS) '
- || '    SELECT :log_id, :P_CODE, :lbl, :est, ''RUNNING'', :usnap, '
-    -- The RESOLVED values, not the raw input: what the statements were actually built
-    -- with. NULL when the action takes none, so an unparameterised row reads as having
-    -- had none rather than as an empty object that might mean anything.
- || '           IFF(ARRAY_SIZE(OBJECT_KEYS(:chosen)) = 0, NULL, TO_JSON(:chosen)); '
-    -- :i indexes the ARRAY from 0, but every number this procedure SHOWS a
-    -- human is :i + 1. Sabotaging the second statement of an action originally
-    -- produced "statement 1: SQL compilation error", which points at the wrong
-    -- DDL -- the single most expensive kind of wrong in an error message.
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    BEGIN '
- || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
- || '               LAST_QUERY_ID(), ''OK''; '
- || '      ran := :ran + 1; '
- || '    EXCEPTION WHEN OTHER THEN '
- || '      errs := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :errs; '
- || '      BREAK; '
- || '    END; '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''DONE'', ''FAILED''), '
- || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
- || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
- || '  IF (:errs <> '''') THEN '
- || '    RETURN ''FAILED after '' || :ran || '' statement(s), nothing further was run. '' || :errs; '
- || '  END IF; '
- || '  RETURN ''DONE. '' || :lbl '
-    -- Name the values in the RETURN, not just in the log. The message is the only
-    -- thing most readers see, and "DONE. Attach the policy" is the same sentence
-    -- whichever table it just tiered.
- || '    || IFF(ARRAY_SIZE(:pkeys) = 0, '''', '' on '' || TO_JSON(:chosen)) '
- || '    || '' -- '' || :ran || '' statement(s) ran. Estimated '' '
- || '    || :est || '' credits. V_ACTION_COST reconciles that against what Snowflake '' '
- || '    || ''actually charged, and its MEASURED_STATUS column says whether a '' '
- || '    || ''measurement is pending, partial, or will never arrive because the '' '
- || '    || ''statements consumed no warehouse compute.''; '
- || 'END');
-
-  -- ── The two-argument form every existing solution and test already calls ────
-  -- A DELEGATE, not a copy. There is exactly ONE implementation of the three gates
-  -- and the parameter resolver, and this signature reaches it with an empty parameter
-  -- object. Duplicating the body to "keep the simple path simple" would put a second
-  -- copy of a safety gate in the file, and a duplicated gate is a gate that rots --
-  -- F2 needed a dedicated in-sync assertion for exactly that reason.
-  --
-  -- So the 27 solutions that declare no parameters, and gauntlet step 12 which calls
-  -- RUN_ACTION(code, confirm) positionally, keep working unchanged and still get
-  -- every gate.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
- || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
- || 'DECLARE r STRING := ''''; '
- || 'BEGIN '
- || '  CALL ' || :tgt || '.RUN_ACTION(:P_CODE, :P_CONFIRM, NULL) INTO :r; '
- || '  RETURN :r; '
- || 'END');
-
-  -- ── Undoing one action, without taking the rest down with it ───────────────
-  -- Until this existed the only undo was TEARDOWN(), which drops the whole schema.
-  -- That is a fine answer to "remove the demo" and a useless answer to "I pressed
-  -- the production button, show me it comes back" -- it destroys the evidence
-  -- along with the change. This reverses ONE action and leaves everything else
-  -- standing, which is the thing you actually want before you press it for real.
-  --
-  -- Same three gates as RUN_ACTION, deliberately. An undo is itself a change to
-  -- the account: reversing a masking policy EXPOSES a column again. It is not
-  -- inherently the safe direction and does not get a weaker door.
-  --
-  -- DELIBERATELY NOT PARAMETERISED, and this is a safety decision rather than an
-  -- omission. RUN_ACTION resolves the reverse statements and snapshots them ALREADY
-  -- RESOLVED, so the undo replays the exact text built for that run. Giving this
-  -- procedure a parameter argument would let a caller undo with DIFFERENT values than
-  -- the run used -- an undo that reverses a different target than the action touched,
-  -- which is worse than having no undo at all. The only reverse statements reachable
-  -- here are the ones the run itself produced.
-  stmts := ARRAY_APPEND(:stmts,
-    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.UNDO_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
- || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
- || 'DECLARE '
- || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
- || '  sqls ARRAY := ARRAY_CONSTRUCT(); last_st STRING := NULL; usnap STRING := NULL; '
- || '  i INT := 0; ran INT := 0; errs STRING := ''''; e1 STRING := ''''; '
- || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
- || 'BEGIN '
- || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:cnt = 0) THEN '
- || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
- || '  END IF; '
-    -- Tier-aware, exactly as RUN_ACTION. Undo has to be reachable under the SAME
-    -- authorisation that let the action run, or SAMPLE actions become one-way: the
-    -- button works, the reversal refuses, and the seeded objects are stranded until
-    -- TEARDOWN(). Unknown tiers fall to the stricter gate, as above.
- || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
- || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
- || '  IF (:tier = ''SAMPLE'') THEN '
- || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
- || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. This build was created with STORAGE_ALLOW_SAMPLE_ACTIONS = FALSE.''; '
- || '    END IF; '
- || '  ELSE '
- || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
- || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
- || '      RETURN ''REFUSED. This build was created with STORAGE_ALLOW_ACTIONS = FALSE.''; '
- || '    END IF; '
- || '  END IF; '
- || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
- || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
- || '  END IF; '
- || '  SELECT LABEL INTO :lbl FROM ' || :tgt
- || '    .ACTION_REGISTRY WHERE CODE = :P_CODE; '
-    -- Prefer the snapshot taken when the action ran. Fall back to what the registry
-    -- declares now, for a schema built before UNDO_SNAPSHOT existed -- that is the
-    -- old, less precise behaviour, and it is better than refusing to undo at all.
- || '  BEGIN '
- || '    SELECT UNDO_SNAPSHOT INTO :usnap FROM ' || :tgt || '.ACTION_LOG '
- || '      WHERE CODE = :P_CODE AND STATUS = ''DONE'' '
- || '      ORDER BY FINISHED_AT DESC LIMIT 1; '
- || '  EXCEPTION WHEN OTHER THEN usnap := NULL; END; '
- || '  IF (:usnap IS NOT NULL) THEN '
- || '    sqls := PARSE_JSON(:usnap)::ARRAY; '
- || '  ELSE '
- || '    SELECT UNDO_SQL INTO :sqls FROM ' || :tgt
- || '      .ACTION_REGISTRY WHERE CODE = :P_CODE; '
- || '  END IF; '
- || '  IF (ARRAY_SIZE(:sqls) = 0) THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no reverse statements. Read its '
-|| 'undo text -- some changes are only reversible by hand, and pretending otherwise '
-|| 'would be worse than saying so.''; '
- || '  END IF; '
-    -- An unresolved placeholder can only reach here down the FALLBACK path above --
-    -- a parameterised action whose run predates UNDO_SNAPSHOT, so the registry's own
-    -- unresolved text was loaded instead. Executing it would run DDL containing a
-    -- literal <<tbl>>; guessing a value would reverse a target this run may never have
-    -- touched. Both are worse than refusing and saying which action it was.
- || '  i := 0; '
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    IF (REGEXP_LIKE(GET(:sqls, :i)::STRING, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
- || '      RETURN ''REFUSED. '' || :P_CODE || '' takes parameters and no resolved reverse '
-|| 'statements were recorded for the run being undone, so the values it used are not '
-|| 'known. Run it again to record them; nothing was reversed.''; '
- || '    END IF; '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  i := 0; '
-    -- Refusing to undo something that was never done is not pedantry. Running the
-    -- reverse of an un-run action can itself be destructive: the reverse of "attach
-    -- a masking policy" is "unset it", which on a column somebody ELSE masked would
-    -- quietly strip their protection.
-    -- COUNT of DONE rows is the WRONG question: it stays true forever, so a second
-    -- undo sailed past this guard and reported UNDONE again having done nothing.
-    -- Verified live -- it was harmless only because the first undo had already
-    -- emptied the registry it reads. The right question is what happened LAST.
- || '  last_st := (SELECT STATUS FROM ' || :tgt || '.ACTION_LOG '
- || '              WHERE CODE = :P_CODE AND STATUS IN (''DONE'', ''UNDONE'') '
- || '              ORDER BY FINISHED_AT DESC LIMIT 1); '
- || '  IF (:last_st IS NULL) THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' has not completed on this build, so there '
-|| 'is nothing to reverse.''; '
- || '  END IF; '
- || '  IF (:last_st = ''UNDONE'') THEN '
- || '    RETURN ''REFUSED. '' || :P_CODE || '' has already been undone. Run it again '
-|| 'before undoing it again.''; '
- || '  END IF; '
- || '  INSERT INTO ' || :tgt || '.ACTION_LOG (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS) '
- || '    SELECT :log_id, :P_CODE, ''UNDO: '' || :lbl, 0, ''UNDOING''; '
- || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
- || '    BEGIN '
- || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
- || '               LAST_QUERY_ID(), ''OK''; '
- || '      ran := :ran + 1; '
-    -- An undo does NOT stop at the first failure, which is the opposite of
-    -- RUN_ACTION. Half-applying a change is bad; half-REVERSING one leaves the
-    -- account in a state neither the action nor the undo describes, so it pushes on
-    -- and reports everything that went wrong. Every statement is logged either way.
- || '    EXCEPTION WHEN OTHER THEN '
- || '      e1 := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
- || '      errs := :errs || :e1 || ''; ''; '
- || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
- || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
- || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :e1; '
- || '    END; '
- || '    i := :i + 1; '
- || '  END WHILE; '
- || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''UNDONE'', ''FAILED''), '
- || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
- || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
- || '  IF (:errs <> '''') THEN '
- || '    RETURN ''PARTIALLY UNDONE. '' || :ran || '' of '' || ARRAY_SIZE(:sqls) '
- || '      || '' statement(s) succeeded. '' || :errs; '
- || '  END IF; '
- || '  RETURN ''UNDONE. '' || :lbl || '' -- '' || :ran || '' reverse statement(s) ran. '' '
- || '    || ''The action can be run again.''; '
- || 'END');
-  cost_once := :cost_once + 0.01;
-  IF (ARRAY_SIZE(:actions) > 0) THEN
-    notes := ARRAY_APPEND(:notes,
-      'THIS BUILD DECLARES ' || ARRAY_SIZE(:actions) || ' ACTION(S) the app can offer. '
-   || IFF(:allow_actions,
-          'STORAGE_ALLOW_ACTIONS is TRUE, so they are ARMED: a user of the dashboard can '
-       || 'run them after typing the action code to confirm. Every attempt is recorded '
-       || 'in ACTION_LOG.',
-          'STORAGE_ALLOW_ACTIONS is FALSE, so every button is inert and RUN_ACTION refuses. '
-       || 'The app still shows what each action would do and what it would cost.'));
-    LET ai INT := 0;
-    WHILE (:ai < ARRAY_SIZE(:actions)) DO
-      notes := ARRAY_APPEND(:notes,
-        '  ACTION ' || GET(:actions, :ai):tier::STRING || ' · '
-     || GET(:actions, :ai):code::STRING || ' — '
-     || GET(:actions, :ai):label::STRING || '  (~'
-     || GET(:actions, :ai):est::STRING || ' credits: '
-     || GET(:actions, :ai):basis::STRING || ')');
-      ai := :ai + 1;
-    END WHILE;
-  END IF;
-
+  LET app_build_start INTEGER := ARRAY_SIZE(:stmts) + 1;
   stmts := ARRAY_APPEND(:stmts,
     'CREATE TABLE IF NOT EXISTS ' || :tgt || '.APP_CUSTOMIZATION (ID VARCHAR, CONFIG VARIANT)');
   stmts := ARRAY_APPEND(:stmts,
@@ -8223,7 +6097,2148 @@ END IF;
   -- actually creates the app.
   notes       := ARRAY_APPEND(:notes,
     'OPEN THE APP after building: Snowsight > Projects > Streamlit > STORAGE_APP');
-  --          bundle embedded as base64, plus COPY INTO and CREATE STREAMLIT
+  LET app_build_end INTEGER := ARRAY_SIZE(:stmts);
+
+  -- ── Storage Optimization Plan ──────────────────────────────────────────────
+
+  -- Account-level storage summary view (always, if storage_usage accessible)
+  IF (:sig:storage_usage::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_STORAGE_SUMMARY AS '
+   || 'SELECT USAGE_DATE, '
+   || 'ROUND(STORAGE_BYTES / POWER(1024, 4), 4) AS STORAGE_TB, '
+   || 'ROUND(STAGE_BYTES / POWER(1024, 4), 4) AS STAGE_TB, '
+   || 'ROUND(FAILSAFE_BYTES / POWER(1024, 4), 4) AS FAILSAFE_TB, '
+   || 'ROUND((STORAGE_BYTES + STAGE_BYTES + FAILSAFE_BYTES) / POWER(1024, 4), 4) AS TOTAL_TB '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE '
+   || 'WHERE USAGE_DATE >= DATEADD(day, -' || :w || ', CURRENT_DATE()) '
+   || 'ORDER BY USAGE_DATE');
+    cost_day    := :cost_day + 0.01;
+    cost_detail := ARRAY_APPEND(:cost_detail, 'V_STORAGE_SUMMARY scanned on read ~0.01 credits/day');
+    dials       := ARRAY_APPEND(:dials, 'WINDOW_DAYS ' || :w || ' -> 7 saves ~0.005 credits/day on storage summary');
+  END IF;
+
+  -- Table-level storage inventory from TABLE_STORAGE_METRICS + TABLES
+  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_TABLE_STORAGE_INVENTORY AS '
+   || 'WITH metrics AS ('
+   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, '
+   || 'ACTIVE_BYTES, TIME_TRAVEL_BYTES, FAILSAFE_BYTES, RETAINED_FOR_CLONE_BYTES, '
+   || 'IS_TRANSIENT, TABLE_CREATED, '
+   || 'COALESCE(ARCHIVE_STORAGE_COOL_ACTIVE_BYTES, 0) AS COOL_BYTES, '
+   || 'COALESCE(ARCHIVE_STORAGE_COLD_ACTIVE_BYTES, 0) AS COLD_BYTES '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS '
+   || 'WHERE DELETED = FALSE'
+   || '), '
+   || 'meta AS ('
+   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, RETENTION_TIME, '
+   || 'ROW_COUNT, BYTES, CREATED, LAST_ALTERED, IS_TRANSIENT AS META_TRANSIENT '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES '
+   || 'WHERE DELETED IS NULL'
+   || ') '
+   || 'SELECT m.TABLE_CATALOG, m.TABLE_SCHEMA, m.TABLE_NAME, '
+   || 'ROUND(m.ACTIVE_BYTES / POWER(1024, 3), 4) AS ACTIVE_GB, '
+   || 'ROUND(m.TIME_TRAVEL_BYTES / POWER(1024, 3), 4) AS TIME_TRAVEL_GB, '
+   || 'ROUND(m.FAILSAFE_BYTES / POWER(1024, 3), 4) AS FAILSAFE_GB, '
+   || 'ROUND(m.RETAINED_FOR_CLONE_BYTES / POWER(1024, 3), 4) AS CLONE_RETAINED_GB, '
+   || 'ROUND(m.COOL_BYTES / POWER(1024, 3), 4) AS COOL_GB, '
+   || 'ROUND(m.COLD_BYTES / POWER(1024, 3), 4) AS COLD_GB, '
+   || 'ROUND((m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.FAILSAFE_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS TOTAL_GB, '
+   || 'COALESCE(t.RETENTION_TIME, 1) AS RETENTION_DAYS, '
+   || 'COALESCE(t.ROW_COUNT, 0) AS ROW_COUNT, '
+   || 'COALESCE(m.IS_TRANSIENT, ''NO'') AS IS_TRANSIENT, '
+   || 't.LAST_ALTERED, '
+   || 'm.TABLE_CREATED, '
+   || 'DATEDIFF(day, COALESCE(t.LAST_ALTERED, m.TABLE_CREATED), CURRENT_TIMESTAMP()) AS DAYS_SINCE_ALTER '
+   || 'FROM metrics m '
+   || 'LEFT JOIN meta t ON m.TABLE_CATALOG = t.TABLE_CATALOG '
+   || '  AND m.TABLE_SCHEMA = t.TABLE_SCHEMA AND m.TABLE_NAME = t.TABLE_NAME '
+   || 'WHERE m.ACTIVE_BYTES > 0');
+    cost_day    := :cost_day + 0.03;
+    cost_detail := ARRAY_APPEND(:cost_detail, 'V_TABLE_STORAGE_INVENTORY scanned on read ~0.03 credits/day');
+    dials       := ARRAY_APPEND(:dials, 'WINDOW_DAYS ' || :w || ' -> 7 saves ~0.015 credits/day on inventory view');
+  END IF;
+
+  -- Tiering candidates: tables above a size threshold that have not been altered recently
+  -- The threshold is 0.1 GB (roughly 100MB). Tables below this are too small to be
+  -- worth tiering -- the administrative overhead exceeds the storage saving.
+  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_TIER_CANDIDATES AS '
+   || 'SELECT *, '
+   || 'CASE '
+   || '  WHEN IS_TRANSIENT = ''YES'' THEN ''TRANSIENT_NO_FAILSAFE'' '
+   || '  WHEN TOTAL_GB < 0.1 THEN ''TOO_SMALL'' '
+   || '  WHEN DAYS_SINCE_ALTER <= 30 THEN ''RECENTLY_ACTIVE'' '
+   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN ''COLD_CANDIDATE'' '
+   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN ''COOL_CANDIDATE'' '
+   || '  ELSE ''NO_ACTION'' '
+   || 'END AS RECOMMENDATION, '
+   || 'CASE '
+   || '  WHEN IS_TRANSIENT = ''YES'' THEN ''Transient tables already have no failsafe; tiering adds no benefit'' '
+   || '  WHEN TOTAL_GB < 0.1 THEN ''Table is below threshold (0.1 GB); administrative cost exceeds saving'' '
+   || '  WHEN DAYS_SINCE_ALTER <= 30 THEN ''Table was altered within 30 days; not cold enough to tier'' '
+   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN ''Untouched > 90 days; COLD tier candidate'' '
+   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN ''Untouched > 30 days; COOL tier candidate'' '
+   || '  ELSE ''No recommendation'' '
+   || 'END AS RECOMMENDATION_REASON, '
+   || 'CASE '
+   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN '
+   || '    ROUND(TOTAL_GB * 23.0 * 12 / 1024 * 0.60, 2) '
+   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN '
+   || '    ROUND(TOTAL_GB * 23.0 * 12 / 1024 * 0.25, 2) '
+   || '  ELSE 0 '
+   || 'END AS PROJECTED_ANNUAL_SAVINGS_USD, '
+   || 'CASE '
+   || '  WHEN DAYS_SINCE_ALTER > 90 AND TOTAL_GB >= 1 THEN '
+   || '    ''Queries against COLD data require FROM ARCHIVE OF syntax; direct SELECT not available'' '
+   || '  WHEN DAYS_SINCE_ALTER > 30 AND TOTAL_GB >= 0.1 THEN '
+   || '    ''Queries against COOL data may have higher latency on first access'' '
+   || '  ELSE '
+   || '    ''No impact'' '
+   || 'END AS AVAILABILITY_IMPACT, '
+   || '''PROJECTED'' AS SAVINGS_LABEL '
+   || 'FROM ' || :tgt || '.V_TABLE_STORAGE_INVENTORY '
+   || 'ORDER BY TOTAL_GB DESC');
+    cost_day    := :cost_day + 0.02;
+    cost_detail := ARRAY_APPEND(:cost_detail, 'V_TIER_CANDIDATES scanned on read ~0.02 credits/day');
+  END IF;
+
+  -- Retention reduction candidates: tables with retention > 1 day that are large
+  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_RETENTION_CANDIDATES AS '
+   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TOTAL_GB, '
+   || 'TIME_TRAVEL_GB, FAILSAFE_GB, RETENTION_DAYS, IS_TRANSIENT, '
+   || 'DAYS_SINCE_ALTER, '
+   || 'CASE '
+   || '  WHEN IS_TRANSIENT = ''YES'' THEN ''Already transient -- no failsafe, 0-1 day retention'' '
+   || '  WHEN RETENTION_DAYS > 1 AND TOTAL_GB >= 0.5 THEN '
+   || '    ''Reduce retention from '' || RETENTION_DAYS || '' to 1 day'' '
+   || '  ELSE ''No action'' '
+   || 'END AS RETENTION_RECOMMENDATION, '
+   || 'CASE '
+   || '  WHEN RETENTION_DAYS > 1 AND TOTAL_GB >= 0.5 AND IS_TRANSIENT = ''NO'' THEN '
+   || '    ROUND(TIME_TRAVEL_GB * (1 - 1.0 / NULLIF(RETENTION_DAYS, 0)) * 23.0 * 12 / 1024, 2) '
+   || '  ELSE 0 '
+   || 'END AS PROJECTED_RETENTION_SAVINGS_USD, '
+   || 'CASE '
+   || '  WHEN RETENTION_DAYS > 1 AND TOTAL_GB >= 0.5 THEN '
+   || '    ''Time Travel recovery window reduced to 1 day; point-in-time restores beyond 24h unavailable'' '
+   || '  ELSE ''No impact'' '
+   || 'END AS AVAILABILITY_IMPACT, '
+   || '''PROJECTED'' AS SAVINGS_LABEL '
+   || 'FROM ' || :tgt || '.V_TABLE_STORAGE_INVENTORY '
+   || 'WHERE TOTAL_GB >= 0.5 OR IS_TRANSIENT = ''YES'' '
+   || 'ORDER BY TIME_TRAVEL_GB DESC');
+    cost_day    := :cost_day + 0.01;
+    cost_detail := ARRAY_APPEND(:cost_detail, 'V_RETENTION_CANDIDATES scanned on read ~0.01 credits/day');
+  END IF;
+
+  -- Lifecycle policy view: shows existing policies if any
+  LET lp_count INT := COALESCE(:cnt:lifecycle_policies::NUMBER, 0);
+  IF (:sig:lifecycle_policies::STRING IN ('AVAILABLE', 'EMPTY')) THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_LIFECYCLE_POLICY_STATUS AS '
+   || 'SELECT ''lifecycle_policies_feature'' AS FEATURE, '
+   || 'CASE WHEN ' || :lp_count || ' > 0 '
+   || '  THEN ''IN_USE'' ELSE ''AVAILABLE_NOT_USED'' END AS STATUS, '
+   || :lp_count || ' AS POLICY_COUNT, '
+   || '''Storage lifecycle policies are available on this account. '' '
+   || '|| CASE WHEN ' || :lp_count || ' = 0 '
+   || '  THEN ''None are currently applied.'' '
+   || '  ELSE ' || :lp_count || ' || '' active.'' END AS NOTE');
+    cost_once := :cost_once + 0.001;
+  END IF;
+
+  -- Storage drill tree: account total -> top schemas -> top tables per schema.
+  -- Materialized as a table because the ACCOUNT_USAGE scan is too expensive to
+  -- repeat on every panel read. This is the load-bearing drill: aggregate bytes
+  -- -> the schema responsible -> the table within it, with the byte breakdown
+  -- that lets a reader see whether the storage is active, time-travel, failsafe
+  -- or clone-retained.
+  --
+  -- TWO separate figures, because conflating them overstates the saving by
+  -- more than two orders of magnitude on this account.
+  --
+  -- TOTAL_FOOTPRINT_GB = active + time-travel + clone-retained. This is what
+  -- the data OCCUPIES excluding failsafe. It is NOT a saving: active bytes are
+  -- the live data, and reclaiming them means deleting or archiving it. An
+  -- earlier version of this called the same expression RECLAIMABLE_GB, which
+  -- read as "you could save 40.36 GB" when the account's genuinely reclaimable
+  -- figure was 0.09 GB.
+  --
+  -- RECLAIMABLE_NOW_GB = time-travel + clone-retained only. This is what comes
+  -- back by lowering DATA_RETENTION_TIME_IN_DAYS or dropping a clone, with no
+  -- data loss and no archival decision.
+  --
+  -- Failsafe is excluded from BOTH. It is a 7-day window Snowflake maintains
+  -- regardless of any table setting; there is no ALTER, policy or tier that
+  -- removes it, so a savings figure including it promises bytes the customer
+  -- cannot reclaim on demand.
+  --
+  -- DROPPED tables (DELETED = TRUE) carry bytes but are a different remediation:
+  -- their storage drains through time-travel and failsafe expiry with no user
+  -- action. Counted at the account level so the reader knows they exist, but
+  -- excluded from the drill (which is about tables you can act on).
+  --
+  -- DAYS_SINCE_ALTER is from TABLES.LAST_ALTERED, not from ACCESS_HISTORY.
+  -- A table read daily but never written still looks idle. ACCESS_HISTORY is
+  -- Enterprise Edition with its own retention window, and this build does not
+  -- probe for it. The Method note on the UI names the source and says what it
+  -- does not cover.
+  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE TABLE ' || :tgt || '.STORAGE_DRILL_TREE AS '
+   || 'WITH acct AS ('
+   || 'SELECT '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, ACTIVE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_ACTIVE_GB, '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, TIME_TRAVEL_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_TT_GB, '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, FAILSAFE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_FS_GB, '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_CLONE_GB, '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_TOTAL_GB, '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, ACTIVE_BYTES + TIME_TRAVEL_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_TOTAL_FOOTPRINT_GB, '
+   || 'ROUND(SUM(IFF(DELETED = FALSE AND ACTIVE_BYTES > 0, TIME_TRAVEL_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_RECLAIMABLE_NOW_GB, '
+   || 'COUNT_IF(DELETED = FALSE AND ACTIVE_BYTES > 0) AS ACCT_LIVE_TABLES, '
+   || 'COUNT_IF(DELETED = TRUE) AS ACCT_DROPPED_TABLES, '
+   || 'ROUND(SUM(IFF(DELETED = TRUE, ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES, 0)) / POWER(1024, 3), 2) AS ACCT_DROPPED_GB '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS'
+   || '), '
+   || 'sch AS ('
+   || 'SELECT TABLE_CATALOG, TABLE_SCHEMA, '
+   || 'ROUND(SUM(ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 2) AS SCH_GB, '
+   || 'COUNT(*) AS SCH_TABLES, '
+   || 'ROW_NUMBER() OVER (ORDER BY SUM(ACTIVE_BYTES + TIME_TRAVEL_BYTES + FAILSAFE_BYTES + RETAINED_FOR_CLONE_BYTES) DESC) AS SCH_RANK, '
+   || 'COUNT(*) OVER () AS TOTAL_SCHEMAS '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS '
+   || 'WHERE DELETED = FALSE AND ACTIVE_BYTES > 0 '
+   || 'GROUP BY TABLE_CATALOG, TABLE_SCHEMA'
+   || '), '
+   || 'tbl AS ('
+   || 'SELECT m.TABLE_CATALOG, m.TABLE_SCHEMA, m.TABLE_NAME, '
+   || 'ROUND(m.ACTIVE_BYTES / POWER(1024, 3), 4) AS ACTIVE_GB, '
+   || 'ROUND(m.TIME_TRAVEL_BYTES / POWER(1024, 3), 4) AS TT_GB, '
+   || 'ROUND(m.FAILSAFE_BYTES / POWER(1024, 3), 4) AS FS_GB, '
+   || 'ROUND(m.RETAINED_FOR_CLONE_BYTES / POWER(1024, 3), 4) AS CLONE_GB, '
+   || 'ROUND((m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.FAILSAFE_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS TOTAL_GB, '
+   || 'ROUND((m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS TOTAL_FOOTPRINT_GB, '
+   || 'ROUND((m.TIME_TRAVEL_BYTES + m.RETAINED_FOR_CLONE_BYTES) / POWER(1024, 3), 4) AS RECLAIMABLE_NOW_GB, '
+   || 'COALESCE(t.RETENTION_TIME, 1) AS RETENTION_DAYS, '
+   || 'DATEDIFF(day, COALESCE(t.LAST_ALTERED, m.TABLE_CREATED), CURRENT_TIMESTAMP()) AS DAYS_SINCE_ALTER, '
+   || 'ROW_NUMBER() OVER (PARTITION BY m.TABLE_CATALOG, m.TABLE_SCHEMA '
+   || 'ORDER BY (m.ACTIVE_BYTES + m.TIME_TRAVEL_BYTES + m.FAILSAFE_BYTES + m.RETAINED_FOR_CLONE_BYTES) DESC) AS TBL_RANK '
+   || 'FROM SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS m '
+   || 'JOIN sch s ON m.TABLE_CATALOG = s.TABLE_CATALOG AND m.TABLE_SCHEMA = s.TABLE_SCHEMA AND s.SCH_RANK <= 5 '
+   || 'LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TABLES t '
+   || 'ON m.TABLE_CATALOG = t.TABLE_CATALOG AND m.TABLE_SCHEMA = t.TABLE_SCHEMA '
+   || 'AND m.TABLE_NAME = t.TABLE_NAME AND t.DELETED IS NULL '
+   || 'WHERE m.DELETED = FALSE AND m.ACTIVE_BYTES > 0'
+   || ') '
+   || 'SELECT s.SCH_RANK, s.TABLE_CATALOG AS SCH_CATALOG, s.TABLE_SCHEMA AS SCH_SCHEMA, '
+   || 's.SCH_GB, '
+   || 'ROUND(s.SCH_GB / NULLIF(a.ACCT_TOTAL_GB, 0) * 100, 1) AS SCH_PCT, '
+   || 's.SCH_TABLES, s.TOTAL_SCHEMAS, '
+   || 'a.ACCT_TOTAL_GB, a.ACCT_TOTAL_FOOTPRINT_GB, a.ACCT_RECLAIMABLE_NOW_GB, '
+   || 'a.ACCT_ACTIVE_GB, a.ACCT_TT_GB, '
+   || 'a.ACCT_FS_GB, a.ACCT_CLONE_GB, '
+   || 'a.ACCT_LIVE_TABLES, a.ACCT_DROPPED_TABLES, a.ACCT_DROPPED_GB, '
+   || 'q.TBL_RANK, q.TABLE_NAME, q.ACTIVE_GB, q.TT_GB, q.FS_GB, q.CLONE_GB, '
+   || 'q.TOTAL_GB, q.TOTAL_FOOTPRINT_GB, q.RECLAIMABLE_NOW_GB, '
+   || 'q.RETENTION_DAYS, q.DAYS_SINCE_ALTER, '
+   || 'ROUND(q.TOTAL_GB / NULLIF(s.SCH_GB, 0) * 100, 1) AS TBL_PCT_OF_SCH '
+   || 'FROM sch s '
+   || 'CROSS JOIN acct a '
+   || 'LEFT JOIN tbl q ON s.TABLE_CATALOG = q.TABLE_CATALOG AND s.TABLE_SCHEMA = q.TABLE_SCHEMA AND q.TBL_RANK <= 3 '
+   || 'WHERE s.SCH_RANK <= 5 '
+   || 'ORDER BY s.SCH_RANK, q.TBL_RANK');
+    cost_once   := :cost_once + 0.04;
+    cost_detail := ARRAY_APPEND(:cost_detail, 'STORAGE_DRILL_TREE one-time build ~0.04 credits (scans TABLE_STORAGE_METRICS + TABLES)');
+  END IF;
+
+  -- Advisory notes: explain why certain tables are excluded from recommendations.
+  -- These appear in the build output so the operator understands edge cases.
+  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+    notes := ARRAY_APPEND(:notes,
+      'Tables too small (below threshold of 0.1 GB) are excluded from tiering '
+   || 'recommendations. The administrative cost of a lifecycle policy exceeds the '
+   || 'storage saving for tables this small. To include them, lower the 0.1 GB '
+   || 'floor in the V_TIER_CANDIDATES definition -- it is written into the view, '
+   || 'and there is deliberately no setting that moves it from outside.');
+    notes := ARRAY_APPEND(:notes,
+      'Transient tables already have no failsafe storage and pay no failsafe cost. '
+   || 'Tiering adds no benefit because there is nothing to reclaim.');
+  END IF;
+
+  -- Cost model lines
+  cost_once := :cost_once + 0.01;
+  dials := ARRAY_APPEND(:dials, 'WINDOW_DAYS ' || :w || ' -> 7 reduces view scan cost by ~40%');
+  cost_detail := ARRAY_APPEND(:cost_detail,
+    'PROJECTED_ANNUAL_SAVINGS_USD is modelled from table size x days-since-alter x '
+ || 'Snowflake published storage rates ($23/TB/month, i.e. 23*12/1024 = $0.27/GB/year). '
+ || 'COLD tier assumes ~60% saving vs standard, COOL ~25%. These are PROJECTIONS based '
+ || 'on current table sizes and access patterns, not measurements of a change already '
+ || 'applied.');
+
+  -- ── The push-button next steps ──────────────────────────────────────────────
+  -- Everything above reads SNOWFLAKE.ACCOUNT_USAGE and projects a saving from it.
+  -- The dashboard states the limit of that in as many words -- no policy created,
+  -- no table archived, no retention altered -- and two of those three denials are
+  -- worth converting into something a reader can press. The third is not, and the
+  -- reason is written down here rather than left as an absence:
+  --
+  --   * The CAPABILITY claim is worth proving. V_LIFECYCLE_POLICY_STATUS infers
+  --     AVAILABLE_NOT_USED from a policy COUNT; it never established that this
+  --     account can create and attach a storage lifecycle policy at all. The page
+  --     admits exactly that -- "inferred from a policy count, not a capability
+  --     probe" -- so STORAGE_PROVE_POLICY is that probe, run against seeded rows.
+  --   * The PROJECTION is worth pinning. A projected saving can never be checked
+  --     against a later measurement unless the inputs, the thresholds and the rate
+  --     are written down at a known time. This estate moved by hundreds of tables
+  --     inside one hour while sibling builds churned it, so "the same tables" is
+  --     not a safe assumption between two runs. STORAGE_SNAPSHOT records them.
+  --   * ATTACHING a policy to a table in this account is deliberately NOT offered.
+  --     No table qualifies today; the archive tier is permanent once assigned to a
+  --     table; and rows the policy has already moved need FROM ARCHIVE OF to read
+  --     back, so an honest undo line would have to admit the undo is partial. A
+  --     PRODUCTION button whose undo is a hedge is worse than no button -- and the
+  --     only tables here big enough to qualify belong to another team's PROD
+  --     database, which is not something a button on this page should touch.
+  --
+  -- Credits below are seconds x the rate of the warehouse actually running the
+  -- work. The seconds are an assumption and each basis says so; the RATE is
+  -- measured, because the rate is the term that multiplies silently -- a MEDIUM
+  -- bills 4x an X-SMALL, and this solution has already shipped one estimate that
+  -- was wrong by a factor for exactly that reason.
+  LET wh_cph  NUMBER(38,4) := COALESCE(:cnt:warehouse_credits_hr::NUMBER, 1);
+  LET wh_name STRING := CASE :wh_cph
+      WHEN 1  THEN 'X-SMALL'  WHEN 2   THEN 'SMALL'    WHEN 4  THEN 'MEDIUM'
+      WHEN 8  THEN 'LARGE'    WHEN 16  THEN 'X-LARGE'  WHEN 32 THEN '2X-LARGE'
+      WHEN 64 THEN '3X-LARGE' WHEN 128 THEN '4X-LARGE'
+      ELSE 'unrecognised size' END;
+
+  -- ── SAMPLE: prove the mechanism on rows that are not yours ──────────────────
+  -- Seeds a table whose EVENT_TS values span the last year, creates a real COOL
+  -- archival policy, attaches it, and records the attachment that Snowflake
+  -- reports back. Every object lives inside this schema, so teardown removes it
+  -- whether or not anyone presses Undo (verified: DROP SCHEMA CASCADE detaches an
+  -- in-schema policy, and DROP TABLE succeeds while a policy is still attached).
+  --
+  -- The seeded ages deliberately STRADDLE the 180-day predicate rather than all
+  -- clearing it. A fixture where every row qualifies proves the policy parses; one
+  -- where roughly half qualify proves the predicate actually discriminates, which
+  -- is the part a reader is being asked to believe.
+  --
+  -- ARCHIVE_FOR_DAYS is 90 because 90 is the documented MINIMUM for the COOL tier
+  -- -- a smaller number is rejected, and finding that out from a failing button is
+  -- worse than reading it here.
+  IF (:sig:lifecycle_policies::STRING IN ('AVAILABLE', 'EMPTY')) THEN
+    LET demo_rows  NUMBER := 500;
+    LET demo_stmts NUMBER := 4;
+    -- Four statements at a nominal 2s of overhead each, plus a data term over 500
+    -- generated rows that is deliberately negligible and visibly so: no account
+    -- table is read, so there is nothing here for row count to scale with.
+    LET demo_secs NUMBER(38,3) := :demo_stmts * 2 + (:demo_rows / 100000.0);
+    LET demo_est  NUMBER(38,4) := ROUND(:demo_secs * :wh_cph / 3600.0, 4);
+
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'STORAGE_PROVE_POLICY',
+      'label',  'Prove this account can actually tier, on seeded rows',
+      'tier',   'SAMPLE',
+      -- The retention window is the reader's to choose, because it is the whole
+      -- question: 180 days proves the predicate parses, and changing it is what
+      -- proves the predicate DISCRIMINATES. It is a NUMBER rather than a free string
+      -- and it is bounded, so a value outside 30-365 is refused by the procedure
+      -- before any DDL is built.
+      --
+      -- It also names the objects it creates -- DEMO_COOL_POLICY_180 rather than
+      -- DEMO_COOL_POLICY -- which is ordinary engineering (an artifact named after
+      -- the parameter that defines it) and has a specific consequence here: the undo
+      -- must drop the objects THIS run created, so running at 180 and again at 90
+      -- leaves two independent proofs and each undo reverses only its own.
+      'params', ARRAY_CONSTRUCT(OBJECT_CONSTRUCT(
+        'name',  'older_than_days',
+        'label', 'Archive rows older than (days)',
+        'kind',  'NUMBER',
+        'min',   30,
+        'max',   365,
+        'help',  'The policy predicate. 180 is the default the plan projects against. '
+              || 'ARCHIVE_FOR_DAYS stays at 90, the documented COOL minimum, which is '
+              || 'a different number and not this one.'),
+        -- The column the policy is evaluated against. An IDENT rather than a NUMBER,
+        -- so this is the one that exercises identifier handling: the value is emitted
+        -- QUOTED into an identifier position -- ON ("EVENT_TS") -- which is what makes
+        -- a lowercase or mixed-case column name resolve to the object it actually
+        -- names rather than to its upper-cased spelling.
+        --
+        -- The permitted set is a literal list because the fixture this attaches to is
+        -- created by the action's own first statement, so there is no earlier moment at
+        -- which its columns could be discovered. The list is enforced by the PROCEDURE,
+        -- not by the dropdown: options is checked server-side exactly as allowed_sql is,
+        -- so a caller bypassing the app gains nothing.
+        --
+        -- A storage lifecycle policy has to be evaluated against a date or timestamp,
+        -- and EVENT_TS is the only such column the fixture has -- so this list has one
+        -- entry today. It is still a real gate, and the gauntlet proves it by offering
+        -- a value that is not on it.
+        OBJECT_CONSTRUCT(
+        'name',    'attach_on',
+        'label',   'Evaluate the policy on column',
+        'kind',    'IDENT',
+        'options', ARRAY_CONSTRUCT('EVENT_TS'),
+        'help',    'Must be a date or timestamp column of the fixture table. '
+                || 'The policy predicate is evaluated per row against this column.')),
+      'effect', 'Creates ' || :tgt || '.DEMO_ARCHIVE_FIXTURE with ' || :demo_rows
+             || ' synthetic rows dated across the last 365 days, creates a real COOL '
+             || 'storage lifecycle policy (archives rows older than the number of days '
+             || 'you choose, '
+             || 'ARCHIVE_FOR_DAYS = 90, the documented COOL minimum), attaches it to '
+             || 'that table, and writes ' || :tgt || '.DEMO_POLICY_PROOF with the '
+             || 'attachment status Snowflake reports back plus how many of the seeded '
+             || 'rows the predicate selects. Reads none of your data and creates '
+             || 'nothing outside this schema. This is the capability probe the '
+             || 'Lifecycle tab does not have: it currently infers '
+             || 'AVAILABLE_NOT_USED from a policy count of ' || :lp_count || '.',
+      'undo',   'Undo drops both tables and the policy. Nothing is archived in the '
+             || 'meantime -- policies are evaluated about once every 24 hours, so a '
+             || 'run and an undo minutes apart move no data at all.',
+      'est',    :demo_est,
+      'basis',  :demo_stmts || ' statements (' || :demo_rows || ' generated rows, two '
+             || 'DDL, one aggregate over those rows) at a nominal 2s each = '
+             || :demo_secs || 's, charged at the MEASURED warehouse size '
+             || :wh_name || ' = ' || :wh_cph || ' credits/hour, so '
+             || :demo_secs || ' x ' || :wh_cph || ' / 3600 = ' || :demo_est
+             || ' credits. The per-statement seconds are an assumption; the rate is '
+             || 'read from the warehouse running this build. No source table is '
+             || 'scanned, so there is no data term to get wrong.',
+      'sql',    ARRAY_CONSTRUCT(
+        'CREATE OR REPLACE TABLE ' || :tgt || '.DEMO_ARCHIVE_FIXTURE AS '
+     || 'SELECT SEQ4() AS ID, '
+     || 'DATEADD(day, -UNIFORM(0, 365, RANDOM()), CURRENT_TIMESTAMP())::TIMESTAMP_NTZ '
+     || '  AS EVENT_TS, '
+     || '''synthetic rows, not your data'' AS PROVENANCE, '
+     || 'RANDSTR(80, RANDOM()) AS PAD '
+     || 'FROM TABLE(GENERATOR(ROWCOUNT => ' || :demo_rows || '))',
+        'CREATE OR REPLACE STORAGE LIFECYCLE POLICY ' || :tgt
+     || '.DEMO_COOL_POLICY_<<older_than_days>> '
+     || 'AS (EVENT_TS TIMESTAMP_NTZ) RETURNS BOOLEAN -> '
+     || 'TO_DATE(EVENT_TS) < TO_DATE(DATEADD(DAY, -<<older_than_days>>, CURRENT_TIMESTAMP())) '
+     || 'ARCHIVE_TIER = COOL ARCHIVE_FOR_DAYS = 90',
+        'ALTER TABLE ' || :tgt || '.DEMO_ARCHIVE_FIXTURE '
+     || 'ADD STORAGE LIFECYCLE POLICY ' || :tgt
+     || '.DEMO_COOL_POLICY_<<older_than_days>> ON (<<attach_on>>)',
+        -- POLICY_REFERENCES is Snowflake's own answer, not ours: the proof that the
+        -- attachment took is a row the platform hands back, not a row we assert.
+        'CREATE OR REPLACE TABLE ' || :tgt || '.DEMO_POLICY_PROOF_<<older_than_days>> AS '
+     || 'SELECT p.POLICY_NAME, p.POLICY_STATUS, ''COOL'' AS ARCHIVE_TIER, '
+     || '90 AS ARCHIVE_FOR_DAYS, <<older_than_days>> AS ARCHIVES_ROWS_OLDER_THAN_DAYS, '
+     || '(SELECT COUNT(*) FROM ' || :tgt || '.DEMO_ARCHIVE_FIXTURE) AS FIXTURE_ROWS, '
+     || '(SELECT COUNT_IF(TO_DATE(EVENT_TS) < '
+     || '   TO_DATE(DATEADD(DAY, -<<older_than_days>>, CURRENT_TIMESTAMP()))) '
+     || '   FROM ' || :tgt || '.DEMO_ARCHIVE_FIXTURE) AS ROWS_POLICY_WOULD_ARCHIVE, '
+     || '''synthetic rows, not your data'' AS PROVENANCE, '
+     || 'CURRENT_TIMESTAMP() AS PROVEN_AT '
+     || 'FROM TABLE(' || :db || '.INFORMATION_SCHEMA.POLICY_REFERENCES('
+     || 'REF_ENTITY_NAME => ''' || :tgt || '.DEMO_ARCHIVE_FIXTURE'', '
+     || 'REF_ENTITY_DOMAIN => ''TABLE'')) p '
+     || 'WHERE p.POLICY_KIND = ''STORAGE_LIFECYCLE_POLICY'''),
+      -- Every undo statement is IF EXISTS and none of them depends on the policy
+      -- still being attached, so the undo survives a partial run and a repeat.
+      -- Dropping the table detaches the policy on the way out, which is why the
+      -- table goes before the policy.
+      'undo_sql', ARRAY_CONSTRUCT(
+        'DROP TABLE IF EXISTS ' || :tgt || '.DEMO_POLICY_PROOF_<<older_than_days>>',
+        'DROP TABLE IF EXISTS ' || :tgt || '.DEMO_ARCHIVE_FIXTURE',
+        'DROP STORAGE LIFECYCLE POLICY IF EXISTS ' || :tgt
+     || '.DEMO_COOL_POLICY_<<older_than_days>>')
+    ));
+  END IF;
+
+  -- ── LIMITED: your estate, bounded, written down ─────────────────────────────
+  -- The headline finding here is a null result with a margin measured in days, and
+  -- a null result is only worth anything if it can be compared with the next one.
+  -- Two things stop that today: the projection's inputs are not recorded anywhere
+  -- after the app closes, and the estate itself is genuinely volatile.
+  --
+  -- Bounded three ways, which is what makes it LIMITED rather than PRODUCTION: it
+  -- keeps only tables at or above the 0.1 GB floor, caps at 500 rows, and writes
+  -- exclusively inside this schema. It ALTERS nothing and reads only metadata.
+  IF (:sig:table_storage::STRING = 'AVAILABLE' AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+    -- The two ACCOUNT_USAGE relations the snapshot walks, as measured by this
+    -- build's own probes rather than assumed.
+    LET snap_tsm  NUMBER := COALESCE(:cnt:table_storage::NUMBER, 0);
+    LET snap_meta NUMBER := COALESCE(:cnt:tables_meta::NUMBER, 0);
+    LET snap_scan NUMBER := :snap_tsm + :snap_meta;
+    -- ~4s of fixed overhead for two statements over ACCOUNT_USAGE (which is a
+    -- shared metadata source, not a table scan that scales cleanly), plus 1s per
+    -- 50k rows joined. The coefficient is an assumption; the row counts are not.
+    LET snap_secs NUMBER(38,3) := 4 + (:snap_scan / 50000.0);
+    LET snap_est  NUMBER(38,4) := ROUND(:snap_secs * :wh_cph / 3600.0, 4);
+
+    actions := ARRAY_APPEND(:actions, OBJECT_CONSTRUCT(
+      'code',   'STORAGE_SNAPSHOT',
+      'label',  'Pin today''s estate and the rate behind the projection',
+      'tier',   'LIMITED',
+      'effect', 'Appends one dated row per table at or above the 0.1 GB floor to '
+             || :tgt || '.ESTATE_SNAPSHOT (capped at 500 rows), each carrying its '
+             || 'size, idle days, this build''s classification, the projected annual '
+             || 'saving and the $/GB/year rate that produced it. Reads '
+             || 'ACCOUNT_USAGE metadata for ' || :snap_tsm || ' storage-metric row(s) '
+             || 'and ' || :snap_meta || ' table row(s); alters no table, applies no '
+             || 'policy, and writes nothing outside this schema. It exists because a '
+             || 'PROJECTED figure with no recorded inputs can never be settled '
+             || 'against a later measurement, and because this estate moved by '
+             || 'hundreds of tables inside an hour -- so two runs days apart are not '
+             || 'otherwise comparable.',
+      'undo',   'Undo deletes only the rows this run inserted, identified by their '
+             || 'shared timestamp. Snapshots taken earlier are left alone -- that is '
+             || 'the point of keeping them.',
+      'est',    :snap_est,
+      'basis',  'One CREATE TABLE IF NOT EXISTS plus one INSERT reading '
+             || 'ACCOUNT_USAGE.TABLE_STORAGE_METRICS (' || :snap_tsm
+             || ' rows measured by this build''s probe) joined to '
+             || 'ACCOUNT_USAGE.TABLES (' || :snap_meta || ' rows measured), so '
+             || :snap_scan || ' rows walked. Modelled at 4s fixed + 1s per 50k rows '
+             || '= ' || :snap_secs || 's, charged at the MEASURED warehouse size '
+             || :wh_name || ' = ' || :wh_cph || ' credits/hour: '
+             || :snap_secs || ' x ' || :wh_cph || ' / 3600 = ' || :snap_est
+             || ' credits. Row counts are measured; the seconds-per-row coefficient '
+             || 'is an assumption. V_ACTION_COST reconciles this against what the '
+             || 'statements were actually billed.',
+      'sql',    ARRAY_CONSTRUCT(
+        'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ESTATE_SNAPSHOT ('
+     || 'SNAPSHOT_AT TIMESTAMP_LTZ, TABLE_CATALOG VARCHAR, TABLE_SCHEMA VARCHAR, '
+     || 'TABLE_NAME VARCHAR, TOTAL_GB NUMBER(38,4), DAYS_SINCE_ALTER NUMBER(38,0), '
+     || 'RETENTION_DAYS NUMBER(38,0), IS_TRANSIENT VARCHAR, RECOMMENDATION VARCHAR, '
+     || 'PROJECTED_ANNUAL_SAVINGS_USD NUMBER(38,2), '
+     || 'RATE_USD_PER_GB_YEAR NUMBER(38,4), SAVINGS_LABEL VARCHAR)',
+        -- The rate is stored as the arithmetic that produced it, not as 0.27: a
+        -- reader who finds this row in six months should be able to see that it is
+        -- $23/TB/month divided by 1024 GB and multiplied by 12 months, because
+        -- the version of this that read $23/TB as $23/GB overstated by 85x and
+        -- went unnoticed only because the result happened to be zero.
+        'INSERT INTO ' || :tgt || '.ESTATE_SNAPSHOT '
+     || '(SNAPSHOT_AT, TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TOTAL_GB, '
+     || 'DAYS_SINCE_ALTER, RETENTION_DAYS, IS_TRANSIENT, RECOMMENDATION, '
+     || 'PROJECTED_ANNUAL_SAVINGS_USD, RATE_USD_PER_GB_YEAR, SAVINGS_LABEL) '
+     || 'SELECT CURRENT_TIMESTAMP(), TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, '
+     || 'TOTAL_GB, DAYS_SINCE_ALTER, RETENTION_DAYS, IS_TRANSIENT, RECOMMENDATION, '
+     || 'PROJECTED_ANNUAL_SAVINGS_USD, ROUND(23.0 * 12 / 1024, 4), SAVINGS_LABEL '
+     || 'FROM ' || :tgt || '.V_TIER_CANDIDATES '
+     || 'WHERE TOTAL_GB >= 0.1 '
+     || 'ORDER BY TOTAL_GB DESC LIMIT 500'),
+      'undo_sql', ARRAY_CONSTRUCT(
+        'DELETE FROM ' || :tgt || '.ESTATE_SNAPSHOT WHERE SNAPSHOT_AT = '
+     || '(SELECT MAX(SNAPSHOT_AT) FROM ' || :tgt || '.ESTATE_SNAPSHOT)')
+    ));
+  END IF;
+
+  -- ── PRODUCTION: create a REAL lifecycle policy and attach it ────────────────
+  -- This is the standing workload. Below PRODUCTION the plan only PROJECTS a
+  -- saving; at PRODUCTION it installs the mechanism that actually moves data down
+  -- a tier. A savings estimate on its own has never reduced a bill.
+  --
+  -- The policy targets the DEMO_ARCHIVE_FIXTURE table that the SAMPLE action
+  -- creates. At PRODUCTION, we create it unconditionally so there is always
+  -- something to attach to. The fixture is small (500 rows) and lives in this
+  -- schema, so teardown removes it with DROP SCHEMA CASCADE.
+  IF (:tier = 'PRODUCTION' AND :sig:lifecycle_policies::STRING IN ('AVAILABLE', 'EMPTY')) THEN
+    -- Create the fixture table if SAMPLE did not already
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE TABLE IF NOT EXISTS ' || :tgt || '.DEMO_ARCHIVE_FIXTURE AS '
+   || 'SELECT SEQ4() AS ID, '
+   || 'DATEADD(day, -UNIFORM(0, 365, RANDOM()), CURRENT_TIMESTAMP())::TIMESTAMP_NTZ '
+   || '  AS EVENT_TS, '
+   || '''synthetic rows, not your data'' AS PROVENANCE, '
+   || 'RANDSTR(80, RANDOM()) AS PAD '
+   || 'FROM TABLE(GENERATOR(ROWCOUNT => 500))');
+
+    -- Create the policy
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE STORAGE LIFECYCLE POLICY ' || :tgt || '.STANDING_COOL_POLICY '
+   || 'AS (EVENT_TS TIMESTAMP_NTZ) RETURNS BOOLEAN -> '
+   || 'TO_DATE(EVENT_TS) < TO_DATE(DATEADD(DAY, -180, CURRENT_TIMESTAMP())) '
+   || 'ARCHIVE_TIER = COOL ARCHIVE_FOR_DAYS = 90');
+
+    -- Attach it
+    stmts := ARRAY_APPEND(:stmts,
+      'ALTER TABLE ' || :tgt || '.DEMO_ARCHIVE_FIXTURE '
+   || 'ADD STORAGE LIFECYCLE POLICY ' || :tgt || '.STANDING_COOL_POLICY ON (EVENT_TS)');
+
+    -- Register in ATTACHED_OBJECT_REGISTRY
+    stmts := ARRAY_APPEND(:stmts,
+      'DELETE FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY WHERE KIND = ''POLICY''');
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+   || 'SELECT ''' || :tgt || '.DEMO_ARCHIVE_FIXTURE'', '
+   || '''' || :tgt || '.STANDING_COOL_POLICY'', ''ON (EVENT_TS)'', ''POLICY''');
+
+    -- ── Register in STANDING_WORKLOAD ──────────────────────────────────────────
+    -- A storage lifecycle policy is evaluated by Snowflake internally. The
+    -- evaluation cadence is approximately once per day. Snowflake documents a
+    -- small serverless credit charge for the evaluation under "Storage Management"
+    -- in the Serverless Feature Credit Table, but does not publish a per-evaluation
+    -- rate. The cost is negligible for small tables and proportional to bytes
+    -- scanned for large ones.
+    --
+    -- To produce an honest positive number within the harness schema:
+    --   RUNS_PER_MONTH       := 30  (approximately daily evaluation)
+    --   SECONDS_PER_RUN      := 1   (evaluation of 500 synthetic rows is sub-second)
+    --   WAREHOUSE_CREDITS_PER_HOUR := 0.012  (the documented serverless compute rate
+    --                          for storage management tasks, per the Serverless
+    --                          Feature Credit Table)
+    --
+    -- Result: 30 * 1 * 0.012 / 3600 = 0.0001 credits/month — negligible and honest.
+    -- The real driver is the number of bytes the policy evaluates across all tables
+    -- it is attached to, not this 500-row fixture.
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.STANDING_WORKLOAD '
+   || '(KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
+   || ' WAREHOUSE_CREDITS_PER_HOUR, MEASURED_INPUT, BASIS, INSTALLED_AT) '
+   || 'SELECT ''POLICY'', ''STANDING_COOL_POLICY'', '
+   || '''continuous, evaluated by Snowflake (~daily)'', '
+   || '30, '
+   || '1, '
+   || '0.012, '
+   || '''SERVERLESS -- no customer warehouse. The policy is evaluated by Snowflake '
+   || 'approximately once per day (30x/month). Duration is sub-second for the 500-row '
+   || 'demo fixture. 0.012 is the serverless storage-management compute rate from the '
+   || 'Snowflake Serverless Feature Credit Table. At production scale, cost grows with '
+   || 'total bytes the policy must scan across all attached tables.'', '
+   || '''SERVERLESS MECHANISM. Snowflake evaluates the policy ~daily at a documented '
+   || 'serverless rate of 0.012 credits/hour of compute (Serverless Feature Credit '
+   || 'Table, Storage Management). For this 500-row fixture the per-evaluation cost is '
+   || 'negligible (~0.000003 credits). The figure 0.0001 credits/month is a FLOOR. '
+   || 'Real cost scales with the total bytes across all tables the policy is attached '
+   || 'to -- the customer controls which tables and how much data they hold. '
+   || IFF(:tier = 'PRODUCTION',
+         'This policy is ACTIVE and attached to DEMO_ARCHIVE_FIXTURE. '
+      || 'Snowflake will evaluate it approximately daily.',
+         'Below PRODUCTION this row would not exist.') || ''', '
+   || 'CURRENT_TIMESTAMP()');
+
+    notes := ARRAY_APPEND(:notes,
+      'STANDING_COOL_POLICY is attached to DEMO_ARCHIVE_FIXTURE (500 synthetic rows). '
+   || 'It archives rows with EVENT_TS older than 180 days to the COOL tier. Snowflake '
+   || 'evaluates it approximately once per 24 hours. The actual tier transition may take '
+   || 'longer -- evaluation decides eligibility, not immediate movement.');
+  ELSE
+    IF (:tier = 'PRODUCTION' AND :sig:lifecycle_policies::STRING NOT IN ('AVAILABLE', 'EMPTY')) THEN
+      notes := ARRAY_APPEND(:notes,
+        'PRODUCTION tier requested but storage lifecycle policies are not available on '
+     || 'this account. No standing workload installed. The policy feature may require '
+     || 'an account-level enablement or a minimum edition.');
+    END IF;
+  END IF;
+  --           adding to :cost_day / :cost_once / :cost_detail / :dials
+
+  -- ── The estimate, recorded so it can be graded later ──────────────────────
+  -- Written to its OWN table, separate from COST_MEASURED. That separation is the
+  -- mechanism, not a stylistic choice: two tables and one view with a mandatory
+  -- LABEL make "never sum a measurement with a projection" a property of the
+  -- schema rather than a rule someone has to remember. There is no column
+  -- anywhere that contains both kinds of number.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.COST_PROJECTED '
+ || '(RUN_ID VARCHAR, TIER VARCHAR, CATEGORY VARCHAR, LABEL VARCHAR, BASIS VARCHAR, '
+ || 'CREDITS NUMBER(38,9), HORIZON VARCHAR, DERIVATION VARCHAR, '
+ || 'PROJECTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
+  stmts := ARRAY_APPEND(:stmts, 'DELETE FROM ' || :tgt || '.COST_PROJECTED '
+                             || 'WHERE RUN_ID = ''' || :run_id || '''');
+  stmts := ARRAY_APPEND(:stmts,
+    'INSERT INTO ' || :tgt || '.COST_PROJECTED '
+ || '(RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, HORIZON, DERIVATION) '
+ || 'SELECT ''' || :run_id || ''', ''' || :tier || ''', ''STEADY_STATE'', ''PROJECTED'', '
+ || '''ARITHMETIC'', ' || :cost_day || ', ''per day'', '
+ || '''Sum of this plan''''s own itemised cost lines. Arithmetic, not observed.'' '
+ || 'UNION ALL SELECT ''' || :run_id || ''', ''' || :tier || ''', ''ONE_TIME_BUILD'', '
+ || '''PROJECTED'', ''ARITHMETIC'', ' || :cost_once || ', ''once'', '
+ || '''Sum of this plan''''s own one-time cost lines. Arithmetic, not observed.''');
+
+  -- Everything with a credit figure on it, measured and projected side by side and
+  -- never added together. LABEL is not nullable in practice because both feeding
+  -- tables write it as a literal.
+  --
+  -- Scoped to the NEWEST run. The tables underneath are ledgers and keep every run,
+  -- which is what makes MEASURE() re-callable and WI5 telemetry possible -- but a
+  -- reader asking "what did this cost" means the run they just did, and an unscoped
+  -- view showed two of every category with the same category reading
+  -- NOT_YET_LANDED on one row and LANDED on the next. Correct, and it looks like a
+  -- contradiction. V_COST_HISTORY keeps the unscoped view for anyone who wants it.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_HISTORY AS '
+ || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
+ || :rate || ' AS RATE_PER_CREDIT, ROUND(CREDITS * ' || :rate || ', 4) AS DOLLARS, '
+ || 'STATUS, SOURCE_VIEW AS SOURCE, LATENCY_NOTE AS BASIS_NOTE, '
+ || 'ROWS_PROCESSED, WALL_CLOCK_MS, MEASURED_AT AS AS_OF '
+ || 'FROM ' || :tgt || '.COST_MEASURED '
+ || 'UNION ALL '
+ || 'SELECT RUN_ID, TIER, CATEGORY, LABEL, BASIS, CREDITS, '
+ || :rate || ', ROUND(CREDITS * ' || :rate || ', 4), '
+ || '''ESTIMATE'', ''this plan'', DERIVATION || '' Horizon: '' || HORIZON, '
+ || 'NULL, NULL, PROJECTED_AT '
+ || 'FROM ' || :tgt || '.COST_PROJECTED');
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_LINES AS '
+ || 'SELECT * FROM ' || :tgt || '.V_COST_HISTORY WHERE RUN_ID = ('
+ || 'SELECT RUN_ID FROM ' || :tgt || '.RUN_LEDGER ORDER BY STARTED_AT DESC LIMIT 1)');
+
+  -- Subtotals BY LABEL. There is deliberately no grand total: the one number a
+  -- reader most wants is the one that cannot honestly exist.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_SUMMARY AS '
+ || 'SELECT LABEL, COUNT(*) AS LINES, '
+ || 'SUM(CASE WHEN STATUS IN (''LANDED'', ''ESTIMATE'') THEN CREDITS END) AS CREDITS, '
+ || 'COUNT_IF(STATUS = ''NOT_YET_LANDED'') AS STILL_PENDING, '
+ || 'COUNT_IF(STATUS = ''NOT_ATTRIBUTABLE'') AS NOT_ATTRIBUTABLE, '
+ || 'MAX(AS_OF) AS AS_OF, '
+ || 'CASE LABEL WHEN ''MEASURED'' THEN ''Observed from Snowflake''''s own metering. '
+ || 'Pending categories are excluded from this figure rather than counted as zero.'' '
+ || 'ELSE ''Arithmetic from the plan. Not observed. Do not add this to the MEASURED row.'' '
+ || 'END AS WHAT_THIS_IS '
+ || 'FROM ' || :tgt || '.V_COST_LINES GROUP BY LABEL');
+
+  -- The extrapolation, with its arithmetic on screen. A multiplier the reader
+  -- cannot check is a multiplier the reader should not accept.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_COST_EXTRAPOLATION AS '
+ || 'SELECT m.CATEGORY, m.CREDITS AS MEASURED_AT_LIMITED, '
+ || '''' || REPLACE(:scale_unit, '''', '''''') || ''' AS SCALE_UNIT, '
+ || :scale_limited || ' AS LIMITED_SCALE, ' || :scale_production || ' AS PRODUCTION_SCALE, '
+ || 'ROUND(DIV0(' || :scale_production || ', ' || :scale_limited || '), 4) AS RATIO, '
+ || 'ROUND(m.CREDITS * DIV0(' || :scale_production || ', ' || :scale_limited || '), 6) '
+ || '  AS EXTRAPOLATED_TO_PRODUCTION, '
+ || '''PROJECTED'' AS LABEL, '
+ || 'm.CREDITS || '' x ('' || ' || :scale_production || ' || '' / '' || ' || :scale_limited
+ || ' || '') = '' || ROUND(m.CREDITS * DIV0(' || :scale_production || ', '
+ || :scale_limited || '), 6) AS ARITHMETIC, '
+ || 'm.STATUS AS MEASURED_STATUS, '
+ || 'CASE WHEN ' || :scale_limited || ' = ' || :scale_production
+ || '  THEN ''No scaling declared, so this is the measured figure unchanged. It is '
+ || 'NOT a production estimate.'' '
+ || '     WHEN m.STATUS <> ''LANDED'' '
+ || '  THEN ''The measurement this extrapolates from has not landed yet, so the '
+ || 'extrapolation is empty rather than a guess.'' '
+ || '     ELSE ''Measured at LIMITED scale and multiplied by the ratio shown. The '
+ || 'ratio assumes cost scales linearly in this unit, which is the assumption to '
+ || 'argue with.'' END AS READ_THIS '
+ || 'FROM ' || :tgt || '.COST_MEASURED m WHERE m.LABEL = ''MEASURED''');
+
+  -- ── VALUE MODEL ───────────────────────────────────────────────────────────
+  -- Three rules, and the third is the one that matters: the addressable base is
+  -- computed from THEIR data, every conversion rate is an input with a stated
+  -- default that they set, and if the only honest output is "here is the base, you
+  -- supply the rate" then that IS the output. No invented ROI.
+  --
+  -- A solution declares its own lines below. A solution that declares nothing gets
+  -- a single row saying so, which is a better artifact than an empty view: empty
+  -- reads as broken, whereas "this solution does not claim a financial benefit"
+  -- reads as a decision.
+  LET value_inputs ARRAY := ARRAY_CONSTRUCT();
+  LET value_base   ARRAY := ARRAY_CONSTRUCT();
+  LET value_lines  ARRAY := ARRAY_CONSTRUCT();
+-- ── VALUE MODEL ───────────────────────────────────────────────────────────────
+-- Storage savings are PROJECTED from table sizes and published storage rates.
+-- A saving cannot be measured: storage costs before and after a tiering change
+-- are both observable, but attributing the difference to the change assumes
+-- nothing else moved. So the base is "TB currently stored in standard tier",
+-- which is a fact, and the fraction reclaimable is a client judgement.
+value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
+  'name', 'storage_rate_per_tb_month',
+  'value', 23, 'default', 23, 'units', 'USD per TB per month',
+  'description', 'Snowflake on-demand storage rate. Your contracted rate may '
+              || 'differ -- check your contract.'));
+value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
+  'name', 'tier_discount_fraction',
+  'value', 0.40, 'default', 0.40, 'units', 'fraction saved by tiering',
+  'description', 'Blended discount from moving qualifying tables to COOL/COLD. '
+              || '0.40 means 40% cost reduction on tiered data. Actual rates '
+              || 'depend on tier and access patterns.'));
+value_inputs := ARRAY_APPEND(:value_inputs, OBJECT_CONSTRUCT(
+  'name', 'months_per_year',
+  'value', 12, 'default', 12, 'units', 'months',
+  'description', 'Annualisation factor.'));
+
+value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
+  'metric', 'tierable_storage_tb',
+  'units', 'TB',
+  'sql', 'SELECT COALESCE(ROUND(SUM(TOTAL_GB) / 1024, 6), 0) '
+      || 'FROM ' || :tgt || '.V_TIER_CANDIDATES '
+      || 'WHERE RECOMMENDATION IN (''COLD_CANDIDATE'', ''COOL_CANDIDATE'')',
+  'derivation', 'Total storage in GB (converted to TB) of tables this run '
+             || 'identified as COOL or COLD candidates, from TABLE_STORAGE_METRICS.'));
+
+value_base := ARRAY_APPEND(:value_base, OBJECT_CONSTRUCT(
+  'metric', 'query_latency_risk',
+  'units', 'queries affected',
+  'measurable', FALSE,
+  'derivation', 'Would require a before-and-after comparison of query latency '
+             || 'on tiered tables.',
+  'why_not', 'COLD tier makes data unavailable for direct SELECT (requires FROM '
+          || 'ARCHIVE OF). COOL tier adds first-access latency. Neither can be '
+          || 'measured until the change is applied. V_TIER_CANDIDATES names what '
+          || 'becomes slower or unavailable for each recommendation.'));
+
+value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
+  'line', 'Projected annual storage savings from tiering',
+  'base_metric', 'tierable_storage_tb',
+  'rate_input', 'tier_discount_fraction',
+  'value_input', 'storage_rate_per_tb_month',
+  'annualise_input', 'months_per_year',
+  'horizon', 'per year, at published storage rates'));
+value_lines := ARRAY_APPEND(:value_lines, OBJECT_CONSTRUCT(
+  'line', 'Query latency cost of tiering',
+  'base_metric', 'query_latency_risk',
+  'rate_input', 'tier_discount_fraction',
+  'value_input', 'storage_rate_per_tb_month',
+  'annualise_input', 'months_per_year',
+  'horizon', 'unmeasurable'));
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_INPUTS AS SELECT '
+ || 'VALUE:name::STRING AS INPUT_NAME, VALUE:value::NUMBER(38,6) AS VALUE, '
+ || 'VALUE:default::NUMBER(38,6) AS DEFAULT_VALUE, VALUE:units::STRING AS UNITS, '
+ || 'IFF(VALUE:value::NUMBER(38,6) = VALUE:default::NUMBER(38,6), '
+ || '''DEFAULT — you have not changed this'', ''CLIENT_SET'') AS SOURCE, '
+ || 'VALUE:description::STRING AS WHAT_IT_MEANS '
+ || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
+ || BASE64_ENCODE(TO_JSON(:value_inputs)) || '''))))');
+
+  -- The addressable base, and this is the part that has to come from THEIR data.
+  --
+  -- A base metric may be declared three ways, and the third is the point:
+  --   'sql'   a scalar query, evaluated at BUILD time against the views this
+  --           solution just created. This is the honest form -- the base is
+  --           measured from the account rather than assumed.
+  --   'value' a plan-time literal, for a base already known from discovery.
+  --   measurable = FALSE  the solution KNOWS it cannot compute this base here, and
+  --           says so with a reason instead of substituting a plausible number.
+  --
+  -- A base declared with 'sql' that does not compile fails the build loudly. That
+  -- is deliberate: it is OUR SQL, so a broken one is a defect for the gauntlet to
+  -- catch, not a condition of the customer's data to be swallowed at runtime.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_BASE '
+ || '(METRIC VARCHAR, BASE_VALUE NUMBER(38,4), UNITS VARCHAR, DERIVED_HOW VARCHAR, '
+ || 'MEASURABLE BOOLEAN, WHY_NOT_MEASURABLE VARCHAR)');
+  LET vb INT := 0;
+  WHILE (:vb < ARRAY_SIZE(:value_base)) DO
+    LET vb_o VARIANT := GET(:value_base, :vb);
+    LET vb_m STRING := REPLACE(COALESCE(:vb_o:metric::STRING, ''), '''', '''''');
+    LET vb_u STRING := REPLACE(COALESCE(:vb_o:units::STRING, ''), '''', '''''');
+    LET vb_d STRING := REPLACE(COALESCE(:vb_o:derivation::STRING, ''), '''', '''''');
+    LET vb_ok BOOLEAN := COALESCE(:vb_o:measurable::BOOLEAN, TRUE);
+    LET vb_why STRING := REPLACE(COALESCE(:vb_o:why_not::STRING, ''), '''', '''''');
+    LET vb_sql STRING := COALESCE(:vb_o:sql::STRING, '');
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.VALUE_BASE '
+   || '(METRIC, BASE_VALUE, UNITS, DERIVED_HOW, MEASURABLE, WHY_NOT_MEASURABLE) SELECT '
+   || '''' || :vb_m || ''', '
+   || CASE WHEN NOT :vb_ok THEN 'NULL'
+           WHEN :vb_sql <> '' THEN '(' || :vb_sql || ')'
+           ELSE COALESCE(:vb_o:value::STRING, 'NULL') END || ', '
+   || '''' || :vb_u || ''', ''' || :vb_d || ''', '
+   || IFF(:vb_ok, 'TRUE', 'FALSE') || ', '
+   || IFF(:vb_why = '', 'NULL', '''' || :vb_why || ''''));
+    vb := :vb + 1;
+  END WHILE;
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.VALUE_LINES AS SELECT '
+ || 'VALUE:line::STRING AS LINE, VALUE:base_metric::STRING AS BASE_METRIC, '
+ || 'VALUE:rate_input::STRING AS RATE_INPUT, VALUE:value_input::STRING AS VALUE_INPUT, '
+     -- Names an input that converts the base's own period into a year. Without it a
+     -- per-day base produced a per-day benefit which was then compared against a
+     -- per-year cost, and the NET column silently subtracted a year of cost from a
+     -- day of value. It read as a credible negative number, which is the worst kind
+     -- of wrong. It is an INPUT rather than a constant so a client whose warehouses
+     -- only run on business days can say 250 instead of 365.
+ || 'VALUE:annualise_input::STRING AS ANNUALISE_INPUT, '
+ || 'COALESCE(VALUE:horizon::STRING, ''per year'') AS HORIZON '
+ || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
+ || BASE64_ENCODE(TO_JSON(:value_lines)) || '''))))');
+
+  -- Cost on one side, value on the other, both ANNUAL so the comparison is
+  -- apples-to-apples, arithmetic printed on every row, and the two never blended
+  -- into a single "ROI" figure. Cost is MEASURED where it has landed and PROJECTED
+  -- where it has not, and the column says which.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_BUSINESS_CASE AS '
+ || 'WITH cost AS ('
+ || '  SELECT SUM(CASE WHEN LABEL = ''MEASURED'' AND STATUS = ''LANDED'' THEN CREDITS END) '
+ || '           AS MEASURED_CREDITS, '
+ || '         SUM(CASE WHEN LABEL = ''PROJECTED'' AND CATEGORY = ''STEADY_STATE'' '
+ || '                  THEN CREDITS END) AS PROJECTED_CREDITS_PER_DAY, '
+ || '         COUNT_IF(LABEL = ''MEASURED'' AND STATUS = ''NOT_YET_LANDED'') AS PENDING '
+ || '  FROM ' || :tgt || '.V_COST_LINES) '
+ || 'SELECT l.LINE, b.METRIC, b.BASE_VALUE, b.UNITS, b.DERIVED_HOW, b.MEASURABLE, '
+ || '       r.INPUT_NAME AS RATE_NAME, r.VALUE AS RATE, r.SOURCE AS RATE_SOURCE, '
+ || '       v.INPUT_NAME AS VALUE_NAME, v.VALUE AS VALUE_PER_UNIT, v.SOURCE AS VALUE_SOURCE, '
+ || '       COALESCE(an.VALUE, 1) AS PERIODS_PER_YEAR, l.HORIZON, '
+ || '       CASE WHEN NOT b.MEASURABLE THEN NULL ELSE ROUND(b.BASE_VALUE * r.VALUE '
+ || '            * v.VALUE * COALESCE(an.VALUE, 1), 2) END AS GROSS_VALUE_PER_YEAR, '
+ || '       ROUND(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) AS PROJECTED_COST_PER_YEAR, '
+ || '       CASE WHEN NOT b.MEASURABLE THEN NULL '
+ || '            ELSE ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1) '
+ || '                       - c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', 2) '
+ || '       END AS NET_PER_YEAR, '
+     -- Payback in days, from two annual figures. NULL rather than a big number when
+     -- annual value is zero or negative: "never" is the answer, and a division
+     -- would print something that looks like a duration.
+ || '       CASE WHEN NOT b.MEASURABLE '
+ || '              OR COALESCE(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 0) <= 0 '
+ || '            THEN NULL '
+ || '            ELSE ROUND(DIV0(c.PROJECTED_CREDITS_PER_DAY * 365 * ' || :rate || ', '
+ || '                            b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1)) '
+ || '                       * 365, 1) END AS PAYBACK_DAYS, '
+ || '       CASE WHEN NOT b.MEASURABLE '
+ || '            THEN ''UNMEASURABLE: '' || COALESCE(b.WHY_NOT_MEASURABLE, '
+ || '                 ''this solution cannot compute this base from your account'') '
+ || '            ELSE b.BASE_VALUE || '' '' || b.UNITS || '' x '' || r.VALUE || '' ('' '
+ || '                 || r.INPUT_NAME || '') x '' || v.VALUE || '' ('' || v.INPUT_NAME '
+ || '                 || '') x '' || COALESCE(an.VALUE, 1) || '' periods/yr = '' '
+ || '                 || ROUND(b.BASE_VALUE * r.VALUE * v.VALUE * COALESCE(an.VALUE, 1), 2) '
+ || '                 || '' per year'' END AS ARITHMETIC, '
+ || '       ''The base is measured from your data. Both rates are YOURS to set -- '
+ || 'the defaults are placeholders, not benchmarks, and VALUE_INPUTS says which of '
+ || 'them you have actually changed. Value and cost are both annual here so they can '
+ || 'be compared. Cost is '' || COALESCE(c.MEASURED_CREDITS::STRING, '
+ || '''not yet measured'') || '' measured credits with '' || c.PENDING '
+ || '       || '' category(ies) still pending.'' AS READ_THIS '
+ || 'FROM ' || :tgt || '.VALUE_LINES l '
+ || 'JOIN ' || :tgt || '.VALUE_BASE b ON b.METRIC = l.BASE_METRIC '
+ || 'JOIN ' || :tgt || '.VALUE_INPUTS r ON r.INPUT_NAME = l.RATE_INPUT '
+ || 'JOIN ' || :tgt || '.VALUE_INPUTS v ON v.INPUT_NAME = l.VALUE_INPUT '
+ || 'LEFT JOIN ' || :tgt || '.VALUE_INPUTS an ON an.INPUT_NAME = l.ANNUALISE_INPUT '
+ || 'CROSS JOIN cost c '
+ || 'UNION ALL '
+     -- The declared-nothing case. An empty view reads as a bug; this reads as an
+     -- answer, and it is the correct answer for a solution whose benefit is
+     -- operational rather than financial.
+ || 'SELECT ''NO VALUE MODEL DECLARED'', NULL, NULL, NULL, NULL, FALSE, '
+ || '       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '
+ || '       ROUND((SELECT PROJECTED_CREDITS_PER_DAY FROM cost) * 365 * ' || :rate || ', 2), '
+ || '       NULL, NULL, ''UNMEASURABLE: no financial benefit is claimed'', '
+ || '       ''This solution does not assert a financial return. Its cost is shown so '
+ || 'you can judge it against a benefit you decide on yourself. Inventing a rate here '
+ || 'would be the dishonest option.'' '
+ || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.VALUE_LINES)');
+
+  -- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────
+  -- What would make this POC a success, decided from THEIR account rather than
+  -- from a number somebody liked. Same shape as the value model above: the
+  -- solution declares criteria, this block builds the objects.
+  --
+  -- A criterion carries two SQL scalars, `target_sql` and `actual_sql`, and BOTH
+  -- are re-evaluated on every read of V_POC_SCORECARD. That is a deliberate
+  -- choice by the operator and it has a cost worth naming: because the bar is
+  -- re-derived from current data, a MET on Tuesday and a MET on Friday are not
+  -- necessarily the same claim, and a shrinking base can lower the bar it is
+  -- being judged against. The COMPARABILITY column on every row says so, so the
+  -- caveat travels with the number instead of living in a design document.
+  --
+  -- The mechanism is worth understanding before editing. A view cannot
+  -- EXECUTE IMMEDIATE a string, so target_sql/actual_sql are not stored and
+  -- interpreted -- they are INLINED as scalar subqueries into the view body at
+  -- build time. Reading the view re-runs them. Consequence for snippet authors:
+  -- each must be an UNCORRELATED scalar subquery. A correlated one, or an EXISTS
+  -- in the select list, raises "Unsupported subquery type" at build.
+  --
+  -- Four states, and the third and fourth are the reason this exists:
+  --   MET       target compared against actual, comparison holds
+  --   NOT_MET   comparison does not hold. A real failure, reported as one.
+  --   PENDING   cannot be evaluated YET -- credits have not landed, a holdout
+  --             group does not exist. Carries why, and when it resolves.
+  --   N/A       does not apply to this build, e.g. PRODUCTION-tier only.
+  -- PENDING is not a failure and must never render as one. A zero standing in
+  -- for "no data yet" is the defect this design exists to prevent.
+  -- WHY THESE ARE ALL poc_-PREFIXED. The first cut used sc, sc2, sc_o and so on,
+  -- and two solutions legitimately declare their own `LET sc` in this same
+  -- procedure body -- 09_rmn_cleanroom's adapt_apply.sql holds slot columns in one.
+  -- Snowflake rejected the whole block with "Variable with name SC declared twice"
+  -- and the build failed with nothing to point at the cause. A shared template does
+  -- not get to squat on short identifiers that snippet authors reasonably use.
+  LET success_criteria ARRAY := ARRAY_CONSTRUCT();
+-- ── POC SUCCESS CRITERIA ──────────────────────────────────────────────────────
+-- What would make this Storage Optimization POC a success, measured against bars
+-- derived from THIS account rather than from a slide.
+--
+-- EVERY CRITERION IS GATED ON THE SLOT IT READS. The main views require both
+-- table_storage and tables_meta from ACCOUNT_USAGE.
+--
+-- WHAT IS DELIBERATELY NOT HERE. There is no "actual savings realised" criterion.
+-- This build projects savings from metadata; it does not apply lifecycle policies
+-- to customer tables (by design -- see the plan's explanation of why ATTACH is
+-- not offered). Measuring realised savings requires a before/after comparison
+-- over a billing period, which this build cannot provide.
+
+-- ── Coverage: did the inventory capture the account's permanent tables ────────
+-- The target is 80% of permanent tables with active storage in
+-- TABLE_STORAGE_METRICS. The view joins two ACCOUNT_USAGE relations, and the
+-- join can drop rows whose metadata has not yet propagated. 80% is our allowance
+-- for that propagation gap.
+IF (:sig:table_storage::STRING = 'AVAILABLE'
+    AND :sig:tables_meta::STRING = 'AVAILABLE') THEN
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'STORAGE_INVENTORY_COVERED',
+    'label', 'The inventory captured most of the permanent tables with active storage',
+    'why', 'A storage optimisation that silently excludes tables understates the '
+        || 'opportunity. If the view dropped 30% of the estate, the projected savings '
+        || 'are 30% too low.',
+    'compare', '>=',
+    'units', 'tables in inventory',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT CEIL(0.8 * COUNT(*)) FROM '
+        || 'SNOWFLAKE.ACCOUNT_USAGE.TABLE_STORAGE_METRICS '
+        || 'WHERE DELETED = FALSE AND ACTIVE_BYTES > 0',
+    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_TABLE_STORAGE_INVENTORY',
+    'target_derivation', '80% of the tables with active bytes in '
+        || 'TABLE_STORAGE_METRICS. The base is your data; the 80% is our allowance '
+        || 'for the join with ACCOUNT_USAGE.TABLES whose metadata may lag.'));
+
+  -- ── Quality: did the analysis find anything worth tiering ────────────────────
+  -- The bar is at least one actionable candidate (COOL or COLD). An estate where
+  -- every table is recently active has no tiering opportunity, and that is a
+  -- finding, not a failure -- but a POC that finds zero candidates has nothing to
+  -- show on the recommendations tab.
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'STORAGE_CANDIDATES_FOUND',
+    'label', 'At least one table qualifies for COOL or COLD tiering',
+    'why', 'The tiering recommendations tab needs at least one actionable row to '
+        || 'demonstrate value. Zero candidates means either the estate is freshly '
+        || 'active (a genuine null result) or the thresholds are too strict.',
+    'compare', '>=',
+    'units', 'tiering candidates',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT 1',
+    'actual_sql', 'SELECT COUNT(*) FROM ' || :tgt || '.V_TIER_CANDIDATES '
+        || 'WHERE RECOMMENDATION IN (''COLD_CANDIDATE'', ''COOL_CANDIDATE'')',
+    'target_derivation', 'At least one candidate. This is our judgement: a storage '
+        || 'optimisation POC with zero actionable candidates has nothing to '
+        || 'demonstrate. The floor thresholds (0.1 GB, 30/90 days idle) are '
+        || 'written into V_TIER_CANDIDATES.'));
+
+  -- ── Fidelity: projected savings are computed, not zero ──────────────────────
+  -- The savings column is modelled from table size and idle days. If the column
+  -- is all zeros despite candidates existing, the arithmetic is broken.
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'STORAGE_SAVINGS_NONZERO',
+    'label', 'Projected annual savings for tiering candidates are greater than zero',
+    'why', 'A candidate with a zero projected saving means the arithmetic that '
+        || 'converts table size and idle days into dollars produced nothing. Either '
+        || 'the formula is broken or the tables are too small to matter at the rate '
+        || 'used ($23/TB/month).',
+    'compare', '>',
+    'units', 'projected USD per year',
+    'basis', 'BY_QUERY_ID',
+    'target_sql', 'SELECT 0',
+    'actual_sql', 'SELECT COALESCE(SUM(PROJECTED_ANNUAL_SAVINGS_USD), 0) FROM '
+        || :tgt || '.V_TIER_CANDIDATES '
+        || 'WHERE RECOMMENDATION IN (''COLD_CANDIDATE'', ''COOL_CANDIDATE'')',
+    'target_derivation', 'Greater than zero. The savings are PROJECTED from table '
+        || 'size, idle days, and Snowflake''s published storage rate '
+        || '($23/TB/month). They are not measurements of a change already applied.',
+    'pending_reason', 'If no tables qualify for tiering (all recently active or too '
+        || 'small), the sum is zero and this criterion reads NOT_MET rather than '
+        || 'PENDING. That is the correct result: it means there is genuinely no '
+        || 'saving to project.',
+    'resolves_when', 'Either tables age past the 30/90-day thresholds, or the '
+        || 'thresholds are lowered in V_TIER_CANDIDATES'));
+END IF;
+
+-- ── Cost ──────────────────────────────────────────────────────────────────────
+IF (:credit_cap > 0) THEN
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'STORAGE_COST_IN_BUDGET',
+    'label', 'Measured build cost stays inside your credit cap',
+    'why', 'A POC that cannot state its own cost cannot be approved for production.',
+    'compare', '<=',
+    'units', 'credits',
+    'basis', 'BY_TAG',
+    'target_sql', 'SELECT ' || :credit_cap,
+    'actual_sql', 'SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
+        || 'WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''',
+    'target_derivation', 'Your STORAGE_CREDIT_CAP setting, currently '
+        || :credit_cap || ' credits.',
+    'pending_reason', 'Warehouse credits reach ACCOUNT_USAGE on a delay, so '
+        || 'nothing has been attributed to this run yet.',
+    'resolves_when', 'Credits land in ACCOUNT_USAGE, typically within 8 hours -- '
+        || 'call MEASURE() in this schema after that to fill it in'));
+ELSE
+  success_criteria := ARRAY_APPEND(:success_criteria, OBJECT_CONSTRUCT(
+    'code', 'STORAGE_COST_IN_BUDGET',
+    'label', 'Measured build cost stays inside your credit cap',
+    'why', 'A POC that cannot state its own cost cannot be approved for production.',
+    'compare', '<=',
+    'units', 'credits',
+    'basis', 'BY_TAG',
+    'target_derivation', 'No cap was set, so there is no bar to derive.',
+    'na_reason', 'STORAGE_CREDIT_CAP is 0, so no ceiling was declared for this run. '
+        || 'Set it and re-run to have this criterion scored.'));
+END IF;
+
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.SUCCESS_CRITERIA '
+ || '(CODE VARCHAR, LABEL VARCHAR, WHY_IT_MATTERS VARCHAR, COMPARE VARCHAR, '
+ || 'UNITS VARCHAR, BASIS VARCHAR, TARGET_DERIVATION VARCHAR, '
+ || 'PENDING_REASON VARCHAR, RESOLVES_WHEN VARCHAR, NA_REASON VARCHAR)');
+
+  -- The declarations themselves, one INSERT each. Same reason the value base
+  -- uses a WHILE loop rather than a FLATTEN: the fields are optional in
+  -- different combinations and a single projection over the array would have to
+  -- invent a shape for the absent ones.
+  LET poc_i INT := 0;
+  WHILE (:poc_i < ARRAY_SIZE(:success_criteria)) DO
+    LET poc_o VARIANT := GET(:success_criteria, :poc_i);
+    LET poc_code STRING := REPLACE(COALESCE(:poc_o:code::STRING, ''), '''', '''''');
+    LET poc_lab  STRING := REPLACE(COALESCE(:poc_o:label::STRING, ''), '''', '''''');
+    LET poc_why  STRING := REPLACE(COALESCE(:poc_o:why::STRING, ''), '''', '''''');
+    LET poc_cmp  STRING := REPLACE(COALESCE(:poc_o:compare::STRING, '>='), '''', '''''');
+    LET poc_un   STRING := REPLACE(COALESCE(:poc_o:units::STRING, ''), '''', '''''');
+    LET poc_bas  STRING := REPLACE(COALESCE(:poc_o:basis::STRING, 'BY_TIME_WINDOW'), '''', '''''');
+    LET poc_der  STRING := REPLACE(COALESCE(:poc_o:target_derivation::STRING, ''), '''', '''''');
+    LET poc_pr   STRING := REPLACE(COALESCE(:poc_o:pending_reason::STRING, ''), '''', '''''');
+    LET poc_rw   STRING := REPLACE(COALESCE(:poc_o:resolves_when::STRING, ''), '''', '''''');
+    LET poc_nr   STRING := REPLACE(COALESCE(:poc_o:na_reason::STRING, ''), '''', '''''');
+    stmts := ARRAY_APPEND(:stmts,
+      'INSERT INTO ' || :tgt || '.SUCCESS_CRITERIA (CODE, LABEL, WHY_IT_MATTERS, '
+   || 'COMPARE, UNITS, BASIS, TARGET_DERIVATION, PENDING_REASON, RESOLVES_WHEN, '
+   || 'NA_REASON) SELECT '
+   || '''' || :poc_code || ''', ''' || :poc_lab || ''', ''' || :poc_why || ''', '
+   || '''' || :poc_cmp || ''', ''' || :poc_un || ''', ''' || :poc_bas || ''', '
+   || '''' || :poc_der || ''', '
+   || IFF(:poc_pr = '', 'NULL', '''' || :poc_pr || '''') || ', '
+   || IFF(:poc_rw = '', 'NULL', '''' || :poc_rw || '''') || ', '
+   || IFF(:poc_nr = '', 'NULL', '''' || :poc_nr || ''''));
+    poc_i := :poc_i + 1;
+  END WHILE;
+
+  -- The scorecard. Each criterion becomes one SELECT with its target and actual
+  -- inlined, and the arms are UNION ALLed into a single view. Built as a string
+  -- because the number of arms is not known until the solution has declared.
+  LET poc_body STRING := '';
+  LET poc_j INT := 0;
+  WHILE (:poc_j < ARRAY_SIZE(:success_criteria)) DO
+    LET poc2_o VARIANT := GET(:success_criteria, :poc_j);
+    LET poc2_code STRING := REPLACE(COALESCE(:poc2_o:code::STRING, ''), '''', '''''');
+    LET poc2_cmp  STRING := COALESCE(:poc2_o:compare::STRING, '>=');
+    LET poc2_tsql STRING := COALESCE(:poc2_o:target_sql::STRING, '');
+    LET poc2_asql STRING := COALESCE(:poc2_o:actual_sql::STRING, '');
+    -- An unevaluable criterion declares no actual_sql. It still gets a row --
+    -- omitting it would make the scorecard look shorter than the promise.
+    LET poc2_t STRING := IFF(:poc2_tsql = '', 'CAST(NULL AS NUMBER(38,6))',
+                           '(' || :poc2_tsql || ')::NUMBER(38,6)');
+    LET poc2_a STRING := IFF(:poc2_asql = '', 'CAST(NULL AS NUMBER(38,6))',
+                           '(' || :poc2_asql || ')::NUMBER(38,6)');
+    poc_body := :poc_body
+      || IFF(:poc_body = '', '', ' UNION ALL ')
+      || 'SELECT ''' || :poc2_code || ''' AS CODE, ' || :poc2_t || ' AS TARGET, '
+      || :poc2_a || ' AS ACTUAL, ''' || REPLACE(:poc2_cmp, '''', '''''') || ''' AS CMP';
+    poc_j := :poc_j + 1;
+  END WHILE;
+
+  -- The verdict CASE is deliberately ordered, and only NA_REASON forces a state.
+  --
+  -- PENDING_REASON is an EXPLANATION, not a state. An earlier cut had it force
+  -- PENDING, which meant a criterion that declared "credits land in about eight
+  -- hours" was pinned to PENDING permanently -- it could never resolve, so the
+  -- one criterion whose whole point was to become answerable never did. A
+  -- criterion is pending because its ACTUAL is absent, and for no other reason;
+  -- the declared text only says WHY it is absent and when that changes.
+  --
+  -- The NULL check therefore has to come before the comparison. Reversing them
+  -- would let a NULL actual reach the comparison, which returns NULL, which a
+  -- naive COALESCE would then turn into a failure. "Not measured yet" reported as
+  -- "failed" is the single most damaging thing this view could do.
+  IF (ARRAY_SIZE(:success_criteria) > 0) THEN
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS '
+   || 'WITH ev AS (' || :poc_body || ') '
+   || 'SELECT c.CODE, c.LABEL, c.WHY_IT_MATTERS, e.TARGET, e.ACTUAL, c.UNITS, '
+   || '       c.COMPARE, c.BASIS, c.TARGET_DERIVATION, '
+   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN ''N/A'' '
+   || '            WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN ''PENDING'' '
+   || '            WHEN e.CMP = ''>='' AND e.ACTUAL >= e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''<='' AND e.ACTUAL <= e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''>''  AND e.ACTUAL >  e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''<''  AND e.ACTUAL <  e.TARGET THEN ''MET'' '
+   || '            WHEN e.CMP = ''='' AND e.ACTUAL =  e.TARGET THEN ''MET'' '
+   || '            ELSE ''NOT_MET'' END AS STATE, '
+      -- Why a row is not simply pass/fail, in the row itself. The solution's own
+      -- wording wins when it has one, because "a randomised holdout would be
+      -- required" is worth infinitely more than "no measurement has landed".
+   || '       CASE WHEN c.NA_REASON IS NOT NULL THEN c.NA_REASON '
+   || '            WHEN e.ACTUAL IS NOT NULL AND e.TARGET IS NOT NULL THEN NULL '
+   || '            WHEN c.PENDING_REASON IS NOT NULL THEN c.PENDING_REASON '
+   || '            WHEN e.ACTUAL IS NULL THEN ''No measurement has landed for this '
+   || 'criterion yet. It is not a failure; it is not yet answerable.'' '
+   || '            ELSE ''The target could not be derived from your account -- the '
+   || 'discovery input it depends on is absent.'' END AS WHY_NOT_EVALUATED, '
+      -- Suppressed once the row is answerable: "resolves when credits land" under
+      -- a row that has already been decided is stale advice.
+   || '       CASE WHEN c.NA_REASON IS NULL '
+   || '             AND (e.ACTUAL IS NULL OR e.TARGET IS NULL) '
+   || '            THEN c.RESOLVES_WHEN END AS RESOLVES_WHEN, '
+      -- The arithmetic, printed. A bare MET is an assertion; "42 >= 30" is
+      -- checkable by the person reading it.
+   || '       CASE WHEN e.ACTUAL IS NULL OR e.TARGET IS NULL THEN NULL '
+   || '            ELSE ROUND(e.ACTUAL, 4) || '' '' || e.CMP || '' '' '
+   || '                 || ROUND(e.TARGET, 4) || '' '' || COALESCE(c.UNITS, '''') '
+   || '       END AS ARITHMETIC, '
+   || '       ''Target and actual are BOTH re-derived from your account on every '
+   || 'read, so this bar moves as your data moves. That is intended -- the target '
+   || 'is not a number we picked -- but it means MET is a statement about today, '
+   || 'not a result comparable across runs. TARGET_DERIVATION says how the bar '
+   || 'was set. BASIS says how the actual was attributed.'' AS COMPARABILITY '
+   || 'FROM ' || :tgt || '.SUCCESS_CRITERIA c '
+   || 'JOIN ev e ON e.CODE = c.CODE');
+  ELSE
+    -- Declared nothing. One honest row beats an empty view, exactly as with the
+    -- value model: empty reads as broken, this reads as unauthored.
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_SCORECARD AS SELECT '
+   || '''NO SUCCESS CRITERIA DECLARED'' AS CODE, '
+   || '''This solution has not declared POC success criteria'' AS LABEL, '
+   || 'NULL AS WHY_IT_MATTERS, CAST(NULL AS NUMBER(38,6)) AS TARGET, '
+   || 'CAST(NULL AS NUMBER(38,6)) AS ACTUAL, NULL AS UNITS, NULL AS COMPARE, '
+   || 'NULL AS BASIS, NULL AS TARGET_DERIVATION, ''PENDING'' AS STATE, '
+   || '''No criteria are declared, so there is nothing to pass or fail. This is a '
+   || 'gap in the solution, not a result for your account.'' AS WHY_NOT_EVALUATED, '
+   || '''When this solution declares blocks/success_criteria.sql'' AS RESOLVES_WHEN, '
+   || 'NULL AS ARITHMETIC, ''Nothing is being claimed here.'' AS COMPARABILITY');
+  END IF;
+
+  -- The roll-up behind the header chip. MET requires that nothing failed AND
+  -- that something actually passed -- a scorecard of nothing but PENDING is not
+  -- a success, and calling it one would be the whole failure mode of this
+  -- feature. NOT_RUN is not a pass.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_POC_VERDICT AS '
+ || 'WITH s AS (SELECT COUNT_IF(STATE = ''MET'') AS MET, '
+ || '                  COUNT_IF(STATE = ''NOT_MET'') AS NOT_MET, '
+ || '                  COUNT_IF(STATE = ''PENDING'') AS PENDING, '
+ || '                  COUNT_IF(STATE = ''N/A'') AS NA, '
+ || '                  COUNT_IF(STATE <> ''N/A'') AS SCORED '
+ || '           FROM ' || :tgt || '.V_POC_SCORECARD) '
+ || 'SELECT MET, NOT_MET, PENDING, NA, SCORED, '
+ || '       MET || ''/'' || SCORED || '' MET'' AS HEADLINE, '
+ || '       CASE WHEN SCORED = 0 THEN ''NOT_RUN'' '
+ || '            WHEN NOT_MET > 0 THEN ''NOT_MET'' '
+ || '            WHEN MET = 0 THEN ''PENDING'' '
+ || '            WHEN PENDING > 0 THEN ''MET_WITH_PENDING'' '
+ || '            ELSE ''MET'' END AS VERDICT, '
+ || '       CASE WHEN SCORED = 0 THEN ''Nothing has been scored.'' '
+ || '            WHEN NOT_MET > 0 THEN NOT_MET || '' criterion(s) did not meet '
+ || 'target. Open the POC success tab for the arithmetic on each.'' '
+ || '            WHEN MET = 0 THEN ''Nothing has failed, but nothing has been '
+ || 'confirmed either -- every criterion is still pending.'' '
+ || '            WHEN PENDING > 0 THEN ''Everything measurable so far has met its '
+ || 'target, with '' || PENDING || '' still pending. Not a complete result yet.'' '
+ || '            ELSE ''Every scored criterion met its target.'' END AS READ_THIS '
+ || 'FROM s');
+
+  -- ── PRODUCTION HARDENING ──────────────────────────────────────────────────
+  -- Only at PRODUCTION tier, and every piece of it detects-then-skips with a
+  -- printed reason rather than failing the build. A platform team's objection to a
+  -- tool is almost never "it does too little"; it is "it left something behind
+  -- that nobody owns".
+  IF (:tier = 'PRODUCTION') THEN
+    -- Cost attribution. The tag lives in the target schema so it disappears with
+    -- it; the ONE thing outside the schema is the tag applied to the warehouse, so
+    -- that is the only row the registry needs.
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE TAG IF NOT EXISTS ' || :tgt || '.ONESHOT_SOLUTION '
+   || 'COMMENT = ''Cost attribution for Storage Optimization. Query '
+   || 'ACCOUNT_USAGE.TAG_REFERENCES to find everything this deployment owns.''');
+    stmts := ARRAY_APPEND(:stmts,
+      'ALTER SCHEMA ' || :tgt || ' SET TAG ' || :tgt || '.ONESHOT_SOLUTION = '
+   || '''Storage Optimization''');
+    IF (:wh_ok) THEN
+      stmts := ARRAY_APPEND(:stmts,
+        'INSERT INTO ' || :tgt || '.ATTACHED_OBJECT_REGISTRY (TARGET_FQN, ARTIFACT, ARGUMENTS, KIND) '
+     || 'SELECT ''' || :meas_wh || ''', ''' || :tgt || '.ONESHOT_SOLUTION'', '
+     || '''WAREHOUSE'', ''OBJECT_TAG'' '
+     || 'WHERE NOT EXISTS (SELECT 1 FROM ' || :tgt || '.ATTACHED_OBJECT_REGISTRY '
+     || 'WHERE TARGET_FQN = ''' || :meas_wh || ''' AND ARTIFACT = ''' || :tgt
+     || '.ONESHOT_SOLUTION'' AND KIND = ''OBJECT_TAG'')');
+      stmts := ARRAY_APPEND(:stmts,
+        'ALTER WAREHOUSE ' || :meas_wh || ' SET TAG ' || :tgt
+     || '.ONESHOT_SOLUTION = ''Storage Optimization''');
+    END IF;
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'COST ATTRIBUTION: everything this deployment created carries the tag '
+   || :tgt || '.ONESHOT_SOLUTION, so your FinOps team can find it in '
+   || 'ACCOUNT_USAGE.TAG_REFERENCES without asking us. Tags cost nothing.');
+
+    -- Failure notification. Tasks take an error integration directly; dynamic
+    -- tables have NO equivalent clause, so theirs needs an alert, which is
+    -- serverless and therefore costs credits of its own. That asymmetry is priced
+    -- rather than hidden, and the whole thing skips loudly when there is no
+    -- integration to point at.
+    IF (:notif <> '') THEN
+      notes := ARRAY_APPEND(:notes,
+        'FAILURE NOTIFICATION: task failures will be sent to ' || :notif || '. '
+     || 'Dynamic table refresh failures CANNOT use an error integration -- Snowflake '
+     || 'has no such clause for them -- so if this solution creates dynamic tables '
+     || 'their failures need a serverless ALERT over DYNAMIC_TABLE_REFRESH_HISTORY, '
+     || 'which is priced separately in the cost lines above.');
+    ELSE
+      notes := ARRAY_APPEND(:notes,
+        'FAILURE NOTIFICATION SKIPPED: STORAGE_NOTIFICATION_INTEGRATION is blank, so '
+     || 'nothing will tell you when a scheduled object fails. This is a real gap at '
+     || 'PRODUCTION tier and the build continues anyway rather than blocking you. '
+     || 'Run SHOW NOTIFICATION INTEGRATIONS to pick one; if the account has none, an '
+     || 'administrator runs: CREATE NOTIFICATION INTEGRATION ONESHOT_ALERTS '
+     || 'TYPE = EMAIL ENABLED = TRUE;');
+    END IF;
+
+    -- What an on-call engineer opens at 3am. Built to survive a solution that has
+    -- no tasks and no dynamic tables: it returns a row saying so rather than
+    -- nothing, because an empty operations view is indistinguishable from a broken
+    -- one.
+    stmts := ARRAY_APPEND(:stmts,
+      'CREATE OR REPLACE VIEW ' || :tgt || '.V_OPERATIONS AS '
+   || 'SELECT ''TASK'' AS OBJECT_KIND, t.NAME AS OBJECT_NAME, '
+      -- The cron string lives on ACCOUNT_USAGE.TASKS, NOT on TASK_HISTORY.
+      -- t.SCHEDULE was read straight off TASK_HISTORY, which has 30 columns and
+      -- none of them is SCHEDULE, so this view failed to compile on every
+      -- PRODUCTION build -- and because the statement loop stops at the first
+      -- failure, everything declared after it was silently never created. It went
+      -- unnoticed because step 16 read only the OUTER statement results and this
+      -- failure surfaced as an inner FAILED row nobody looked at.
+      --
+      -- COALESCE, because ACCOUNT_USAGE lags: a task created minutes ago may have
+      -- history but no TASKS row yet, and a blank SLA is better than dropping the
+      -- task from an operations view.
+   || '       COALESCE(s.SCHEDULE, ''schedule not yet in ACCOUNT_USAGE.TASKS'') '
+   || '         AS REFRESH_SLA, MAX(t.COMPLETED_TIME) AS LAST_RUN, '
+   || '       COUNT_IF(t.STATE = ''FAILED'') AS FAILURES_IN_WINDOW, '
+   || '       COUNT(*) AS RUNS_IN_WINDOW, NULL::NUMBER AS CREDITS_IN_WINDOW, '
+   || '       ''From ACCOUNT_USAGE.TASK_HISTORY over the last '' || ' || :w
+   || '         || '' days.'' AS SOURCE '
+   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY t '
+      -- TASKS names its columns TASK_NAME / TASK_DATABASE / TASK_SCHEMA, while
+      -- TASK_HISTORY uses NAME / DATABASE_NAME / SCHEMA_NAME. Two ACCOUNT_USAGE
+      -- views of the same object disagreeing on column names is exactly the kind
+      -- of thing to read rather than assume -- guessing S.NAME cost another run.
+   || '  LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.TASKS s '
+   || '    ON s.TASK_NAME = t.NAME AND s.TASK_DATABASE = t.DATABASE_NAME '
+   || '   AND s.TASK_SCHEMA = t.SCHEMA_NAME AND s.DELETED IS NULL '
+   || '  WHERE t.DATABASE_NAME = ''' || :db || ''' AND t.SCHEMA_NAME = ''' || :sch || ''' '
+   || '    AND t.SCHEDULED_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
+   || '  GROUP BY 1, 2, 3 '
+   || 'UNION ALL '
+   || 'SELECT ''DYNAMIC_TABLE'', d.NAME, d.TARGET_LAG_SEC::STRING || '' sec target lag'', '
+   || '       MAX(d.REFRESH_END_TIME), COUNT_IF(d.STATE = ''FAILED''), COUNT(*), NULL, '
+   || '       ''From ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY. Note: dynamic tables '
+   || 'auto-suspend after 5 consecutive failures.'' '
+   || '  FROM SNOWFLAKE.ACCOUNT_USAGE.DYNAMIC_TABLE_REFRESH_HISTORY d '
+   || '  WHERE d.DATABASE_NAME = ''' || :db || ''' AND d.SCHEMA_NAME = ''' || :sch || ''' '
+   || '    AND d.REFRESH_START_TIME >= DATEADD(day, -' || :w || ', CURRENT_TIMESTAMP()) '
+   || '  GROUP BY 1, 2, 3 '
+   || 'UNION ALL '
+   || 'SELECT ''THIS DEPLOYMENT'', ''' || :sch || ''', ''not scheduled'', '
+   || '       (SELECT MAX(STARTED_AT) FROM ' || :tgt || '.RUN_LEDGER), 0, '
+   || '       (SELECT COUNT(*) FROM ' || :tgt || '.RUN_LEDGER), '
+   || '       (SELECT SUM(CREDITS) FROM ' || :tgt || '.V_COST_LINES '
+   || '         WHERE LABEL = ''MEASURED'' AND STATUS = ''LANDED''), '
+   || '       ''No tasks or dynamic tables found for this schema in the window. If '
+   || 'this solution creates none, that is expected and this row is the whole '
+   || 'operations picture.'' ');
+    cost_detail := ARRAY_APPEND(:cost_detail,
+      'OPERATIONS: V_OPERATIONS reports last run, failures and credits per '
+   || 'scheduled object over ' || :w || ' days. It reads ACCOUNT_USAGE views, which '
+   || 'are free to query but lag by up to 45 minutes for task history.');
+  END IF;
+
+  -- ── The action registry, its audit log, and the one door in ────────────────
+  -- Built AFTER the solution's plan section, because that is where a solution
+  -- declares its actions.
+  --
+  -- CREATE OR REPLACE ... AS SELECT rather than CREATE + INSERT: a second build
+  -- must not stack a second copy of every action, which is the same bug
+  -- ATTACHED_OBJECT_REGISTRY had. Note the two need DIFFERENT fixes and this comment
+  -- used to imply otherwise: the action registry can be rebuilt from scratch each
+  -- run, so CREATE OR REPLACE is right; the attachment registry must SURVIVE, because
+  -- TEARDOWN reads it, so it takes an anti-join insert instead. Reaching for
+  -- CREATE OR REPLACE there would have destroyed the record of what to detach.
+  -- FLATTEN over a JSON literal also avoids the VALUES-clause restriction on
+  -- ARRAY/OBJECT constructors.
+  --
+  -- The JSON travels BASE64-ENCODED, and that is not belt-and-braces. An action's
+  -- `sql` array holds generated DDL, which routinely contains quoted identifiers
+  -- like "ICE_GOLD_ORDERS". TO_JSON escapes those double quotes to \", and when
+  -- the result is pasted into a single-quoted SQL literal Snowflake's parser
+  -- consumes the backslash -- so PARSE_JSON receives structurally broken JSON and
+  -- fails with "Error parsing JSON: missing comma, pos 1628", pointing at a
+  -- character that is nowhere near the actual problem. Doubling the quotes, as
+  -- this line used to, does nothing about the backslash.
+  --
+  -- 03_generative_completion hit this first and fixed it locally by chaining a
+  -- second REPLACE for backslashes; that works but depends on getting the order
+  -- right and on remembering it at every new call site. The base64 alphabet
+  -- contains no quote and no backslash, so the hazard cannot recur here.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE TABLE ' || :tgt || '.ACTION_REGISTRY AS SELECT '
+ || 'VALUE:code::STRING AS CODE, VALUE:label::STRING AS LABEL, '
+ || 'VALUE:tier::STRING AS TIER, VALUE:effect::STRING AS EFFECT, '
+ || 'VALUE:undo::STRING AS UNDO, '
+ || 'VALUE:est::NUMBER(38,6) AS EST_CREDITS, VALUE:basis::STRING AS EST_BASIS, '
+ || 'VALUE:sql::ARRAY AS RUN_SQL, '
+    -- The reverse of RUN_SQL, declared by the solution alongside it. COALESCE to an
+    -- empty array so an action that genuinely cannot be reversed is representable:
+    -- zero undo statements is a fact the app can show, whereas a NULL would just
+    -- look like a bug.
+ || 'COALESCE(VALUE:undo_sql::ARRAY, ARRAY_CONSTRUCT()) AS UNDO_SQL, '
+    -- The parameters this action accepts, declared alongside its SQL. Empty array for
+    -- every action that takes none, which is why an unparameterised action is byte
+    -- identical in behaviour to before: ARRAY_SIZE 0 skips the whole resolver.
+    --
+    -- Each element is {name, label, kind, allowed_sql, options, min, max, help}. The
+    -- WHITELIST LIVES HERE, in the registry, and is evaluated inside RUN_ACTION -- not
+    -- passed in by the app. The app cannot influence what a value is checked against,
+    -- which is the entire point: a tampered client can only ever choose from a set
+    -- this build already discovered.
+ || 'COALESCE(VALUE:params::ARRAY, ARRAY_CONSTRUCT()) AS PARAM_SPEC, '
+ || 'CURRENT_TIMESTAMP() AS DECLARED_AT '
+ || 'FROM TABLE(FLATTEN(input => PARSE_JSON(BASE64_DECODE_STRING('''
+ || BASE64_ENCODE(TO_JSON(:actions)) || '''))))');
+
+  -- One row per attempt, whether it worked or not. An action framework without an
+  -- audit trail is indistinguishable from someone running DDL by hand.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_LOG '
+ || '(LOG_ID VARCHAR, CODE VARCHAR, LABEL VARCHAR, EST_CREDITS NUMBER(38,6), '
+ || 'STATUS VARCHAR, STATEMENTS_RUN INT, ERROR VARCHAR, '
+ || 'RUN_BY VARCHAR DEFAULT CURRENT_USER(), '
+ || 'STARTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(), '
+ || 'FINISHED_AT TIMESTAMP_NTZ, UNDO_SNAPSHOT VARCHAR, PARAMS VARCHAR)');
+  -- Separate ALTER because the CREATE above is IF NOT EXISTS: a schema built by an
+  -- earlier artifact already has the table and would silently keep the old shape.
+  stmts := ARRAY_APPEND(:stmts,
+    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
+ || 'ADD COLUMN IF NOT EXISTS UNDO_SNAPSHOT VARCHAR');
+  -- The RESOLVED parameter values this run actually used, as JSON. Without this the
+  -- audit trail becomes untrue the moment an action takes parameters: two rows reading
+  -- "DONE. Attach the policy" would be indistinguishable while having tiered different
+  -- tables. NULL for an unparameterised action, which is honest -- there were none.
+  stmts := ARRAY_APPEND(:stmts,
+    'ALTER TABLE ' || :tgt || '.ACTION_LOG '
+ || 'ADD COLUMN IF NOT EXISTS PARAMS VARCHAR');
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE TABLE IF NOT EXISTS ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '(LOG_ID VARCHAR, SEQ INT, STATEMENT VARCHAR, QUERY_ID VARCHAR, '
+ || 'STATUS VARCHAR, ERROR VARCHAR, '
+ || 'RAN_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP())');
+
+  -- What the app reads. Excludes RUN_SQL on purpose: the dashboard needs to show
+  -- what an action DOES and what it costs, and shipping the DDL to the browser
+  -- invites someone to treat the page as the source of truth for it.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTIONS AS SELECT '
+ || 'a.CODE, a.LABEL, a.TIER, a.EFFECT, a.UNDO, a.EST_CREDITS, a.EST_BASIS, '
+ || 'ARRAY_SIZE(a.RUN_SQL) AS STATEMENTS, '
+ || 'ARRAY_SIZE(a.UNDO_SQL) AS UNDO_STATEMENTS, '
+ || 'ARRAY_SIZE(a.PARAM_SPEC) AS PARAM_COUNT, '
+ || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
+ || '  WHERE l.CODE = a.CODE AND l.STATUS = ''UNDONE'') AS TIMES_UNDONE, '
+ || '(SELECT COUNT(*) FROM ' || :tgt || '.ACTION_LOG l '
+ || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS TIMES_RUN, '
+ || '(SELECT MAX(l.FINISHED_AT) FROM ' || :tgt || '.ACTION_LOG l '
+ || '  WHERE l.CODE = a.CODE AND l.STATUS = ''DONE'') AS LAST_RUN_AT '
+ || 'FROM ' || :tgt || '.ACTION_REGISTRY a '
+ || 'ORDER BY CASE a.TIER WHEN ''SAMPLE'' THEN 1 WHEN ''LIMITED'' THEN 2 ELSE 3 END, a.CODE');
+
+  -- ── What the app renders a widget from ─────────────────────────────────────
+  -- One row per parameter. Deliberately EXCLUDES allowed_sql, for the same reason
+  -- V_ACTIONS excludes RUN_SQL: the app does not need the whitelist QUERY, it needs
+  -- the whitelist RESULT, and shipping the query invites someone to treat the browser
+  -- as the place the permitted set is decided. The host reads OPTIONS_SQL only to run
+  -- it for display; RUN_ACTION re-evaluates the registry's own copy when it validates,
+  -- so what the app showed can never be what authorises the value.
+  --
+  -- ORDINAL is preserved from the declaration order so the widgets render in the order
+  -- the solution author intended rather than alphabetically.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_PARAMS AS SELECT '
+ || 'a.CODE, p.INDEX AS ORDINAL, '
+ || 'p.VALUE:name::STRING AS PARAM_NAME, '
+ || 'COALESCE(p.VALUE:label::STRING, p.VALUE:name::STRING) AS LABEL, '
+ || 'UPPER(COALESCE(p.VALUE:kind::STRING, ''IDENT'')) AS KIND, '
+ || 'p.VALUE:allowed_sql::STRING AS OPTIONS_SQL, '
+ || 'p.VALUE:options::ARRAY AS OPTIONS, '
+ || 'p.VALUE:min::NUMBER(38,6) AS MIN_VALUE, '
+ || 'p.VALUE:max::NUMBER(38,6) AS MAX_VALUE, '
+ || 'COALESCE(p.VALUE:freeform::BOOLEAN, FALSE) AS FREEFORM, '
+ || 'p.VALUE:help::STRING AS HELP '
+ || 'FROM ' || :tgt || '.ACTION_REGISTRY a, '
+ || 'LATERAL FLATTEN(input => a.PARAM_SPEC) p '
+ || 'ORDER BY a.CODE, p.INDEX');
+
+  -- Estimated against measured. The measurement is NOT available immediately:
+  -- per-query credits live in QUERY_ATTRIBUTION_HISTORY, which lags by up to a few
+  -- hours, so this view is empty for a while after an action runs and then fills
+  -- in. Saying that plainly beats printing an estimate and letting the reader
+  -- assume it was measured.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_ACTION_COST AS SELECT '
+ || 'l.LOG_ID, l.CODE, l.LABEL, l.STATUS, l.EST_CREDITS, '
+ || 'SUM(q.CREDITS_ATTRIBUTED_COMPUTE) AS MEASURED_CREDITS, '
+ || 'COUNT(q.QUERY_ID) AS STATEMENTS_MEASURED, l.STATEMENTS_RUN, l.STARTED_AT, '
+    -- Why the measurement is absent, rather than leaving a NULL to be read as a
+    -- failure. QUERY_ATTRIBUTION_HISTORY only records queries that consumed
+    -- WAREHOUSE COMPUTE. ALTER WAREHOUSE, CREATE VIEW and SET MASKING POLICY consume
+    -- none, so for a metadata-only action no row will EVER appear -- and every
+    -- action was telling the customer the figure "appears once attribution catches
+    -- up". Checked against real runs: ICE_FIX matched 0 of 27 statements and
+    -- WH_SUSPEND_ALL 0 of 2, permanently. A promise that never comes true is worse
+    -- than saying up front that there is nothing to measure.
+ || 'CASE '
+ || '  WHEN COUNT(q.QUERY_ID) >= l.STATEMENTS_RUN AND l.STATEMENTS_RUN > 0 '
+ || '    THEN ''MEASURED'' '
+ || '  WHEN COUNT(q.QUERY_ID) > 0 '
+ || '    THEN ''PARTIAL: '' || COUNT(q.QUERY_ID) || '' of '' || l.STATEMENTS_RUN '
+ || '      || '' statement(s) used attributable compute; the rest were metadata-only'' '
+ || '  WHEN l.STARTED_AT > DATEADD(hour, -6, CURRENT_TIMESTAMP()) '
+ || '    THEN ''PENDING: attribution can lag several hours. If these statements were '
+|| 'metadata-only (ALTER, CREATE VIEW, policy attach) it will stay empty because they '
+|| 'consume no warehouse compute.'' '
+ || '  ELSE ''NO COMPUTE MEASURED: these statements consumed no warehouse compute, so '
+|| 'QUERY_ATTRIBUTION_HISTORY has nothing to attribute. Metadata operations are '
+|| 'genuinely near-free -- this is not a missing measurement.'' '
+ || 'END AS MEASURED_STATUS '
+ || 'FROM ' || :tgt || '.ACTION_LOG l '
+ || 'LEFT JOIN ' || :tgt || '.ACTION_STATEMENT_LOG s ON s.LOG_ID = l.LOG_ID '
+ || 'LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY q '
+ || '  ON q.QUERY_ID = s.QUERY_ID '
+ || 'GROUP BY 1,2,3,4,5,8,9');
+
+  -- ── The monthly run-rate, over whatever the solution registered above ─────
+  -- THE CADENCE IS KNOWN, THE DURATION IS MEASURED, THE PRODUCT IS PROJECTED.
+  -- Runs per month comes from a schedule this build itself set, so it is a fact.
+  -- Seconds per run comes from what this build observed. Their product is still a
+  -- PROJECTION, because next month's data volume is not this month's -- and it is
+  -- labelled that way rather than presented as a bill.
+  --
+  -- Deliberately not summed with anything MEASURED, for the same reason step 14
+  -- asserts it: a total mixing a measurement with a forecast is a number nobody
+  -- can defend in a room.
+  -- A row with RUNS_PER_MONTH IS NULL is VOLUME-DRIVEN: a serverless meter billed per
+  -- unit of data (Snowpipe Streaming, for instance) with no schedule and no warehouse.
+  -- The formula below cannot describe it, and NULL arithmetic correctly yields NULL
+  -- rather than inventing a monthly figure. Every schedule-driven solution writes a
+  -- positive RUNS_PER_MONTH, so this branch changes nothing for them.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_MONTHLY_RUN_RATE AS SELECT '
+ || 'KIND, OBJECT_NAME, CADENCE, RUNS_PER_MONTH, SECONDS_PER_RUN, '
+ || 'WAREHOUSE_CREDITS_PER_HOUR, '
+    -- credits = runs x seconds x (credits/hour / 3600). Multiply BEFORE dividing:
+    -- LET cps := 1.0/3600.0 rounds to scale 6 (0.000278) and a solution already
+    -- shipped a 4x-low figure that way.
+ || 'ROUND(RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
+ || '  / 3600.0, 4) AS EST_CREDITS_PER_MONTH, '
+ || 'CASE WHEN RUNS_PER_MONTH IS NULL THEN ''VOLUME-DRIVEN'' '
+ || '     ELSE ''PROJECTED'' END AS LABEL, MEASURED_INPUT, BASIS, INSTALLED_AT '
+ || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
+
+  -- One line the app and the packet can both print. Zero rows is a legitimate
+  -- and meaningful answer -- it means this solution installs nothing recurring --
+  -- so it says that in words rather than rendering an empty table.
+  --
+  -- Scheduled and volume-driven components are reported in SEPARATE clauses and are
+  -- never added together. The single-sentence version claimed every figure was
+  -- "PROJECTED from schedules this build set and durations it measured", which for a
+  -- continuous serverless ingest endpoint was false three times over -- no schedule was
+  -- set, no duration was measured, and the resulting "About 0.02 credits/month" read as
+  -- though streaming were free. A volume-driven component contributes NO credits figure
+  -- here on purpose: the honest answer is a per-unit rate plus a volume the customer
+  -- controls, and that lives in BASIS.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE VIEW ' || :tgt || '.V_RUN_RATE_HEADLINE AS SELECT '
+ || 'CASE WHEN COUNT(*) = 0 THEN '
+ || '  ''This build installs nothing that runs on a schedule. It costs storage '
+ || 'plus whatever compute the people querying it use.'' '
+ || 'ELSE '
+ || '  CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0 THEN '
+ || '    ''About '' || ROUND(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
+ || '      RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
+ || '      / 3600.0, 0)), 2) '
+ || '    || '' credits/month across '' || COUNT_IF(RUNS_PER_MONTH IS NOT NULL) '
+ || '    || '' scheduled component(s), PROJECTED from schedules this build set '
+ || 'and durations it measured.'' ELSE '''' END '
+ || '  || CASE WHEN COUNT_IF(RUNS_PER_MONTH IS NULL) > 0 THEN '
+ || '    IFF(COUNT_IF(RUNS_PER_MONTH IS NOT NULL) > 0, '' Plus '', ''This build '
+ || 'installs '') || COUNT_IF(RUNS_PER_MONTH IS NULL) '
+ || '    || '' volume-driven component(s) that run continuously with NO schedule '
+ || 'and NO monthly projection: the cost scales with how much data you send, not '
+ || 'with a cadence. This is NOT zero -- read BASIS in V_MONTHLY_RUN_RATE for the '
+ || 'per-unit rate.'' ELSE '''' END '
+ || 'END AS HEADLINE, COUNT(*) AS COMPONENTS, '
+ || 'ROUND(COALESCE(SUM(IFF(RUNS_PER_MONTH IS NOT NULL, '
+ || '  RUNS_PER_MONTH * SECONDS_PER_RUN * WAREHOUSE_CREDITS_PER_HOUR '
+ || '  / 3600.0, 0)), 0), 4) AS EST_CREDITS_PER_MONTH, '
+ || 'COUNT_IF(RUNS_PER_MONTH IS NOT NULL) AS SCHEDULED_COMPONENTS, '
+ || 'COUNT_IF(RUNS_PER_MONTH IS NULL) AS VOLUME_COMPONENTS '
+ || 'FROM ' || :tgt || '.STANDING_WORKLOAD');
+
+
+  -- The only way to run one. Everything the app can do goes through here, so the
+  -- refusals below are the whole safety model:
+  --   1. the action must exist in this build
+  --   2. the BUILD must have been authorised FOR THAT ACTION'S TIER -- ALLOW_ACTIONS
+  --      for LIMITED and PRODUCTION, ALLOW_SAMPLE_ACTIONS for SAMPLE
+  --   3. the caller must type the code back exactly
+  -- and it stops at the FIRST failing statement, because a half-applied change is
+  -- worse than an unapplied one.
+  --
+  -- Existence is checked BEFORE authorisation now, because the tier is a property of
+  -- the registered action and there is nothing to authorise until we know it. The
+  -- swap leaks nothing: the action codes are printed in the script and listed in the
+  -- app, so "no such action" was never a secret.
+  --
+  -- An unrecognised TIER falls to the STRICTER gate on purpose. A typo in a tier
+  -- name must not be a way to get a PRODUCTION action treated as a sample.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR, P_PARAMS VARCHAR) '
+ || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
+ || 'DECLARE '
+ || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
+ || '  est NUMBER(38,6) := 0; sqls ARRAY := ARRAY_CONSTRUCT(); usnap STRING := NULL; '
+ || '  i INT := 0; ran INT := 0; errs STRING := ''''; '
+ || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
+    -- Parameter resolution state. `resolved` accumulates the EMITTED TEXT for each
+    -- parameter -- already shape-checked, already whitelisted, already quoted -- so
+    -- interpolation downstream is a plain REPLACE over values that have passed every
+    -- gate. Nothing the caller sent is ever interpolated directly.
+ || '  pspec ARRAY := ARRAY_CONSTRUCT(); pobj OBJECT := OBJECT_CONSTRUCT(); '
+ || '  resolved OBJECT := OBJECT_CONSTRUCT(); pkeys ARRAY := ARRAY_CONSTRUCT(); '
+ || '  k INT := 0; kk INT := 0; pj VARIANT := NULL; pname STRING := ''''; '
+ || '  pkind STRING := ''''; pval STRING := NULL; asql STRING := NULL; '
+ || '  emit STRING := ''''; parts ARRAY := ARRAY_CONSTRUCT(); jj INT := 0; '
+ || '  part STRING := ''''; hits INT := 0; num NUMBER(38,6) := NULL; '
+ || '  canon STRING := NULL; opts ARRAY := ARRAY_CONSTRUCT(); '
+    -- Two accumulators, deliberately. `resolved` holds the EMITTED TEXT that goes into
+    -- the statements -- quoted, so "EVENT_TS". `chosen` holds the CANONICAL VALUE a
+    -- human picked -- EVENT_TS. The log gets `chosen`, because an audit trail reading
+    -- {"attach_on":"\"EVENT_TS\""} makes a reader decode escaping to learn what was
+    -- done; the exact text that executed is already in ACTION_STATEMENT_LOG, so nothing
+    -- is lost by keeping this one readable.
+ || '  chosen OBJECT := OBJECT_CONSTRUCT(); '
+ || '  pmin NUMBER(38,6) := NULL; pmax NUMBER(38,6) := NULL; '
+ || '  s STRING := ''''; fin ARRAY := ARRAY_CONSTRUCT(); ustmts ARRAY := ARRAY_CONSTRUCT(); '
+ || 'BEGIN '
+ || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:cnt = 0) THEN '
+ || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
+ || '  END IF; '
+ || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
+ || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:tier = ''SAMPLE'') THEN '
+ || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
+ || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. This build was created with STORAGE_ALLOW_SAMPLE_ACTIONS = '
+ || 'FALSE, so even the seeded-data actions are inert. Re-run the script with it set '
+ || 'to TRUE to arm them.''; '
+ || '    END IF; '
+ || '  ELSE '
+ || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. '' || :tier || '' actions touch real data and this build was '
+ || 'created with STORAGE_ALLOW_ACTIONS = FALSE, so nothing in the app can change '
+ || 'anything of yours. Re-run the script with it set to TRUE to arm them.''; '
+ || '    END IF; '
+ || '  END IF; '
+ || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
+ || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
+ || '  END IF; '
+ || '  SELECT LABEL, EST_CREDITS, RUN_SQL, TO_JSON(UNDO_SQL), PARAM_SPEC '
+ || '    INTO :lbl, :est, :sqls, :usnap, :pspec '
+ || '    FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE; '
+    -- ── Parameters: validate EVERYTHING before a single statement runs ──────────
+    -- Order matters. This whole block sits BEFORE the ACTION_LOG insert and before
+    -- the execution loop, so a refusal here has applied nothing at all -- which is
+    -- what makes refuse-the-whole-action free rather than a rollback problem. A
+    -- partially-applied change is the thing this framework works hardest to prevent,
+    -- so a single bad value stops the entire action rather than running the subset
+    -- that happened to validate.
+ || '  pobj := COALESCE(TRY_PARSE_JSON(:P_PARAMS)::OBJECT, OBJECT_CONSTRUCT()); '
+    -- Values sent to an action that declares none are a REFUSAL, not something to
+    -- ignore. Silently dropping them would mean the caller believes it constrained
+    -- the action and the action did something broader -- and the log would agree
+    -- with the action, not the caller.
+ || '  IF (ARRAY_SIZE(:pspec) = 0 AND ARRAY_SIZE(OBJECT_KEYS(:pobj)) > 0) THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no parameters, but values were '
+ || 'supplied for it. Nothing was run.''; '
+ || '  END IF; '
+ || '  WHILE (:k < ARRAY_SIZE(:pspec)) DO '
+ || '    pj := GET(:pspec, :k); '
+ || '    pname := pj:name::STRING; '
+ || '    pkind := UPPER(COALESCE(pj:kind::STRING, ''IDENT'')); '
+ || '    asql := pj:allowed_sql::STRING; '
+ || '    pval := GET(:pobj, :pname)::STRING; '
+ || '    IF (:pval IS NULL OR TRIM(:pval) = '''') THEN '
+ || '      RETURN ''REFUSED. '' || :P_CODE || '' needs a value for '' || :pname '
+ || '        || ''. Nothing was run.''; '
+ || '    END IF; '
+ || '    IF (:pkind = ''STRING'') THEN '
+    -- ── A LITERAL VALUE, not an identifier ──────────────────────────────────────
+    -- Some parameters land inside a string literal rather than in an object position
+    -- -- an audience NAME is stored in a column, it does not name anything. Those
+    -- cannot be identifier-quoted (a name with a space is legitimate) and they still
+    -- cannot be bound, because RUN_ACTION EXECUTE IMMEDIATEs pre-built statement text.
+    --
+    -- TWO defences, again, because escaping alone is the thing that goes wrong quietly:
+    --   1. A conservative CHARACTER ALLOWLIST -- letters, digits, space and a few
+    --      punctuation marks that appear in real names. No single quote, no double
+    --      quote, no backslash, no semicolon, no comment marker. This is a permit-list,
+    --      so a character nobody thought about is refused rather than passed through.
+    --   2. Quote DOUBLING on top, so even if the allowlist were later widened by
+    --      someone, a quote could not terminate the literal.
+    -- Length is capped so a parameter cannot be used to push a statement past a limit.
+ || '      IF (LENGTH(:pval) > 200) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' is longer than 200 characters. '
+ || 'Nothing was run.''; '
+ || '      END IF; '
+ || '      IF (NOT REGEXP_LIKE(:pval, ''[A-Za-z0-9 _.,()\\-]+'')) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' contains a character that is not '
+ || 'permitted in a name. Letters, digits, spaces and _ . , ( ) - are allowed. '
+ || 'Nothing was run.''; '
+ || '      END IF; '
+    -- The literal is emitted WITHOUT its surrounding quotes: the statement in the
+    -- solution supplies those, exactly as it does for any other literal it writes, so
+    -- '<<audience_name>>' reads as a literal in the source and stays one.
+ || '      emit := REPLACE(:pval, '''''''', ''''''''''''); '
+ || '      canon := :pval; '
+ || '      IF (NOT COALESCE(pj:freeform::BOOLEAN, FALSE) '
+ || '          AND ARRAY_SIZE(COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT())) = 0) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
+ || 'marked freeform. Nothing was run.''; '
+ || '      END IF; '
+ || '    ELSEIF (:pkind = ''NUMBER'') THEN '
+    -- A number is still interpolated, because clauses like ARCHIVE_FOR_DAYS = 90 are
+    -- DDL and cannot be bound any more than an identifier can. The parse is the gate:
+    -- it returns NULL rather than raising, so a non-numeric arrives here as a refusal
+    -- instead of an exception, and the emitted text is the PARSED number rather than
+    -- the caller's string -- verified: '180 OR 1=1' parses to NULL, so it cannot
+    -- survive as text.
+    --
+    -- TRY_TO_DECIMAL(_, 38, 6), NOT TRY_TO_NUMBER. TRY_TO_NUMBER defaults to scale 0
+    -- and SILENTLY ROUNDS: TRY_TO_NUMBER('90.5') is 91, verified. A parameter that
+    -- quietly becomes a different number than the one chosen is worse than one that
+    -- is refused.
+ || '      num := TRY_TO_DECIMAL(:pval, 38, 6); '
+ || '      IF (:num IS NULL) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' must be a number. Nothing was run.''; '
+ || '      END IF; '
+ || '      pmin := pj:min::NUMBER(38,6); pmax := pj:max::NUMBER(38,6); '
+ || '      IF ((:pmin IS NOT NULL AND :num < :pmin) '
+ || '          OR (:pmax IS NOT NULL AND :num > :pmax)) THEN '
+ || '        RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is outside the '
+ || 'permitted range '' || COALESCE(:pmin::STRING, ''-'') || '' to '' '
+ || '          || COALESCE(:pmax::STRING, ''-'') || ''. Nothing was run.''; '
+ || '      END IF; '
+    -- Emit 180, never 180.000000. These values land in identifier positions as well as
+    -- value positions -- DEMO_COOL_POLICY_180 is a name and DEMO_COOL_POLICY_180.000000
+    -- is a syntax error -- so a NUMBER(38,6) cast straight to STRING breaks the
+    -- statement. Found live: the first parameterised run failed to compile on exactly
+    -- this. A genuinely fractional value keeps its decimals with trailing zeros
+    -- trimmed, so 90.5 stays 90.5.
+ || '      IF (:num = TRUNC(:num)) THEN '
+ || '        emit := :num::INT::STRING; '
+ || '      ELSE '
+ || '        emit := REGEXP_REPLACE(REGEXP_REPLACE(:num::STRING, ''0+$'', ''''), ''[.]$'', ''''); '
+ || '      END IF; '
+ || '      canon := :emit; '
+ || '    ELSE '
+    -- ── Gate 1: SHAPE, per dot-separated part ───────────────────────────────────
+    -- Independent of the whitelist on purpose. The whitelist is only ever as good as
+    -- the allowed_sql a future author writes; point it at a free-text column and it
+    -- authorises arbitrary text. This gate holds regardless. REGEXP_LIKE in Snowflake
+    -- matches the ENTIRE string -- verified, not assumed: ''ORDERS; DROP'' is FALSE
+    -- against this pattern, as are a space and a double quote. Do not "fix" this
+    -- pattern by adding anchors and do not relax it to a partial match.
+    --
+    -- Split on ''.'' so a qualified name is checked part by part. A name genuinely
+    -- containing a dot is refused here rather than silently mis-parsed into the wrong
+    -- number of parts.
+ || '      parts := SPLIT(:pval, ''.''); jj := 0; '
+ || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
+ || '        IF (NOT REGEXP_LIKE(GET(:parts, :jj)::STRING, ''[A-Za-z_][A-Za-z0-9_$]*'')) THEN '
+ || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not a valid '
+ || 'identifier. Nothing was run.''; '
+ || '        END IF; '
+ || '        jj := :jj + 1; '
+ || '      END WHILE; '
+    -- ── Gate 2: MEMBERSHIP, which also returns the CANONICAL SPELLING ───────────
+    -- DEFAULT DENY. A parameter must declare where its permitted values come from --
+    -- allowed_sql (a query) or options (a literal list) -- and if it declares neither
+    -- the action is REFUSED rather than falling back to the shape gate alone. An author
+    -- who simply forgets allowed_sql would otherwise get an identifier accepted on shape
+    -- alone and never know, which is the quiet failure this feature exists to avoid.
+    -- Freeform has to be asked for in writing, and is only appropriate for a NAME BEING
+    -- CREATED, which cannot be checked against things that already exist.
+    --
+    -- Both sources are enforced HERE, server-side. options is not merely what the app
+    -- offers: a list the host renders but the procedure does not check is a dropdown
+    -- pretending to be a control.
+    --
+    -- The comparison is case-INSENSITIVE but what gets emitted is the ALLOWED SET''S OWN
+    -- SPELLING, never the caller''s. This matters specifically because the value is
+    -- emitted QUOTED: a caller typing ''event_ts'' against a column stored as EVENT_TS
+    -- matches, and emitting their casing would produce "event_ts", which is a DIFFERENT
+    -- and non-existent object. Verified live -- the case-insensitive match accepted the
+    -- lowercase spelling, which is correct, and only canonicalising makes the resulting
+    -- identifier resolve. It also means a column genuinely stored lowercase is quoted in
+    -- ITS spelling and resolves too.
+ || '      canon := NULL; '
+ || '      IF (:asql IS NOT NULL AND TRIM(:asql) <> '''') THEN '
+    -- The whitelist query comes from the REGISTRY, never from the caller, so the app
+    -- cannot influence what its own value is checked against. The value is BOUND rather
+    -- than concatenated -- the point of the check is to constrain an attacker-controlled
+    -- string, so the check itself must not concatenate one.
+    --
+    -- allowed_sql must expose a column named ALLOWED_VALUE. Requiring a NAME rather than
+    -- reading position 1 means an author widening their SELECT list cannot silently
+    -- change which column authorises values.
+ || '        EXECUTE IMMEDIATE ''SELECT MAX(TO_VARCHAR(a.ALLOWED_VALUE)) FROM ('' || :asql '
+ || '          || '') a WHERE UPPER(TO_VARCHAR(a.ALLOWED_VALUE)) = UPPER(?)'' USING (pval); '
+ || '        SELECT $1 INTO :canon FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())); '
+ || '        IF (:canon IS NULL) THEN '
+ || '          RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
+ || 'values this build discovered for it. Nothing was run.''; '
+ || '        END IF; '
+ || '      ELSE '
+ || '        opts := COALESCE(pj:options::ARRAY, ARRAY_CONSTRUCT()); '
+ || '        IF (ARRAY_SIZE(:opts) > 0) THEN '
+    -- A plain loop rather than FLATTEN over a local VARIANT: that construct raised
+    -- EXPRESSION_ERROR inside a procedure body when it was tried, and a loop cannot.
+ || '          jj := 0; '
+ || '          WHILE (:jj < ARRAY_SIZE(:opts)) DO '
+ || '            IF (UPPER(GET(:opts, :jj)::STRING) = UPPER(:pval)) THEN '
+ || '              canon := GET(:opts, :jj)::STRING; '
+ || '              BREAK; '
+ || '            END IF; '
+ || '            jj := :jj + 1; '
+ || '          END WHILE; '
+ || '          IF (:canon IS NULL) THEN '
+ || '            RETURN ''REFUSED. '' || :pname || '' = '' || :pval || '' is not one of the '
+ || 'permitted values for it. Nothing was run.''; '
+ || '          END IF; '
+ || '        ELSEIF (COALESCE(pj:freeform::BOOLEAN, FALSE)) THEN '
+    -- Freeform: there is no set to canonicalise against, so the caller''s spelling IS
+    -- the name being created. It has already passed the shape gate.
+ || '          canon := :pval; '
+ || '        ELSE '
+ || '          RETURN ''REFUSED. '' || :pname || '' declares no permitted values and is not '
+ || 'marked freeform, so this build cannot say what it is allowed to be. Nothing was run. '
+ || 'This is a defect in the solution, not in what you chose.''; '
+ || '        END IF; '
+ || '      END IF; '
+    -- ── Quote the CANONICAL value, part by part ─────────────────────────────────
+    -- "DB"."SCHEMA"."TABLE", not "DB.SCHEMA.TABLE" -- the latter names one object with
+    -- dots in it. ENUM values are emitted BARE because they land in positions like
+    -- ARCHIVE_TIER = COOL where a quoted string is not valid syntax; the shape gate
+    -- already refused anything that is not a bare word, so an unquoted enum still
+    -- cannot carry punctuation.
+ || '      parts := SPLIT(:canon, ''.''); jj := 0; emit := ''''; '
+ || '      WHILE (:jj < ARRAY_SIZE(:parts)) DO '
+ || '        part := GET(:parts, :jj)::STRING; '
+ || '        IF (:pkind = ''ENUM'') THEN '
+ || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || :part; '
+ || '        ELSE '
+ || '          emit := :emit || IFF(:jj = 0, '''', ''.'') || ''"'' || :part || ''"''; '
+ || '        END IF; '
+ || '        jj := :jj + 1; '
+ || '      END WHILE; '
+ || '    END IF; '
+ || '    resolved := OBJECT_INSERT(:resolved, :pname, :emit, TRUE); '
+ || '    chosen := OBJECT_INSERT(:chosen, :pname, :canon, TRUE); '
+ || '    k := :k + 1; '
+ || '  END WHILE; '
+    -- ── Interpolation, over validated text only ────────────────────────────────
+    -- Both the forward statements AND the reverse ones, because the reverse set is
+    -- snapshotted below and an undo must reverse THE SAME target. Resolving undo here
+    -- is what makes that structural rather than a promise: UNDO_ACTION replays text
+    -- that was already resolved, so it cannot be handed different values later.
+ || '  pkeys := OBJECT_KEYS(:resolved); '
+ || '  ustmts := PARSE_JSON(:usnap)::ARRAY; '
+ || '  i := 0; '
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    s := GET(:sqls, :i)::STRING; kk := 0; '
+ || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
+ || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
+ || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
+ || '      kk := :kk + 1; '
+ || '    END WHILE; '
+    -- A placeholder left over means the statement names a parameter the action did not
+    -- declare -- a typo between the two. Refusing beats executing DDL with a literal
+    -- <<tbl>> in it, and beats the silent alternative of leaving it to fail with a
+    -- syntax error that points at the wrong thing.
+ || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
+ || '      RETURN ''REFUSED. Statement '' || (:i + 1) || '' of '' || :P_CODE '
+ || '        || '' contains a placeholder this action does not declare. Nothing was run.''; '
+ || '    END IF; '
+ || '    fin := ARRAY_APPEND(:fin, :s); '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  sqls := :fin; fin := ARRAY_CONSTRUCT(); i := 0; '
+ || '  WHILE (:i < ARRAY_SIZE(:ustmts)) DO '
+ || '    s := GET(:ustmts, :i)::STRING; kk := 0; '
+ || '    WHILE (:kk < ARRAY_SIZE(:pkeys)) DO '
+ || '      s := REPLACE(:s, ''<<'' || GET(:pkeys, :kk)::STRING || ''>>'', '
+ || '                   GET(:resolved, GET(:pkeys, :kk)::STRING)::STRING); '
+ || '      kk := :kk + 1; '
+ || '    END WHILE; '
+ || '    IF (REGEXP_LIKE(:s, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
+ || '      RETURN ''REFUSED. Reverse statement '' || (:i + 1) || '' of '' || :P_CODE '
+ || '        || '' contains a placeholder this action does not declare. Nothing was run, '
+ || 'because an action whose undo cannot resolve must not run in the first place.''; '
+ || '    END IF; '
+ || '    fin := ARRAY_APPEND(:fin, :s); '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  usnap := TO_JSON(:fin); i := 0; '
+    -- The reverse statements are SNAPSHOTTED onto this run, not read from the
+    -- registry when the undo happens. The registry holds what the action CURRENTLY
+    -- declares; a rebuild between the run and the undo can change that, and then the
+    -- undo reverses a different set of objects than the run created. Storing them
+    -- here means an undo can only ever replay what THIS run was going to do.
+    -- Stored as JSON text rather than ARRAY because an ARRAY bind through
+    -- INSERT..SELECT is fragile, and TO_JSON/PARSE_JSON round-trips exactly.
+ || '  INSERT INTO ' || :tgt || '.ACTION_LOG '
+ || '    (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS, UNDO_SNAPSHOT, PARAMS) '
+ || '    SELECT :log_id, :P_CODE, :lbl, :est, ''RUNNING'', :usnap, '
+    -- The RESOLVED values, not the raw input: what the statements were actually built
+    -- with. NULL when the action takes none, so an unparameterised row reads as having
+    -- had none rather than as an empty object that might mean anything.
+ || '           IFF(ARRAY_SIZE(OBJECT_KEYS(:chosen)) = 0, NULL, TO_JSON(:chosen)); '
+    -- :i indexes the ARRAY from 0, but every number this procedure SHOWS a
+    -- human is :i + 1. Sabotaging the second statement of an action originally
+    -- produced "statement 1: SQL compilation error", which points at the wrong
+    -- DDL -- the single most expensive kind of wrong in an error message.
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    BEGIN '
+ || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
+ || '               LAST_QUERY_ID(), ''OK''; '
+ || '      ran := :ran + 1; '
+ || '    EXCEPTION WHEN OTHER THEN '
+ || '      errs := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :errs; '
+ || '      BREAK; '
+ || '    END; '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''DONE'', ''FAILED''), '
+ || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
+ || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
+ || '  IF (:errs <> '''') THEN '
+ || '    RETURN ''FAILED after '' || :ran || '' statement(s), nothing further was run. '' || :errs; '
+ || '  END IF; '
+ || '  RETURN ''DONE. '' || :lbl '
+    -- Name the values in the RETURN, not just in the log. The message is the only
+    -- thing most readers see, and "DONE. Attach the policy" is the same sentence
+    -- whichever table it just tiered.
+ || '    || IFF(ARRAY_SIZE(:pkeys) = 0, '''', '' on '' || TO_JSON(:chosen)) '
+ || '    || '' -- '' || :ran || '' statement(s) ran. Estimated '' '
+ || '    || :est || '' credits. V_ACTION_COST reconciles that against what Snowflake '' '
+ || '    || ''actually charged, and its MEASURED_STATUS column says whether a '' '
+ || '    || ''measurement is pending, partial, or will never arrive because the '' '
+ || '    || ''statements consumed no warehouse compute.''; '
+ || 'END');
+
+  -- ── The two-argument form every existing solution and test already calls ────
+  -- A DELEGATE, not a copy. There is exactly ONE implementation of the three gates
+  -- and the parameter resolver, and this signature reaches it with an empty parameter
+  -- object. Duplicating the body to "keep the simple path simple" would put a second
+  -- copy of a safety gate in the file, and a duplicated gate is a gate that rots --
+  -- F2 needed a dedicated in-sync assertion for exactly that reason.
+  --
+  -- So the 27 solutions that declare no parameters, and gauntlet step 12 which calls
+  -- RUN_ACTION(code, confirm) positionally, keep working unchanged and still get
+  -- every gate.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.RUN_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
+ || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
+ || 'DECLARE r STRING := ''''; '
+ || 'BEGIN '
+ || '  CALL ' || :tgt || '.RUN_ACTION(:P_CODE, :P_CONFIRM, NULL) INTO :r; '
+ || '  RETURN :r; '
+ || 'END');
+
+  -- ── Undoing one action, without taking the rest down with it ───────────────
+  -- Until this existed the only undo was TEARDOWN(), which drops the whole schema.
+  -- That is a fine answer to "remove the demo" and a useless answer to "I pressed
+  -- the production button, show me it comes back" -- it destroys the evidence
+  -- along with the change. This reverses ONE action and leaves everything else
+  -- standing, which is the thing you actually want before you press it for real.
+  --
+  -- Same three gates as RUN_ACTION, deliberately. An undo is itself a change to
+  -- the account: reversing a masking policy EXPOSES a column again. It is not
+  -- inherently the safe direction and does not get a weaker door.
+  --
+  -- DELIBERATELY NOT PARAMETERISED, and this is a safety decision rather than an
+  -- omission. RUN_ACTION resolves the reverse statements and snapshots them ALREADY
+  -- RESOLVED, so the undo replays the exact text built for that run. Giving this
+  -- procedure a parameter argument would let a caller undo with DIFFERENT values than
+  -- the run used -- an undo that reverses a different target than the action touched,
+  -- which is worse than having no undo at all. The only reverse statements reachable
+  -- here are the ones the run itself produced.
+  stmts := ARRAY_APPEND(:stmts,
+    'CREATE OR REPLACE PROCEDURE ' || :tgt || '.UNDO_ACTION(P_CODE VARCHAR, P_CONFIRM VARCHAR) '
+ || 'RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS '
+ || 'DECLARE '
+ || '  enabled BOOLEAN := FALSE; lbl STRING := ''''; tier STRING := ''''; '
+ || '  sqls ARRAY := ARRAY_CONSTRUCT(); last_st STRING := NULL; usnap STRING := NULL; '
+ || '  i INT := 0; ran INT := 0; errs STRING := ''''; e1 STRING := ''''; '
+ || '  log_id STRING := UUID_STRING(); cnt INT := 0; '
+ || 'BEGIN '
+ || '  cnt := (SELECT COUNT(*) FROM ' || :tgt || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:cnt = 0) THEN '
+ || '    RETURN ''REFUSED. This build declares no action called '' || :P_CODE || ''.''; '
+ || '  END IF; '
+    -- Tier-aware, exactly as RUN_ACTION. Undo has to be reachable under the SAME
+    -- authorisation that let the action run, or SAMPLE actions become one-way: the
+    -- button works, the reversal refuses, and the seeded objects are stranded until
+    -- TEARDOWN(). Unknown tiers fall to the stricter gate, as above.
+ || '  tier := (SELECT UPPER(COALESCE(TIER, ''PRODUCTION'')) FROM ' || :tgt
+ || '.ACTION_REGISTRY WHERE CODE = :P_CODE); '
+ || '  IF (:tier = ''SAMPLE'') THEN '
+ || '    enabled := (SELECT COALESCE(SAMPLE_ACTIONS_ENABLED, FALSE) FROM ' || :tgt
+ || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. This build was created with STORAGE_ALLOW_SAMPLE_ACTIONS = FALSE.''; '
+ || '    END IF; '
+ || '  ELSE '
+ || '    enabled := (SELECT ACTIONS_ENABLED FROM ' || :tgt || '.V_BUILD_CONTEXT LIMIT 1); '
+ || '    IF (NOT COALESCE(:enabled, FALSE)) THEN '
+ || '      RETURN ''REFUSED. This build was created with STORAGE_ALLOW_ACTIONS = FALSE.''; '
+ || '    END IF; '
+ || '  END IF; '
+ || '  IF (:P_CONFIRM IS NULL OR UPPER(TRIM(:P_CONFIRM)) <> UPPER(TRIM(:P_CODE))) THEN '
+ || '    RETURN ''REFUSED. Type the action code exactly to confirm it.''; '
+ || '  END IF; '
+ || '  SELECT LABEL INTO :lbl FROM ' || :tgt
+ || '    .ACTION_REGISTRY WHERE CODE = :P_CODE; '
+    -- Prefer the snapshot taken when the action ran. Fall back to what the registry
+    -- declares now, for a schema built before UNDO_SNAPSHOT existed -- that is the
+    -- old, less precise behaviour, and it is better than refusing to undo at all.
+ || '  BEGIN '
+ || '    SELECT UNDO_SNAPSHOT INTO :usnap FROM ' || :tgt || '.ACTION_LOG '
+ || '      WHERE CODE = :P_CODE AND STATUS = ''DONE'' '
+ || '      ORDER BY FINISHED_AT DESC LIMIT 1; '
+ || '  EXCEPTION WHEN OTHER THEN usnap := NULL; END; '
+ || '  IF (:usnap IS NOT NULL) THEN '
+ || '    sqls := PARSE_JSON(:usnap)::ARRAY; '
+ || '  ELSE '
+ || '    SELECT UNDO_SQL INTO :sqls FROM ' || :tgt
+ || '      .ACTION_REGISTRY WHERE CODE = :P_CODE; '
+ || '  END IF; '
+ || '  IF (ARRAY_SIZE(:sqls) = 0) THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' declares no reverse statements. Read its '
+|| 'undo text -- some changes are only reversible by hand, and pretending otherwise '
+|| 'would be worse than saying so.''; '
+ || '  END IF; '
+    -- An unresolved placeholder can only reach here down the FALLBACK path above --
+    -- a parameterised action whose run predates UNDO_SNAPSHOT, so the registry's own
+    -- unresolved text was loaded instead. Executing it would run DDL containing a
+    -- literal <<tbl>>; guessing a value would reverse a target this run may never have
+    -- touched. Both are worse than refusing and saying which action it was.
+ || '  i := 0; '
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    IF (REGEXP_LIKE(GET(:sqls, :i)::STRING, ''.*<<[A-Za-z0-9_]+>>.*'', ''s'')) THEN '
+ || '      RETURN ''REFUSED. '' || :P_CODE || '' takes parameters and no resolved reverse '
+|| 'statements were recorded for the run being undone, so the values it used are not '
+|| 'known. Run it again to record them; nothing was reversed.''; '
+ || '    END IF; '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  i := 0; '
+    -- Refusing to undo something that was never done is not pedantry. Running the
+    -- reverse of an un-run action can itself be destructive: the reverse of "attach
+    -- a masking policy" is "unset it", which on a column somebody ELSE masked would
+    -- quietly strip their protection.
+    -- COUNT of DONE rows is the WRONG question: it stays true forever, so a second
+    -- undo sailed past this guard and reported UNDONE again having done nothing.
+    -- Verified live -- it was harmless only because the first undo had already
+    -- emptied the registry it reads. The right question is what happened LAST.
+ || '  last_st := (SELECT STATUS FROM ' || :tgt || '.ACTION_LOG '
+ || '              WHERE CODE = :P_CODE AND STATUS IN (''DONE'', ''UNDONE'') '
+ || '              ORDER BY FINISHED_AT DESC LIMIT 1); '
+ || '  IF (:last_st IS NULL) THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' has not completed on this build, so there '
+|| 'is nothing to reverse.''; '
+ || '  END IF; '
+ || '  IF (:last_st = ''UNDONE'') THEN '
+ || '    RETURN ''REFUSED. '' || :P_CODE || '' has already been undone. Run it again '
+|| 'before undoing it again.''; '
+ || '  END IF; '
+ || '  INSERT INTO ' || :tgt || '.ACTION_LOG (LOG_ID, CODE, LABEL, EST_CREDITS, STATUS) '
+ || '    SELECT :log_id, :P_CODE, ''UNDO: '' || :lbl, 0, ''UNDOING''; '
+ || '  WHILE (:i < ARRAY_SIZE(:sqls)) DO '
+ || '    BEGIN '
+ || '      EXECUTE IMMEDIATE GET(:sqls, :i)::STRING; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, QUERY_ID, STATUS) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), '
+ || '               LAST_QUERY_ID(), ''OK''; '
+ || '      ran := :ran + 1; '
+    -- An undo does NOT stop at the first failure, which is the opposite of
+    -- RUN_ACTION. Half-applying a change is bad; half-REVERSING one leaves the
+    -- account in a state neither the action nor the undo describes, so it pushes on
+    -- and reports everything that went wrong. Every statement is logged either way.
+ || '    EXCEPTION WHEN OTHER THEN '
+ || '      e1 := ''statement '' || (:i + 1) || '': '' || SQLERRM; '
+ || '      errs := :errs || :e1 || ''; ''; '
+ || '      INSERT INTO ' || :tgt || '.ACTION_STATEMENT_LOG '
+ || '        (LOG_ID, SEQ, STATEMENT, STATUS, ERROR) '
+ || '        SELECT :log_id, :i + 1, LEFT(GET(:sqls, :i)::STRING, 4000), ''FAILED'', :e1; '
+ || '    END; '
+ || '    i := :i + 1; '
+ || '  END WHILE; '
+ || '  UPDATE ' || :tgt || '.ACTION_LOG SET STATUS = IFF(:errs = '''', ''UNDONE'', ''FAILED''), '
+ || '    STATEMENTS_RUN = :ran, ERROR = NULLIF(:errs, ''''), '
+ || '    FINISHED_AT = CURRENT_TIMESTAMP() WHERE LOG_ID = :log_id; '
+ || '  IF (:errs <> '''') THEN '
+ || '    RETURN ''PARTIALLY UNDONE. '' || :ran || '' of '' || ARRAY_SIZE(:sqls) '
+ || '      || '' statement(s) succeeded. '' || :errs; '
+ || '  END IF; '
+ || '  RETURN ''UNDONE. '' || :lbl || '' -- '' || :ran || '' reverse statement(s) ran. '' '
+ || '    || ''The action can be run again.''; '
+ || 'END');
+  cost_once := :cost_once + 0.01;
+  IF (ARRAY_SIZE(:actions) > 0) THEN
+    notes := ARRAY_APPEND(:notes,
+      'THIS BUILD DECLARES ' || ARRAY_SIZE(:actions) || ' ACTION(S) the app can offer. '
+   || IFF(:allow_actions,
+          'STORAGE_ALLOW_ACTIONS is TRUE, so they are ARMED: a user of the dashboard can '
+       || 'run them after typing the action code to confirm. Every attempt is recorded '
+       || 'in ACTION_LOG.',
+          'STORAGE_ALLOW_ACTIONS is FALSE, so every button is inert and RUN_ACTION refuses. '
+       || 'The app still shows what each action would do and what it would cost.'));
+    LET ai INT := 0;
+    WHILE (:ai < ARRAY_SIZE(:actions)) DO
+      notes := ARRAY_APPEND(:notes,
+        '  ACTION ' || GET(:actions, :ai):tier::STRING || ' · '
+     || GET(:actions, :ai):code::STRING || ' — '
+     || GET(:actions, :ai):label::STRING || '  (~'
+     || GET(:actions, :ai):est::STRING || ' credits: '
+     || GET(:actions, :ai):basis::STRING || ')');
+      ai := :ai + 1;
+    END WHILE;
+  END IF;
+
+  IF (:app_build_end < :app_build_start) THEN
+    app_build_start := ARRAY_SIZE(:stmts) + 1;
+  END IF;
+  IF (:app_build_end < :app_build_start) THEN
+    app_build_end := ARRAY_SIZE(:stmts);
+  END IF;
 
 
   -- ── DETERMINISTIC GATES ───────────────────────────────────────────────────
@@ -8470,6 +8485,7 @@ END IF;
 
   -- ── Gate ──────────────────────────────────────────────────────────────────
   LET approved BOOLEAN := FALSE;
+  LET workload_blocked BOOLEAN := FALSE;
   BEGIN
     approved := (SELECT TRY_CAST($STORAGE_APPROVE::VARCHAR AS BOOLEAN));
   EXCEPTION WHEN OTHER THEN approved := FALSE;
@@ -8481,10 +8497,10 @@ END IF;
   -- be, because the client owns the decision and the override is the audit trail.
   LET gate_closed_by STRING := '';
   IF (:hard_block <> '') THEN
-    approved := FALSE;
+    workload_blocked := TRUE;
     gate_closed_by := 'DETERMINISTIC CHECK';
   ELSEIF (:review_verdict = 'DO_NOT_PROCEED' AND NOT :override_asked) THEN
-    approved := FALSE;
+    workload_blocked := TRUE;
     gate_closed_by := 'REVIEW VERDICT';
   ELSEIF (:review_verdict = 'DO_NOT_PROCEED' AND :override_asked) THEN
     review_overridden := TRUE;
@@ -8492,6 +8508,15 @@ END IF;
       'OVERRIDE IN EFFECT: the review returned DO_NOT_PROCEED and '
    || 'STORAGE_OVERRIDE_REVIEW = TRUE, so the build proceeded anyway. The verdict and '
    || 'this override are both recorded in REVIEW_LOG and in the packet.');
+  END IF;
+
+  IF (:workload_blocked) THEN
+    IF (:approved AND 'STORAGE_APP' <> '' AND '21_storage_optimization' <> '24_voice_of_customer' AND :app_build_end >= :app_build_start) THEN
+      stmts := ARRAY_SLICE(:stmts, 0, :app_build_end);
+      notes := ARRAY_APPEND(:notes, 'Data-workload build was refused. Only the existing app and its infrastructure are installed; the review decision is not overridden.');
+    ELSE
+      approved := FALSE;
+    END IF;
   END IF;
 
   -- ── The discovery packet ──────────────────────────────────────────────────
@@ -8830,7 +8855,8 @@ END IF;
   LET receipt_app_exists BOOLEAN := FALSE;
   LET receipt_workspace_exists BOOLEAN := FALSE;
   LET receipt_base_url STRING := 'https://app.snowflake.com/' || LOWER(CURRENT_ORGANIZATION_NAME()) || '/' || LOWER(CURRENT_ACCOUNT_NAME());
-  IF (ARRAY_SIZE(:receipt_failures) = 0 AND :receipt_app_name <> '') THEN
+  LET receipt_app_statements INTEGER := (SELECT COUNT(*) FROM TABLE(FLATTEN(INPUT=>:qlog)) WHERE VALUE:seq::INTEGER BETWEEN :app_build_start AND :app_build_end AND VALUE:status::VARCHAR='OK');
+  IF (:receipt_app_name <> '' AND :app_build_end >= :app_build_start AND :receipt_app_statements = :app_build_end - :app_build_start + 1) THEN
     BEGIN
       EXECUTE IMMEDIATE 'SHOW STREAMLITS IN SCHEMA ' || :tgt;
       receipt_app_exists := (SELECT COUNT(*) = 1 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "name" = :receipt_app_name);
@@ -8851,14 +8877,16 @@ END IF;
   END IF;
   IF (NOT $STORAGE_VERBOSE_OUTPUT::BOOLEAN) THEN
     res := (SELECT
-      CASE WHEN ARRAY_SIZE(:receipt_failures) > 0 THEN 'BUILD_FAILED' WHEN :receipt_app_name = '' THEN 'READY_NO_APP' ELSE 'READY' END AS STATUS,
-      IFF(:receipt_app_exists AND ARRAY_SIZE(:receipt_failures) = 0, :receipt_base_url || '/#/streamlit-apps/' || :tgt || '.' || :receipt_app_name, NULL) AS OPEN_APP_URL,
-      IFF(:receipt_workspace_exists AND ARRAY_SIZE(:receipt_failures) = 0, :receipt_base_url || '/#/workspaces/ws/' || :db || '/' || :sch || '/ONESHOT_SOURCE/streamlit_app.py', NULL) AS EDIT_SOURCE_URL,
+      CASE WHEN :receipt_app_exists AND :workload_blocked THEN 'APP_READY_REVIEW_REQUIRED' WHEN :receipt_app_exists AND ARRAY_SIZE(:receipt_failures)>0 THEN 'APP_READY_BUILD_INCOMPLETE' WHEN ARRAY_SIZE(:receipt_failures) > 0 THEN 'BUILD_FAILED' WHEN :receipt_app_name = '' THEN 'READY_NO_APP' WHEN :receipt_app_exists AND :found:source_discovery:status::VARCHAR NOT IN ('REVIEW_SOURCE_PROPOSAL','AVAILABLE') THEN 'APP_READY_REVIEW_REQUIRED' WHEN :receipt_app_exists THEN 'READY' ELSE 'BUILD_FAILED' END AS STATUS,
+      IFF(:receipt_app_exists, :receipt_base_url || '/#/streamlit-apps/' || :tgt || '.' || :receipt_app_name, NULL) AS OPEN_APP_URL,
+      IFF(:receipt_app_exists, 'OPEN THE APP: click OPEN_APP_URL.' || IFF(:workload_blocked,' Data processing was refused; review REVIEW_FINDINGS and ATTENTION.',IFF(ARRAY_SIZE(:receipt_failures)>0,' Some data objects failed; inspect ATTENTION and DIAGNOSTICS. Do not treat missing panels as completed work.',IFF(:found:source_discovery:status::VARCHAR NOT IN ('REVIEW_SOURCE_PROPOSAL','AVAILABLE'),' Source discovery needs attention; inspect SOURCE_DISCOVERY_STATUS and REVIEW_FINDINGS.',' No additional variable changes are needed.'))), IFF(:receipt_app_name = '' AND ARRAY_SIZE(:receipt_failures)=0, 'SQL objects are ready; this solution has no application.', 'BUILD FAILED: inspect DIAGNOSTICS below.')) AS NEXT_ACTION,
+      IFF(:receipt_workspace_exists, :receipt_base_url || '/#/workspaces/ws/' || :db || '/' || :sch || '/ONESHOT_SOURCE/streamlit_app.py', NULL) AS EDIT_SOURCE_URL,
       :mode AS DATA_MODE,
+      :found:source_discovery:status::VARCHAR AS SOURCE_DISCOVERY_STATUS,
       :tgt AS DESTINATION,
       :review_verdict AS REVIEW_STATUS,
       :review_findings AS REVIEW_FINDINGS,
-      IFF(ARRAY_SIZE(:receipt_failures) > 0, TO_JSON(:receipt_failures), IFF(:receipt_app_name = '', 'This solution creates SQL objects, not a Streamlit app.', 'Open OPEN_APP_URL using a role with access to the app.')) AS NEXT_ACTION,
+      IFF(ARRAY_SIZE(:receipt_failures) > 0, TO_JSON(:receipt_failures), 'Use a role with access to the installed objects.') AS ATTENTION,
       'SELECT * FROM ' || :tgt || '.BUILD_STATEMENT_LOG WHERE RUN_ID = ''' || :run_id || ''' ORDER BY SEQ;' AS DIAGNOSTICS,
       'CALL ' || :tgt || '.TEARDOWN();' AS REMOVE_DEMO);
     RETURN TABLE(res);

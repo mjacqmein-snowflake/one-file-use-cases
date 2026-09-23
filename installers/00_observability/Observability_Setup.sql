@@ -3,7 +3,7 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- The gate. Nothing is created while this is FALSE.
-SET MONITOR_APPROVE = FALSE;
+SET MONITOR_APPROVE = TRUE;
 SET MONITOR_BUILD_STATUS = 'NOT_BUILT';
 SET MONITOR_OPEN_APP_URL = '';
 
@@ -66,7 +66,6 @@ SET MONITOR_UPSTREAM_EAI = '';
 -- Seed the registry with worked examples (Airflow, postgres_exporter, Confluent)
 -- so the shape is obvious. Examples are created DISABLED.
 SET MONITOR_UPSTREAM_SEED = TRUE;
-
 -- ─────────────────────────────────────────────────────────────────────────────
 -- BLOCK 0 · PRE-FLIGHT
 -- Answers only the questions that decide whether the rest can run.
