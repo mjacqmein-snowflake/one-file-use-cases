@@ -6,6 +6,9 @@
 -- The gate. Nothing is created while this is FALSE.
 SET DELEG_APPROVE = FALSE;
 
+SET DELEG_VERBOSE_OUTPUT = FALSE;
+
+
 -- Where to build. Blank means the database currently in use.
 SET DELEG_TARGET_DB = '';
 SET DELEG_SCHEMA    = 'DELEGATED_ORCHESTRATION';
@@ -36,7 +39,7 @@ SET DELEG_APP_WAREHOUSE = '';
 -- COST. A never-suspending XSMALL warehouse is about 24 credits/day, and it is 24
 -- credits/day in total rather than per app. FALSE reverts to the warehouse you
 -- are already using, with no always-on cost and slower first loads.
-SET DELEG_KEEP_APP_WARM  = TRUE;
+SET DELEG_KEEP_APP_WARM  = FALSE;
 SET DELEG_WARM_WAREHOUSE = 'ONESHOT_APP_WH';
 
 -- How long a viewer's own app session survives idling, in minutes, 5 to 240.
@@ -491,6 +494,7 @@ BEGIN
   LET sig  OBJECT := OBJECT_CONSTRUCT();
   LET cnt  OBJECT := OBJECT_CONSTRUCT();
 
+
   -- ── Probes ────────────────────────────────────────────────────────────────
   -- One BEGIN/EXCEPTION per signal. Copy the shape; do not merge them, because
   -- a merged probe turns one unreadable view into a dead run.
@@ -733,6 +737,7 @@ EXECUTE IMMEDIATE $$
 DECLARE
   res RESULTSET;
 BEGIN
+  
   LET db      STRING := COALESCE(NULLIF($DELEG_TARGET_DB::VARCHAR, ''), CURRENT_DATABASE());
   LET min_fill NUMBER(38,2) := COALESCE((SELECT TRY_CAST($DELEG_MIN_FILL_PCT::VARCHAR AS NUMBER)), 60);
   LET sample_rows INT := 10000;
@@ -1305,6 +1310,7 @@ BEGIN
       || 'produced SQL, and every choice was checked against the discovered '
       || 'inventory before use. Its reasoning is shown below.');
   END IF;
+
 
 
   stmts := ARRAY_APPEND(:stmts, 'CREATE SCHEMA IF NOT EXISTS ' || :tgt);
@@ -9005,6 +9011,7 @@ END IF;
     'OPEN THE APP after building: Snowsight > Projects > Streamlit > DELEGATED_ORCHESTRATION_APP');
   --          bundle embedded as base64, plus COPY INTO and CREATE STREAMLIT
 
+
   -- ── DETERMINISTIC GATES ───────────────────────────────────────────────────
   -- These evaluate FIRST and they work with Cortex face down. The review that
   -- follows is judgement on top of them, never a substitute for them: a rule that
@@ -9060,7 +9067,7 @@ END IF;
      || :min_fill || '% floor. Anything depending on them is downgraded and named '
      || 'below. The plan continues on what is left.');
     END IF;
-  ELSE
+  ELSEIF (:prof_status NOT IN ('SYNTHETIC_INPUTS','BOUNDED_VALIDATED')) THEN
     notes := ARRAY_APPEND(:notes,
       'PROFILE ' || :prof_status || ': column populated-ness was NOT checked, so '
    || 'nothing in this plan knows whether the columns it reads contain anything. '
@@ -9344,6 +9351,19 @@ END IF;
       'statements', :stmts));
 
   IF (NOT COALESCE(:approved, FALSE)) THEN
+    IF (NOT $DELEG_VERBOSE_OUTPUT::BOOLEAN) THEN
+      res := (SELECT IFF(:hard_block <> '' OR (:review_verdict = 'DO_NOT_PROCEED' AND NOT :override_asked), 'BLOCKED', 'READY_TO_BUILD') AS STATUS,
+        NULL::VARCHAR AS OPEN_APP_URL,
+        :mode AS DATA_MODE,
+        :tgt AS DESTINATION,
+        :cost_once AS ESTIMATED_BUILD_CREDITS,
+        :cost_day AS ESTIMATED_DAILY_CREDITS,
+        IFF(:hard_block <> '', :hard_block, IFF(:review_verdict = 'DO_NOT_PROCEED' AND NOT :override_asked, TO_JSON(:review_findings), 'Review the cost and discovery packet, then set DELEG_APPROVE = TRUE and rerun. Set DELEG_VERBOSE_OUTPUT = TRUE for the full plan.')) AS NEXT_ACTION,
+        :review_verdict AS REVIEW_STATUS,
+        :review_findings AS REVIEW_FINDINGS,
+        :pk_json AS DISCOVERY_PACKET);
+      RETURN TABLE(res);
+    END IF;
     res := (
       SELECT -1 AS step, 'WHAT THIS GIVES YOU' AS action,
              COALESCE(NULLIF(:headline, ''), 'Zero-Privilege Orchestration') AS statement
@@ -9590,6 +9610,45 @@ END IF;
     log := ARRAY_APPEND(:log, OBJECT_CONSTRUCT('n', ARRAY_SIZE(:stmts) + 1, 'status', 'FAILED',
                                                'stmt', 'CREATE PROCEDURE TEARDOWN()', 'error', SQLERRM));
   END;
+
+  LET receipt_failures ARRAY := (SELECT COALESCE(ARRAY_AGG(OBJECT_CONSTRUCT('statement', VALUE:stmt, 'error', VALUE:error)), ARRAY_CONSTRUCT()) FROM TABLE(FLATTEN(INPUT => :log)) WHERE VALUE:status::STRING = 'FAILED');
+  LET receipt_app_name STRING := 'DELEGATED_ORCHESTRATION_APP';
+  LET receipt_app_exists BOOLEAN := FALSE;
+  LET receipt_workspace_exists BOOLEAN := FALSE;
+  LET receipt_base_url STRING := 'https://app.snowflake.com/' || LOWER(CURRENT_ORGANIZATION_NAME()) || '/' || LOWER(CURRENT_ACCOUNT_NAME());
+  IF (ARRAY_SIZE(:receipt_failures) = 0 AND :receipt_app_name <> '') THEN
+    BEGIN
+      EXECUTE IMMEDIATE 'SHOW STREAMLITS IN SCHEMA ' || :tgt;
+      receipt_app_exists := (SELECT COUNT(*) = 1 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "name" = :receipt_app_name);
+      IF (NOT :receipt_app_exists) THEN
+        receipt_failures := ARRAY_APPEND(:receipt_failures, OBJECT_CONSTRUCT('statement', 'Verify deployed app', 'error', 'Expected Streamlit app was not found.'));
+      END IF;
+    EXCEPTION WHEN OTHER THEN
+      receipt_failures := ARRAY_APPEND(:receipt_failures, OBJECT_CONSTRUCT('statement', 'Verify deployed app', 'error', SQLERRM));
+    END;
+    IF (:receipt_app_exists) THEN
+      BEGIN
+        EXECUTE IMMEDIATE 'SHOW WORKSPACES IN SCHEMA ' || :tgt;
+        receipt_workspace_exists := (SELECT COUNT(*) = 1 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "name" = 'ONESHOT_SOURCE' AND "comment" = 'oneshot-source:28_delegated_orchestration');
+      EXCEPTION WHEN OTHER THEN
+        receipt_workspace_exists := FALSE;
+      END;
+    END IF;
+  END IF;
+  IF (NOT $DELEG_VERBOSE_OUTPUT::BOOLEAN) THEN
+    res := (SELECT
+      CASE WHEN ARRAY_SIZE(:receipt_failures) > 0 THEN 'BUILD_FAILED' WHEN :receipt_app_name = '' THEN 'READY_NO_APP' ELSE 'READY' END AS STATUS,
+      IFF(:receipt_app_exists AND ARRAY_SIZE(:receipt_failures) = 0, :receipt_base_url || '/#/streamlit-apps/' || :tgt || '.' || :receipt_app_name, NULL) AS OPEN_APP_URL,
+      IFF(:receipt_workspace_exists AND ARRAY_SIZE(:receipt_failures) = 0, :receipt_base_url || '/#/workspaces/ws/' || :db || '/' || :sch || '/ONESHOT_SOURCE/streamlit_app.py', NULL) AS EDIT_SOURCE_URL,
+      :mode AS DATA_MODE,
+      :tgt AS DESTINATION,
+      :review_verdict AS REVIEW_STATUS,
+      :review_findings AS REVIEW_FINDINGS,
+      IFF(ARRAY_SIZE(:receipt_failures) > 0, TO_JSON(:receipt_failures), IFF(:receipt_app_name = '', 'This solution creates SQL objects, not a Streamlit app.', 'Open OPEN_APP_URL using a role with access to the app.')) AS NEXT_ACTION,
+      'SELECT * FROM ' || :tgt || '.BUILD_STATEMENT_LOG WHERE RUN_ID = ''' || :run_id || ''' ORDER BY SEQ;' AS DIAGNOSTICS,
+      'CALL ' || :tgt || '.TEARDOWN();' AS REMOVE_DEMO);
+    RETURN TABLE(res);
+  END IF;
 
   -- The notes and the review verdict are emitted HERE as well as on the gate-closed
   -- path, and leaving them out of this one was a real gap. Everything the review has

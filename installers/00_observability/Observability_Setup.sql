@@ -4,6 +4,8 @@
 
 -- The gate. Nothing is created while this is FALSE.
 SET MONITOR_APPROVE = FALSE;
+SET MONITOR_BUILD_STATUS = 'NOT_BUILT';
+SET MONITOR_OPEN_APP_URL = '';
 
 -- Where to build. Blank means the database currently in use.
 SET MONITOR_TARGET_DB = '';
@@ -64,7 +66,6 @@ SET MONITOR_UPSTREAM_EAI = '';
 -- Seed the registry with worked examples (Airflow, postgres_exporter, Confluent)
 -- so the shape is obvious. Examples are created DISABLED.
 SET MONITOR_UPSTREAM_SEED = TRUE;
-
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- BLOCK 0 · PRE-FLIGHT
@@ -1139,24 +1140,28 @@ LEFT JOIN (SELECT OBJECT_FQN, MIN(THRESHOLD) AS SLA_HOURS FROM ' || :tgt || '.MO
                                                'stmt', 'CREATE PROCEDURE TEARDOWN()', 'error', SQLERRM));
   END;
 
-  res := (
-    SELECT v.value:n::INT AS n, v.value:status::STRING AS status,
-           v.value:stmt::STRING AS statement, v.value:error::STRING AS error
-    FROM TABLE(FLATTEN(input => :log)) v
-    UNION ALL
-    SELECT 96, 'READ FIRST', 'SELECT * FROM ' || :tgt || '.V_MONITOR_COVERAGE;', ''
-    UNION ALL
-    SELECT 96, 'WHAT THIS COSTS PER MONTH', 'SELECT * FROM ' || :tgt || '.V_RUN_RATE_HEADLINE;', ''
-    UNION ALL
-    SELECT 97, 'OPEN THE APP', 'Snowsight > Projects > Streamlit > OBSERVABILITY_MONITOR', ''
-    UNION ALL
-    SELECT 98, 'TO REMOVE EVERYTHING', 'CALL ' || :tgt || '.TEARDOWN();', ''
-    ORDER BY n
-  );
+  LET launch_failed INTEGER := (SELECT COUNT(*) FROM TABLE(FLATTEN(INPUT => :log)) WHERE VALUE:status::VARCHAR = 'FAILED');
+  LET launch_exists BOOLEAN := FALSE;
+  LET launch_url VARCHAR := '';
+  IF (:launch_failed = 0) THEN
+    BEGIN
+      EXECUTE IMMEDIATE 'SHOW STREAMLITS IN SCHEMA ' || :tgt;
+      launch_exists := (SELECT COUNT(*) = 1 FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())) WHERE "name" = 'OBSERVABILITY_MONITOR');
+    EXCEPTION WHEN OTHER THEN
+      launch_exists := FALSE;
+    END;
+  END IF;
+  IF (:launch_exists) THEN
+    launch_url := 'https://app.snowflake.com/' || LOWER(CURRENT_ORGANIZATION_NAME()) || '/' || LOWER(CURRENT_ACCOUNT_NAME()) || '/#/streamlit-apps/' || :tgt || '.OBSERVABILITY_MONITOR';
+  END IF;
+  EXECUTE IMMEDIATE 'SET MONITOR_BUILD_STATUS = ''' || IFF(:launch_exists, 'READY', 'BUILD_FAILED') || '''';
+  EXECUTE IMMEDIATE 'SET MONITOR_OPEN_APP_URL = ''' || REPLACE(:launch_url, '''', '''''') || '''';
+  res := (SELECT IFF(:launch_exists, 'READY', 'BUILD_FAILED') AS STATUS,
+    NULLIF(:launch_url, '') AS OPEN_APP_URL, :log AS BUILD_DIAGNOSTICS,
+    'CALL ' || :tgt || '.TEARDOWN();' AS REMOVE_DEMO);
   RETURN TABLE(res);
 END;
 $$;
-
 
 -- ===========================================================================
 -- BLOCK 3 · UPSTREAM COLLECTORS  (the pull side)
@@ -1278,33 +1283,11 @@ BEGIN
 
   -- ------------------------------------------------------------- gate closed
   IF (NOT :gate) THEN
-    RETURN OBJECT_CONSTRUCT(
-      'block', 'BLOCK 3 · UPSTREAM COLLECTORS',
-      'status', 'PLANNED — nothing created',
-      'gate', 'SET MONITOR_UPSTREAM = TRUE to build',
-      'target_schema', :tgt,
-      'role', CURRENT_ROLE(),
-      'can_create_integration', :can_integrate,
-      'incident_lifecycle_present', :has_incidents,
-      'would_create', ARRAY_CONSTRUCT(
-        :tgt || '.UPSTREAM_SOURCE            (registry: one row per upstream system)',
-        :tgt || '.UPSTREAM_PROBE             (one row per HTTP call, success or not)',
-        :tgt || '.UPSTREAM_SIGNAL            (normalised: entity, state, staleness, value)',
-        :tgt || '.COLLECT_UPSTREAM           (Python, egress, per-source dispatch)',
-        :tgt || '.REBIND_UPSTREAM_COLLECTOR  (regenerates the above from the registry)',
-        :tgt || '.COLLECT_ALL_UPSTREAM       (loops enabled sources)',
-        :tgt || '.RAISE_UPSTREAM_INCIDENTS   (bridges failing signals into INCIDENTS)',
-        :tgt || '.V_UPSTREAM_HEALTH          (latest state per entity)',
-        :tgt || '.V_UPSTREAM_STALE           (entities past their staleness budget)',
-        :tgt || '.TASK_COLLECT_UPSTREAM      (created SUSPENDED)'),
-      'supported_kinds', ARRAY_CONSTRUCT(
-        'AIRFLOW_DAG_RUNS   GET /api/v1/dags/~/dagRuns — run state, duration, last success',
-        'AIRFLOW_DAGS       GET /api/v1/dags          — paused/active, schedule',
-        'PROMETHEUS         GET /api/v1/query         — postgres_exporter, Kafka JMX, anything',
-        'CONFLUENT_METRICS  POST /v2/metrics/cloud/query — consumer_lag_offsets',
-        'HTTP_JSON          any JSON endpoint, extraction described in config'),
-      'operator_runbook', :runbook,
-      'constraints', :notes);
+    LET launch_receipt RESULTSET := (SELECT $MONITOR_BUILD_STATUS::VARCHAR AS STATUS,
+      NULLIF($MONITOR_OPEN_APP_URL::VARCHAR, '') AS OPEN_APP_URL,
+      'Upstream collectors are not enabled.' AS UPSTREAM_STATUS,
+      :runbook AS OPERATOR_RUNBOOK, :notes AS CONSTRAINTS);
+    RETURN TABLE(launch_receipt);
   END IF;
 
   -- --------------------------------------------------------------- the build
