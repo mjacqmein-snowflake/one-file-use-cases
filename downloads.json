@@ -178,5 +178,10 @@
     "path": "installers/sc1_vendor_otif/Vendor_OTIF_Scorecard_Setup.sql",
     "bytes": 797333,
     "sha256": "5fb9900e1e6d910a546df142847b92caed12591a3e3d3ab4e256a830f0681570"
+  },
+  "intelligence_workspace": {
+    "path": "installers/intelligence_workspace/Snowflake_Intelligence_Workspace_Setup.sql",
+    "sha256": "4332aa082011ef09e284a375be76552830e0295823bfb1f544d578cdec0cbcd2",
+    "bytes": 977126
   }
 }
