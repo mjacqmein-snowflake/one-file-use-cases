@@ -1,187 +1,187 @@
 {
   "00_observability": {
     "path": "installers/00_observability/Observability_Setup.sql",
-    "bytes": 3403110,
-    "sha256": "50d8d9a0ccd5b6de69ca7e13132b901e46dba7b43da5fdf2f68be7b629a641d2"
+    "bytes": 3276784,
+    "sha256": "dd16d7ca3e8ef3a58d8efc550b410f1d3b2f68df856b80f5fd31de2e74d1edc2"
   },
   "01_customer_360": {
     "path": "installers/01_customer_360/Customer_360_Setup.sql",
-    "bytes": 2698013,
-    "sha256": "7aa786956f433790b4821a6a8f78558cd34389718fe8c5c7c5d28fb631dac298"
+    "bytes": 1935237,
+    "sha256": "8d1270046e41852c8d24492ce079979ff09e616da4aa5dbb9be02fb6882115d5"
   },
   "02_identity_resolution": {
     "path": "installers/02_identity_resolution/Identity_Resolution_Setup.sql",
-    "bytes": 2367705,
-    "sha256": "cf9bdb29af749a6c2a5529aa4c42308bdcebd48462d8bb5feca46df2d798c72c"
+    "bytes": 1721584,
+    "sha256": "9e4c52192e68fdae5e7b5284de04e60c05068fed4f046d05ac38732f65917645"
   },
   "03_generative_completion": {
     "path": "installers/03_generative_completion/Generative_Completion_Setup.sql",
-    "bytes": 2364039,
-    "sha256": "685cb06dab7090bb6e9290a873407933e9f8bfbad4421af673a482955c5a8fe5"
+    "bytes": 1715311,
+    "sha256": "f964100eef4d084e8c9fdd0c24a95f5bb46559ef4c2fb3a72087469ded792cde"
   },
   "04_snowpark_migration": {
     "path": "installers/04_snowpark_migration/Snowpark_Migration_Setup.sql",
-    "bytes": 2465641,
-    "sha256": "bfa13ae87a191885fff8756bf7e96803499f8080c9c53205e1cf5db3fc54e4d7"
+    "bytes": 1774614,
+    "sha256": "72e9cf58be503a0399ee583a3240ef2b1b66e0e8d7f450c5bb89fa67adabd861"
   },
   "05_ml_migration": {
     "path": "installers/05_ml_migration/ML_Migration_Setup.sql",
-    "bytes": 2534783,
-    "sha256": "f3b844782c8bee74ffaf203384660058510c59320e8f82e71344117ab46459c2"
+    "bytes": 1817860,
+    "sha256": "1f04e486d3855f3201ce7f0875af106c4df1b5eb5231e4170ded2a024ef6c98b"
   },
   "06_iceberg_migration": {
     "path": "installers/06_iceberg_migration/Iceberg_Migration.sql",
-    "bytes": 2233443,
-    "sha256": "5e5c7afce33b2ef845c0a1074ff7826a336d816491ac9f29a02aacebe363d900"
+    "bytes": 1630415,
+    "sha256": "afc860bb456f640f600337c518ed61d0549ff33aca39febba6d7de8be74b61db"
   },
   "07_semantic_model_from_history": {
     "path": "installers/07_semantic_model_from_history/Semantic_Model_From_History_Setup.sql",
-    "bytes": 2340557,
-    "sha256": "fa8f57cad8d9c1901355b09455ffa7415e32c200db7555dcdb693bb66c2a3a8f"
+    "bytes": 1704817,
+    "sha256": "a90e8046d3e9925faa3ff75f5311b07fabb7a24940d97dc257d2713ad725c372"
   },
   "08_marketplace_enrichment": {
     "path": "installers/08_marketplace_enrichment/Marketplace_Enrichment_Setup.sql",
-    "bytes": 2282416,
-    "sha256": "bb63a35774ebdf21cccf9a5f19dcdb387af0dc355a0a2f3c2428f0c112cd3384"
+    "bytes": 1664929,
+    "sha256": "19340a7e0f83bef800ab70849c99be1278718b06e650600ae8d263aad5e182f0"
   },
   "09_rmn_cleanroom": {
     "path": "installers/09_rmn_cleanroom/RMN_Cleanroom_Setup.sql",
-    "bytes": 2729008,
-    "sha256": "f9c31081dbab49c60f8c4571ab28d0895fdaf96f2851fd20210acdb1e8ddbfed"
+    "bytes": 1944809,
+    "sha256": "3002cf66cf7c9bf16c7d0155ca5bf4c91c0245eb9d0a07d63bfcf7a3a1a685fc"
   },
   "10_streaming_ingest": {
     "path": "installers/10_streaming_ingest/Streaming_Ingest_Setup.sql",
-    "bytes": 2504282,
-    "sha256": "9f98f7a85b90d4d739e2e1ef6efb582f3aeb3273588ff5c0971d80b047ca7876"
+    "bytes": 1796869,
+    "sha256": "25eb2bfd320f8c1bd3ed2d2361eeee8a66005f8acd2dc551bdc084029a9df661"
   },
   "11_cost_efficiency": {
     "path": "installers/11_cost_efficiency/Cost_Efficiency_Setup.sql",
-    "bytes": 2213678,
-    "sha256": "84691909d0e0c20b13f9551ae7a6ed576583e8af7e7a934460446d4d5489d924"
+    "bytes": 1618535,
+    "sha256": "a3835e70f01438c14f7b234f97115e9d84e8ba051738a86e8363878740224a55"
   },
   "12_data_quality": {
     "path": "installers/12_data_quality/Data_Quality_Setup.sql",
-    "bytes": 2148111,
-    "sha256": "8cb893ba6aba4f522a24d971ad2ff763370b7dd14913eceaab2f1eabae9a6509"
+    "bytes": 1577670,
+    "sha256": "5fef9d621d53f82f156f78ca74c52318e27575c91c93e05902359566fd2026df"
   },
   "13_governance": {
     "path": "installers/13_governance/Governance_Setup.sql",
-    "bytes": 2195525,
-    "sha256": "a1c905f03033c9684bf84da6cb57e7788b76ec0943aa5e5e9cc7434138d9812a"
+    "bytes": 1611961,
+    "sha256": "1c2a8a25ab4248c4c09f19f1d5089048b40ef5c1fd8e062605bb807d72b71cc0"
   },
   "14_agent_deployment": {
     "path": "installers/14_agent_deployment/Agent_Deployment_Setup.sql",
-    "bytes": 2405894,
-    "sha256": "ef382cd46c61431021ed57d695586e83d0a12c481a4959d952023718c405c5bb"
+    "bytes": 1742230,
+    "sha256": "0facfad3712fea17380ce6fb981e8371b8bf6fad22896fd8b216d1b2ff3eab67"
   },
   "15_conversational_assistant": {
     "path": "installers/15_conversational_assistant/Conversational_Assistant_Setup.sql",
-    "bytes": 2112350,
-    "sha256": "2ae0a68ba70445f1bd863f0cde87b04daa1a688d0433ab9ce9109390a375f016"
+    "bytes": 1548862,
+    "sha256": "6a6205d87d21dcf2eef7e8dd4d73e85b3af0581abb05839c552ae8811597d02d"
   },
   "16_interactive_analytics": {
     "path": "installers/16_interactive_analytics/Interactive_Analytics_Setup.sql",
-    "bytes": 2285257,
-    "sha256": "eead7ccfbe6c29f5955ed384236856ade208ea177c4668d175057c7d47868b64"
+    "bytes": 1661066,
+    "sha256": "4df50eae7bfaa8aafc95a50af73d79f81bf265b3492c0d104ec4393b0818f69b"
   },
   "17_lakehouse_analytics": {
     "path": "installers/17_lakehouse_analytics/Lakehouse_Analytics.sql",
-    "bytes": 2082044,
-    "sha256": "3df42dbd817d3a7515f081e18a9e9ca731d47849763022ba2a5d3cd2e7975bc3"
+    "bytes": 1529634,
+    "sha256": "19f584bef0d3eb50fe1183f6eccef69888d9f544bfec06df08a1085ffe30cfe8"
   },
   "18_transformation_pipeline": {
     "path": "installers/18_transformation_pipeline/Transformation_Pipeline_Setup.sql",
-    "bytes": 2274767,
-    "sha256": "ac34853c8a9090bf9a0d057e17a8a8c8214b300c04068ce7c1334b21c9756cb7"
+    "bytes": 1657496,
+    "sha256": "ee91020b9670e9a9133520499b002e985e734a4237ec1a711358bc687f8241d9"
   },
   "19_app_build": {
     "path": "installers/19_app_build/App_Build_Setup.sql",
-    "bytes": 2175054,
-    "sha256": "9f0a56a2c99bb29600e705a5c73699b2ad9ea3d884f1354c29bf5e8fb423e89d"
+    "bytes": 1592409,
+    "sha256": "d541a8af4d4cccd77cefb36463e5b8183637163f078b3f70e79925e84be82181"
   },
   "20_internal_marketplace": {
     "path": "installers/20_internal_marketplace/Internal_Marketplace_Setup.sql",
-    "bytes": 2320799,
-    "sha256": "0595e147c7b2a7aa82804cd5fb885f06dbecee3c42302dfab67a1a09b49b1c8c"
+    "bytes": 1685617,
+    "sha256": "9fb4a1480c2bdacd409923941c29926c833b4db6dec169ac09e9767eaec3b316"
   },
   "21_storage_optimization": {
     "path": "installers/21_storage_optimization/Storage_Optimization_Setup.sql",
-    "bytes": 2236361,
-    "sha256": "14b4b346431fcc96bd09679009c5afd42168a7a1fc299c92ccd2a3d96dfeb571"
+    "bytes": 1630170,
+    "sha256": "7bdeac77762eb8db8d87f1e45f89425b3fc8452145340a9ea14ac58963ef9f87"
   },
   "22_fraud_investigation": {
     "path": "installers/22_fraud_investigation/Proactive_Fraud_Investigation_Setup.sql",
-    "bytes": 2510860,
-    "sha256": "c3e0d6d6f01be01187995e436482316359034337a1a244eca0be6100f6844fa4"
+    "bytes": 1807422,
+    "sha256": "9ed1da7687fe71a8b11faaa9585e66af3baa80a7c8fe38cef69c08579ebff95c"
   },
   "23_retail_merchant": {
     "path": "installers/23_retail_merchant/Retail_Merchant_Agent_Setup.sql",
-    "bytes": 2192642,
-    "sha256": "a58867415fedf3216d757cf40b3ded32291b9af0c17c9116d5894b8f1f127fae"
+    "bytes": 1604448,
+    "sha256": "5d3d622a3f97a8abf274ecd99a22688e61fcbc883638f2beb49742f97fcfb3bd"
   },
   "24_voice_of_customer": {
     "path": "installers/24_voice_of_customer/Voice_of_Customer_Setup.sql",
-    "bytes": 2418126,
-    "sha256": "eaf49aff8da0148df5ca40e638590e5207ef5a206cb8560b4177167943c0ab3c"
+    "bytes": 1738610,
+    "sha256": "360fa939d3a89339199c251137574cff764b24c45c1d0c94af5c83cdead13f9b"
   },
   "25_warehouse_generation": {
     "path": "installers/25_warehouse_generation/Warehouse_Generation_Setup.sql",
-    "bytes": 2501711,
-    "sha256": "90a78fb611caf30e7b28e69c6e22922f8af98f5774a47eecf0ba64b312f36b2c"
+    "bytes": 1802883,
+    "sha256": "8fcef049936867c40f878095dbc49dd20a69046ce2ac95bb5a924dbad65e6827"
   },
   "26_embedded_storefront": {
     "path": "installers/26_embedded_storefront/Embedded_Storefront_Setup.sql",
-    "bytes": 513452,
-    "sha256": "19171cda6d6cb4b0bae6aba7c30f3c922dbdc06b788413ebeb6d6e462324c4ff"
+    "bytes": 426068,
+    "sha256": "13e71f24830cb23d1e7e629d1438dc50f85c942e14ea6e11e37abe99cfd56dc3"
   },
   "28_delegated_orchestration": {
     "path": "installers/28_delegated_orchestration/Delegated_Orchestration_Setup.sql",
-    "bytes": 2361059,
-    "sha256": "321d41d28ce9b66c289e15d0463f1e306b17afc7f531939cb9be1be8cdfc0d13"
+    "bytes": 1706995,
+    "sha256": "12e0490b6711fdbcd269ce804b1528f435054fce25a77cacdeb73a708e0db81a"
   },
   "29_cdc_mirror_cost": {
     "path": "installers/29_cdc_mirror_cost/CDC_Mirror_Cost_Setup.sql",
-    "bytes": 2603711,
-    "sha256": "15ff2cb84f2bbec7e7b743df8b89aa931e53dd5499fac7db3e5026618fa8c384"
+    "bytes": 1856908,
+    "sha256": "43c1887ecbf225e5425c832b3ad1e137506aea72992ab59f6575cb7779779a81"
   },
   "35_ai_value_readiness": {
     "path": "installers/35_ai_value_readiness/AI_Value_Readiness_Setup.sql",
-    "bytes": 12839787,
-    "sha256": "7cc13d050db448a50d826033d6d5a01e9c92b1eb04e50d8c3bc81a4330bbce7d"
+    "bytes": 8776055,
+    "sha256": "61c6092430b309aba018c801c2d9a5e08e387a860ec30fb51cdb79cc5f335144"
   },
   "d1_search_quality": {
     "path": "installers/d1_search_quality/Site_Search_Quality_Monitor_Setup.sql",
-    "bytes": 2119089,
-    "sha256": "1e9c1bf8bb67d1b66277d79c49b1b6c0c825123382df3d90fec9d229c7c8f96f"
+    "bytes": 1560787,
+    "sha256": "cacfd2907f9cab8a5acf0dbb25ae24dc2dbcd8eabf22ce0e2894de7328bf34f8"
   },
   "f1_recovery_audit": {
     "path": "installers/f1_recovery_audit/Recovery_Audit_Setup.sql",
-    "bytes": 2111333,
-    "sha256": "a70f112725384aac41d5f6871887fa2d1ed789524d2cc544f089764dfbe34904"
+    "bytes": 1555017,
+    "sha256": "50b36b7b0d4f3304ecc1c0ce594e4df7d10fa833d804926327ce9a32d39a1a26"
   },
   "hr1_workforce_voice": {
     "path": "installers/hr1_workforce_voice/Voice_of_the_Workforce_Setup.sql",
-    "bytes": 2117134,
-    "sha256": "a7ab77624e97e71e394e1bc4c0eec919fbdd6b6fa407ce5defa6b15d5c79ebf3"
+    "bytes": 1557397,
+    "sha256": "e17eee6042c28753a4a3d577c088e1f424e8c11f61fc90eb331d2cdcaefe1abe"
   },
   "l1_contract_vault": {
     "path": "installers/l1_contract_vault/Contract_Intelligence_Vault_Setup.sql",
-    "bytes": 2137327,
-    "sha256": "11652d6b2c2b2cc19534b689bc9b1c21f28d1507be9904f06c5baa12d677922c"
+    "bytes": 1571205,
+    "sha256": "85692e52631685ff2e83ff0e2c8304754da726107042971eb66ec4cc26170ba5"
   },
   "m1_spend_pacing": {
     "path": "installers/m1_spend_pacing/Spend_Pacing_Setup.sql",
-    "bytes": 2162499,
-    "sha256": "1e884e1a7b09605f9decea4fe0fef919b20c18eecb3e0878dee1df676befcb68"
+    "bytes": 1586776,
+    "sha256": "0edb6d5ed31611ca2ddd89fe0ebd7ac8fc1e653cea206ab4b6603260bc974627"
   },
   "sc1_vendor_otif": {
     "path": "installers/sc1_vendor_otif/Vendor_OTIF_Scorecard_Setup.sql",
-    "bytes": 2137933,
-    "sha256": "6cadb750bbdccef8717efb0e9e7fd87effc8ae819c48638d4074e2ed13c261d7"
+    "bytes": 1571435,
+    "sha256": "c001aee28a97f5155277f15fe1f39ab563c3c4564a9367abbdb3f6368a1995ad"
   },
   "intelligence_workspace": {
     "path": "installers/intelligence_workspace/Snowflake_Intelligence_Workspace_Setup.sql",
-    "sha256": "86798b7d99cfff996ba98d75053f672b9ac97a6b2d60dca7e68cd5a1ad3c016d",
-    "bytes": 986343
+    "sha256": "440e1c126185255d327633ea5dff13e556ac1f243117985f740f42f821dc8a32",
+    "bytes": 1023376
   }
 }
