@@ -56,8 +56,8 @@
   },
   "11_cost_efficiency": {
     "path": "installers/11_cost_efficiency/Cost_Efficiency_Setup.sql",
-    "bytes": 1620394,
-    "sha256": "9950c6d867fc906466e26480eed24df4e0799e32f75cd9f4159620e3d93db430"
+    "bytes": 1658316,
+    "sha256": "70c5734c1cd3d7ec888239534d5f637c76399cd4041fdf69033afc50cc0cedc0"
   },
   "12_data_quality": {
     "path": "installers/12_data_quality/Data_Quality_Setup.sql",
@@ -126,8 +126,8 @@
   },
   "25_warehouse_generation": {
     "path": "installers/25_warehouse_generation/Warehouse_Generation_Setup.sql",
-    "bytes": 1804738,
-    "sha256": "fc5d7cfa3492d14d8e7f44615d1f7fbf93e613e3c024f0a697f41dd7c636fd3d"
+    "bytes": 1768677,
+    "sha256": "d20d2a4de222e489c70b3b90b09c68deffa73a14169c6d1cab3920f20a35445a"
   },
   "26_embedded_storefront": {
     "path": "installers/26_embedded_storefront/Embedded_Storefront_Setup.sql",
