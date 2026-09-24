@@ -62,7 +62,31 @@ GRANT CALLER SELECT ON TABLE SOURCE_DB.SOURCE_SCHEMA.SOURCE_TABLE TO ROLE WORKSP
 ```
 
 Use `ON VIEW` for a view. The viewer also needs usable warehouse and AI privileges
-for discovery/questions, including `USE AI FUNCTION AI_COMPLETE` where required.
+for discovery/questions: `USE AI FUNCTION AI_COMPLETE` (or `USE AI FUNCTIONS`),
+the `SNOWFLAKE.CORTEX_USER` or `AI_FUNCTIONS_USER` database role, and access to the
+selected model.
+
+Initial setup with AI enabled, and the app upgrade, attempt these caller grants
+on the actual app owner role:
+
+```sql
+GRANT CALLER USE AI FUNCTION AI_COMPLETE ON ACCOUNT TO ROLE WORKSPACE_EXECUTIVE_RUNTIME;
+GRANT CALLER USAGE ON DATABASE SNOWFLAKE TO ROLE WORKSPACE_EXECUTIVE_RUNTIME;
+GRANT CALLER PROGRAM USAGE ON DATABASE SNOWFLAKE TO ROLE WORKSPACE_EXECUTIVE_RUNTIME;
+```
+
+`PROGRAM USAGE` permits caller-authorized execution in the system database; it is
+not a grant of customer-table access. It is broader than an individual function
+grant and should be reviewed as such. The application still sends only bounded
+metadata/question prompts to `AI_COMPLETE` and executes fixed source queries with
+restricted caller rights. No `DATA READ`, `FULL MANAGEMENT`, customer-source
+owner grant, or blanket account-wide program grant is added.
+
+The final receipt includes `CALLER_AI_STATUS`. `CONFIGURED` confirms grant setup,
+not viewer/model readiness. `ADMIN_ACTION_REQUIRED` preserves the app and reports
+the exact grant error so an administrator can complete it without SQL-variable
+edits. Partial successful caller grants are retained for an idempotent retry.
+
 Restricted-caller errors can name the internal `SYSTEM$MANAGED` role. Configure
 the actual app owner role, not a system role. Narrow database/schema/table caller
 grants to the app owner were sufficient for the hosted source-preview test.
@@ -70,15 +94,21 @@ Missing AI access leaves manual mapping available. Missing source access prevent
 preview/activation. The application never substitutes an owner-rights source
 query. Row-access and masking policies remain enforced by Snowflake.
 
+AI responses use a typed structured-output contract and bounded JSON decoding.
+Missing privileges produce `AI_ACCESS_REQUIRED`; model, timeout and malformed
+response failures have distinct statuses. They do not become a synthetic result.
+
 ## Upgrade Existing Apps
 
 Select the existing workspace database and run
 `backend/dist/Snowflake_Intelligence_Workspace_Upgrade.sql`. This source-only
 upgrade validates the ownership marker and existing container app, backs up its
 live source inside the account, stages the new code, copies it into the existing
-app and commits. It preserves `deployment.json`, the app object and its grants,
-and all business/demo tables. The receipt contains the app URL, backup path and
-exact rollback SQL. Open a fresh app session after upgrading.
+app and commits. It preserves `deployment.json`, the app object, existing grants
+and all business/demo tables, and attempts the three caller-AI grants above.
+The receipt contains the app URL, backup path, exact source rollback SQL and
+`CALLER_AI_STATUS`. Source rollback does not revoke caller grants. Open a fresh
+app session after upgrading.
 
 An ordinary setup rerun still preserves the deployed app source. It is not a
 substitute for this upgrade file. The standalone HTML remains an offline visual
