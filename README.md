@@ -5,7 +5,7 @@ Snowsight worksheet, read, run, and undo: it discovers the account it is pointed
 what it would build and what that costs, and creates nothing until a gate variable is flipped.
 Every one ships a `TEARDOWN()`.
 
-**Open the catalog:** https://mjacqmein-snowflake.github.io/one-file-use-cases/
+**Open the catalog:** https://sfc-gh-mjacqmein.github.io/one-file-use-cases/
 
 This repository contains the client-facing catalog, its images, the offline HTML,
 and generated SQL installer downloads. Readable development source lives elsewhere.

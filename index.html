@@ -1166,7 +1166,7 @@ body.nomotion *{animation:none!important;transition:none!important}
          7.3MB blob to Pages history for something that regenerates in seconds.
          It carries .tog so it picks up the 44px narrow tap target with the rest. -->
     <a class="tog tog--dl" id="t-offline"
-       href="https://mjacqmein-snowflake.github.io/one-file-use-cases/oneshots.html" download="oneshots.html"
+       href="https://sfc-gh-mjacqmein.github.io/one-file-use-cases/oneshots.html" download="oneshots.html"
        rel="noopener">Download the offline copy</a>
   </div>
 </header>
@@ -1192,7 +1192,7 @@ body.nomotion *{animation:none!important;transition:none!important}
      The src is substituted at build time from the one copy of the URL, in
      build_catalog.py -- see qr_data_uri there. -->
 <aside class="qr">
-  <img class="qr__img" width="246" height="246" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPYAAAD2AQAAAADNaUdlAAAB0UlEQVR42u1ZQY4DIQyLNg/gSXydJ/EAJDaxk1G1h95WlaWi0ZSWiwHHcVK7b8ex7/o/r2+L4dvOuGYz5vHL3TmJr+fH3o9PryfU2Iff5Xt6bii+rkAe81iSwA+06+Dk4yJs3NxLzoXwX/DHnrcY/mBRPnH4SZ5klA5+ogXzg//GKNDhP/Vn/nlk9KdHhG0ozxnL8zpm6asA/pUfI/Un3gl6F4U0+HMLMwIh53kFgXykIknwJ9k+wB/GAvJXkt90zh/Kk1GAsHVkZBX8nDjA821JIUSBAv7zBC9S2AGRKEQS+n9a/7kX+jcokob+wzDUFTAj542MKxS/XszJwy8XSglS4A8tEGOWscArUOG/dwo2mOfmvwh/dj0ETP+c+Vcnf5Eq5L+xculcIOKfWbl0zTKQjoeI/+yay7uQ9EpeS0g/YX4Ss0H5MZHpPzz5lyXkiwvS4E/VX1XzIoshCkTid57H7aD+wuEL6f/kFbBgoQtlC0ij/ur+z9MFci3/wwEXTQsBCzRpinT6P7A9lX/ZArJjSv23EsxRnRPGtQ7/zbptyyqmJEgqfilE5L8a/uo5YAtVyGj1n/n/C1xQVTFK/WeUvd2OMxoJrf7z9//NT6z/AnUGN267bYLGAAAAAElFTkSuQmCC" alt="QR code. Scan it to open this catalog at mjacqmein-snowflake.github.io/one-file-use-cases">
+  <img class="qr__img" width="246" height="246" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPYAAAD2AQAAAADNaUdlAAAB4ElEQVR42u1ZS64DIQyLygE4ElfnSBwAicZ2aKW36O6pstQRahnYOME4n4nz8dnx2//n/RX5NEwHJmvkJF+xGmM/4vPz7f3EP9KOllb0/J8Cn4v6tcAfxCz/pwl5IrvDomaEf2Hk68YKFt3wByiEIyCdjpP/L+ARfcKEPrViwv+Q7PwZNvqjp6yQIXkLRumrAf7UTCHHONT/XGxUIQv8dLiUk87PW9CPAoHH/UXwmgn7iPYdJxIIASb8F+Gv5kOL8lBwLsPI/wpe0ByO4HFY4N8gDGF33YXBKGzCf7KF3lbaA/HB5EwX/UeoFduhPISNEGyDn1TBhVXy+TLKRD/xuyn4wJ+VS84xpkn8YvGCEgz+b5LTzkNx0R/4nzGLiVzdZZpmwZ8cRf5TQnpuFmeUfzZeXvJ/RoUwE/+z2yDNp+yHAplR/pDgq3hcap4Mm/yNPI9qOPDOvm+xSf0uqDyCisKyy4f/7xSoMrojFpn0Tyr+FmbMK5ezwC+2t3VzuaVCIMIkfyj9vzGLgUBFjU3+pppRiUTc+OvVf771V3Xh1AV16t/eFiI/AYQaoUb9WxJpVAlD/TTRf/X/Ua1U54f8r16EDf/V/B/KPNn8ccFf+lMtOH6IUUV8lk/+//u++Z39J4abOV2qtZIyAAAAAElFTkSuQmCC" alt="QR code. Scan it to open this catalog at https://sfc-gh-mjacqmein.github.io/one-file-use-cases/">
   <span class="qr__cap">Take this</span>
 </aside>
 
@@ -2832,7 +2832,7 @@ function actEditing(it) {
     section.appendChild(el('p', 'step__note', 'The installer stages readable Python, JavaScript, styles and configuration and attempts to create an editable source workspace. The app and files remain in your account. Use source-only updates for app edits; rerunning the installer preserves an existing app rather than upgrading it.'));
     section.appendChild(el('p', 'step__note', 'Source discovery supports reviewed single-source customer aggregates through restricted caller rights. Customer charts are session-local; persistent synthetic work is unchanged. Distinct-user production policy validation remains required. No external messaging is enabled.'));
     const upgrade = el('a', 'step__note', 'Download the source-only upgrade');
-    upgrade.href = DATA.offline ? 'https://mjacqmein-snowflake.github.io/one-file-use-cases/' + it.upgradePath : it.upgradePath; upgrade.download = ''; section.appendChild(upgrade);
+    upgrade.href = DATA.offline ? 'https://sfc-gh-mjacqmein.github.io/one-file-use-cases/' + it.upgradePath : it.upgradePath; upgrade.download = ''; section.appendChild(upgrade);
     return section;
   }
   const copy = DATA.editing || {};
@@ -3145,7 +3145,7 @@ $('#q').addEventListener('input', e => { q = e.target.value.trim().toLowerCase()
    Hence: the textarea is built and SELECTED first, synchronously, before any API
    is touched -- that is what leaves execCommand viable inside an async rejection
    handler, which is the one path where the gesture really has expired. */
-const HANDOFF_URL = 'https://mjacqmein-snowflake.github.io/one-file-use-cases/';
+const HANDOFF_URL = 'https://sfc-gh-mjacqmein.github.io/one-file-use-cases/';
 
 function handoff() {
   const box = el('section', 'hand');
