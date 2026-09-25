@@ -146,8 +146,8 @@
   },
   "35_ai_value_readiness": {
     "path": "installers/35_ai_value_readiness/AI_Value_Readiness_Setup.sql",
-    "bytes": 3459852,
-    "sha256": "e3dab8d29cfe50506dda87471690048400f9fc9e17448ab9bc4c4233b1daa51d"
+    "bytes": 3473880,
+    "sha256": "357f168a48fea971cea0dad995bcaaf65e66f406ce434ade7d97b76f5c875f10"
   },
   "d1_search_quality": {
     "path": "installers/d1_search_quality/Site_Search_Quality_Monitor_Setup.sql",
